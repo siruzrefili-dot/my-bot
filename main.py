@@ -1,17 +1,19 @@
 import os
 import logging
 import requests
+import pandas as pd
+import numpy as np
 from flask import Flask
 from threading import Thread
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# Render üçün veb server
+# Render port xətasını önləmək üçün sadə veb server
 app_flask = Flask('')
 
 @app_flask.route('/')
 def home():
-    return "Bot is running!"
+    return "Futures SMC Bot is running!"
 
 def run_flask():
     app_flask.run(host='0.0.0.0', port=int(os.getenv("PORT", 10000)))
@@ -21,72 +23,118 @@ def keep_alive():
     t.start()
 
 TOKEN = os.getenv("BOT_TOKEN")
-COINS = ["bitcoin", "ethereum", "solana", "ripple", "binancecoin", "cardano", "avalanche-2", "dogecoin", "polkadot", "chainlink"]
+# Füçers bazarında ən çox həcmi olan əsas cütlüklər
+FUTURES_COINS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "DOGEUSDT"]
+LEVERAGE = 10  # Füçers üçün tövsiyə olunan standart leverej
 
-def get_best_crypto_opportunity():
+def fetch_binance_futures_klines(symbol, interval="1h", limit=100):
+    # Binance Futures API (dreqular Spot əvəzinə füçers klines endpointi)
+    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
     try:
-        url = "https://api.coingecko.com/api/v3/coins/markets"
-        params = {
-            "vs_currency": "usd",
-            "ids": ",".join(COINS),
-            "order": "market_cap_desc",
-            "per_page": 10,
-            "page": 1,
-            "sparkline": "false",
-            "price_change_percentage": "24h"
-        }
-        response = requests.get(url, params=params, timeout=10)
+        response = requests.get(url, timeout=10)
         if response.status_code == 200:
             data = response.json()
-            best_coin = None
-            max_score = -9999
-            
-            for item in data:
-                symbol = item['symbol'].upper() + "USDT"
-                price = item['current_price']
-                price_change = item.get('price_change_percentage_24h', 0) or 0
-                volume = item['total_volume']
-                
-                if price_change < 0:
-                    current_signal = "🟢 BUY (Dip fürsəti)"
-                    current_score = abs(price_change) * (volume / 1000000)
-                else:
-                    current_signal = "🔴 SELL (Zirvə/Satış fürsəti)"
-                    current_score = price_change * (volume / 1000000)
-
-                if current_score > max_score:
-                    max_score = current_score
-                    best_coin = {
-                        "symbol": symbol,
-                        "price": price,
-                        "change": round(price_change, 2),
-                        "signal": current_signal
-                    }
-
-            if best_coin:
-                return (
-                    f"📊 *10 Coin İçindən Ən Yüksək Fürsət!*\n\n"
-                    f"🪙 *Coin:* `{best_coin['symbol']}`\n"
-                    f"💰 *Qiymət:* `${best_coin['price']}`\n"
-                    f"📈 *24s Dəyişiklik:* `{best_coin['change']}%`\n"
-                    f"🎯 *Tövsiyə:* *{best_coin['signal']}*"
-                )
+            df = pd.DataFrame(data, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_asset_volume', 'number_of_trades',
+                'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+            ])
+            df['open'] = df['open'].astype(float)
+            df['high'] = df['high'].astype(float)
+            df['low'] = df['low'].astype(float)
+            df['close'] = df['close'].astype(float)
+            df['volume'] = df['volume'].astype(float)
+            return df
     except Exception as e:
-        logging.error(f"API xətası: {e}")
+        logging.error(f"Binance Futures API xətası ({symbol}): {e}")
+    return None
+
+def analyze_futures_smc(symbol):
+    df = fetch_binance_futures_klines(symbol, interval="1h", limit=100)
+    if df is None or len(df) < 50:
+        return None
+
+    # Təməl Analiz Filtri: Həcm aktivliyi
+    avg_volume = df['volume'].mean()
+    current_volume = df['volume'].iloc[-1]
+    is_volume_strong = current_volume > (avg_volume * 1.1)
+
+    # SMC - Order Block & Range Hesablamaları
+    current_price = df['close'].iloc[-1]
+    recent_high = df['high'].iloc[-20:-1].max()
+    recent_low = df['low'].iloc[-20:-1].min()
     
-    return "Hazırda bazar məlumatlarını oxumaq mümkün olmadı."
+    price_range = recent_high - recent_low
+    fib_0618 = recent_high - (price_range * 0.618) # Discount Zone (Golden Pocket)
+
+    # Füçers mövqeyi və risk hesablaması
+    if current_price <= fib_0618 * 1.01:
+        bias = "🟢 LONG (Füçers Alış / Discount Zone)"
+        entry = round(current_price, 4)
+        sl = round(recent_low * 0.99, 4)  # Likvidlik bölgəsinin altı
+        tp = round(entry + ((entry - sl) * 2.5), 4) # 1:2.5 Risk/Reward
+    elif current_price >= recent_high * 0.99:
+        bias = "🔴 SHORT (Füçers Satış / Premium Zone)"
+        entry = round(current_price, 4)
+        sl = round(recent_high * 1.01, 4) # Zirvənin üstü
+        tp = round(entry - ((sl - entry) * 2.5), 4)
+    else:
+        bias = "⚖️ RANGE (Gözləmə / Konsolidasiya)"
+        entry = round(current_price, 4)
+        sl = round(current_price * 0.985, 4)
+        tp = round(current_price * 1.025, 4)
+
+    fund_text = "Yüksək Həcm ⚡" if is_volume_strong else "Stabil Həcm 📊"
+
+    return {
+        "symbol": symbol,
+        "bias": bias,
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "fundamental": fund_text,
+        "leverage": LEVERAGE
+    }
+
+def get_best_futures_signal():
+    best_res = None
+    for symbol in FUTURES_COINS:
+        res = analyze_futures_smc(symbol)
+        if res and ("LONG" in res["bias"] or "SHORT" in res["bias"]):
+            best_res = res
+            break
+    
+    if not best_res:
+        best_res = analyze_futures_smc(FUTURES_COINS[0])
+    
+    return best_res
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Salam! Trading botum aktivdir.\n"
-        "Analiz almaq üçün /analiz yazın! 🚀",
+        "🚀 *Füçers SMC & Təməl Analiz Botu* aktivdir!\n"
+        "Leverage ilə işləyən dəqiq giriş nöqtələri üçün /analiz yazın.",
         parse_mode="Markdown"
     )
 
 async def analiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 10 coin analiz edilir, zəhmət olmasa gözləyin...")
-    result = get_best_crypto_opportunity()
-    await update.message.reply_text(result, parse_mode="Markdown")
+    await update.message.reply_text("⚡ Füçers bazarı (Binance FAPI) SMC strategiyası ilə skan edilir...")
+    res = get_best_futures_signal()
+    
+    if res:
+        msg = (
+            f"📊 *Füçers Ticarət Siqnalı (SMC)*\n\n"
+            f"🪙 *Coin:* `{res['symbol']}`\n"
+            f"⚙️ *Tövsiyə olunan Leverage:* `{res['leverage']}x`\n"
+            f"🎯 *Əməliyyat:* *{res['bias']}*\n"
+            f"📈 *Həcm Statusu:* `{res['fundamental']}`\n\n"
+            f"📍 *Giriş (Entry):* `${res['entry']}`\n"
+            f"🛑 *Stop Loss (SL):* `${res['sl']}`\n"
+            f"🎯 *Take Profit (TP):* `${res['tp']}`\n\n"
+            f"⚠️ *Füçers Xəbərdarlığı:* Risk idarəetməsini və marjanı unutmayın!"
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    else:
+        await update.message.reply_text("Hazırda füçers bazarında dəqiq siqnal şərti ödənmədi.")
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
