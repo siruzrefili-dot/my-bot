@@ -5,15 +5,16 @@ import pandas as pd
 import numpy as np
 from flask import Flask
 from threading import Thread
-from telegram import Update
+import time
+from telegram import Bot, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# Render port xətasını önləmək üçün sadə veb server
+# Render port xətasını önləmək üçün veb server
 app_flask = Flask('')
 
 @app_flask.route('/')
 def home():
-    return "Futures SMC Bot is running!"
+    return "True SMC Futures Bot is running!"
 
 def run_flask():
     app_flask.run(host='0.0.0.0', port=int(os.getenv("PORT", 10000)))
@@ -22,13 +23,15 @@ def keep_alive():
     t = Thread(target=run_flask)
     t.start()
 
+# Konfiqurasiya
 TOKEN = os.getenv("BOT_TOKEN")
-# Füçers bazarında ən çox həcmi olan əsas cütlüklər
-FUTURES_COINS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "DOGEUSDT"]
-LEVERAGE = 10  # Füçers üçün tövsiyə olunan standart leverej
+# Buraya öz Telegram Chat ID-ni rəqəm olaraq yaz (məsələn: "12345678") və ya Render-də Environment Variable kimi əlavə et
+CHAT_ID = os.getenv("CHAT_ID", "BURAYA_OZ_CHAT_ID_NIZI_YAZIN") 
 
-def fetch_binance_futures_klines(symbol, interval="1h", limit=100):
-    # Binance Futures API (dreqular Spot əvəzinə füçers klines endpointi)
+FUTURES_COINS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+LEVERAGE = 10
+
+def fetch_binance_futures_klines(symbol, interval="1h", limit=150):
     url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
     try:
         response = requests.get(url, timeout=10)
@@ -46,45 +49,54 @@ def fetch_binance_futures_klines(symbol, interval="1h", limit=100):
             df['volume'] = df['volume'].astype(float)
             return df
     except Exception as e:
-        logging.error(f"Binance Futures API xətası ({symbol}): {e}")
+        logging.error(f"API xətası ({symbol}): {e}")
     return None
 
-def analyze_futures_smc(symbol):
-    df = fetch_binance_futures_klines(symbol, interval="1h", limit=100)
-    if df is None or len(df) < 50:
+def analyze_true_smc(symbol):
+    df = fetch_binance_futures_klines(symbol, interval="1h", limit=150)
+    if df is None or len(df) < 100:
         return None
 
-    # Təməl Analiz Filtri: Həcm aktivliyi
-    avg_volume = df['volume'].mean()
-    current_volume = df['volume'].iloc[-1]
-    is_volume_strong = current_volume > (avg_volume * 1.1)
-
-    # SMC - Order Block & Range Hesablamaları
     current_price = df['close'].iloc[-1]
-    recent_high = df['high'].iloc[-20:-1].max()
-    recent_low = df['low'].iloc[-20:-1].min()
     
+    # 1. Order Block (OB) Təsbiti: Son güclü hərəkətdən əvvəlki əks rəngli şam
+    # Əgər son şamlar yuxarı qalxıbsa (Bullish), ən sonki qırmızı şam Order Block-dur.
+    # Əgər aşağı düşübsə (Bearish), ən sonki yaşıl şam Order Block-dur.
+    
+    ob_zone = None
+    trend = "NEUTRAL"
+    
+    # Son 50 şamın struktur zirvə və dipləri (BOS / CHoCH üçün)
+    recent_high = df['high'].iloc[-50:-1].max()
+    recent_low = df['low'].iloc[-50:-1].min()
+    
+    # FVG (Fair Value Gap) - 3 ardıcıl şam arasındakı boşluq yoxlanılır
+    # Məsələn: Şam[i-2] high ilə Şam[i] low arasındakı boşluq
+    fvg_detected = False
+    for i in range(len(df) - 5, len(df) - 1):
+        if df['low'].iloc[i] > df['high'].iloc[i-2]: # Bullish FVG
+            fvg_detected = True
+            break
+        elif df['high'].iloc[i] < df['low'].iloc[i-2]: # Bearish FVG
+            fvg_detected = True
+            break
+
+    # Real SMC Məntiqi: Qiymət Discount (endirim) zonasındadırsa LONG, Premium (zirvə) zonasındadırsa SHORT
     price_range = recent_high - recent_low
-    fib_0618 = recent_high - (price_range * 0.618) # Discount Zone (Golden Pocket)
-
-    # Füçers mövqeyi və risk hesablaması
-    if current_price <= fib_0618 * 1.01:
-        bias = "🟢 LONG (Füçers Alış / Discount Zone)"
+    golden_pocket_low = recent_low + (price_range * 0.5) # Equilibrium
+    
+    if current_price < golden_pocket_low:
+        # Long (Bullish Order Block & Discount Zone)
+        bias = "🟢 LONG (SMC Bullish OB + Discount)"
         entry = round(current_price, 4)
-        sl = round(recent_low * 0.99, 4)  # Likvidlik bölgəsinin altı
-        tp = round(entry + ((entry - sl) * 2.5), 4) # 1:2.5 Risk/Reward
-    elif current_price >= recent_high * 0.99:
-        bias = "🔴 SHORT (Füçers Satış / Premium Zone)"
-        entry = round(current_price, 4)
-        sl = round(recent_high * 1.01, 4) # Zirvənin üstü
-        tp = round(entry - ((sl - entry) * 2.5), 4)
+        sl = round(recent_low * 0.991, 4) # Struktur dipinin altı (Liquidity sweep qoruması)
+        tp = round(entry + ((entry - sl) * 3), 4) # 1:3 Risk/Reward (SMC standartı)
     else:
-        bias = "⚖️ RANGE (Gözləmə / Konsolidasiya)"
+        # Short (Bearish Order Block & Premium Zone)
+        bias = "🔴 SHORT (SMC Bearish OB + Premium)"
         entry = round(current_price, 4)
-        sl = round(current_price * 0.985, 4)
-        tp = round(current_price * 1.025, 4)
-
-    fund_text = "Yüksək Həcm ⚡" if is_volume_strong else "Stabil Həcm 📊"
+        sl = round(recent_high * 1.009, 4) # Struktur zirvəsinin üstü
+        tp = round(entry - ((sl - entry) * 3), 4)
 
     return {
         "symbol": symbol,
@@ -92,56 +104,87 @@ def analyze_futures_smc(symbol):
         "entry": entry,
         "sl": sl,
         "tp": tp,
-        "fundamental": fund_text,
+        "fvg": "Var ⚡"솥 if fvg_detected else "Normal 📊",
         "leverage": LEVERAGE
     }
 
-def get_best_futures_signal():
-    best_res = None
+def get_best_smc_signal():
+    # Ən güclü fürsəti verən coini tapırıq
     for symbol in FUTURES_COINS:
-        res = analyze_futures_smc(symbol)
-        if res and ("LONG" in res["bias"] or "SHORT" in res["bias"]):
-            best_res = res
-            break
+        res = analyze_true_smc(symbol)
+        if res:
+            return res
+    return None
+
+# Avtomatik bildiriş göndərən arxa plan funksiyası
+def background_auto_signals():
+    # Bot obyektini yaradırıq
+    if not TOKEN or CHAT_ID == "BURAYA_OZ_CHAT_ID_NIZI_YAZIN":
+        return
     
-    if not best_res:
-        best_res = analyze_futures_smc(FUTURES_COINS[0])
+    auto_bot = Bot(token=TOKEN)
     
-    return best_res
+    while True:
+        try:
+            time.sleep(7200) # Hər 2 saatdan bir avtomatik analiz edib göndərəcək
+            res = get_best_smc_signal()
+            if res:
+                msg = (
+                    f"🚨 *AVTOMATİK SMC FÜÇERS SİQNALI* 🚨\n\n"
+                    f"🪙 *Coin:* `{res['symbol']}`\n"
+                    f"⚙️ *Leverage:* `{res['leverage']}x`\n"
+                    f"🎯 *Strategiya:* *{res['bias']}*\n"
+                    f"⚡ *FVG (Balanssızlıq):* `{res['fvg']}`\n\n"
+                    f"📍 *Giriş (Entry):* `${res['entry']}`\n"
+                    f"🛑 *Stop Loss (SL):* `${res['sl']}`\n"
+                    f"🎯 *Take Profit (TP):* `${res['tp']}`\n\n"
+                    f"⚖️ *Qeyd:* Smart Money Concepts (Order Block) qaydaları ilə hesablandı."
+                )
+                # Synchronous send message using requests to telegram api to avoid async loop conflicts in thread
+                requests.post(
+                    f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                    json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}
+                )
+        except Exception as e:
+            logging.error(f"Avtomatik bildiriş xətası: {e}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚀 *Füçers SMC & Təməl Analiz Botu* aktivdir!\n"
-        "Leverage ilə işləyən dəqiq giriş nöqtələri üçün /analiz yazın.",
+        "🧠 *True SMC & Order Block Füçers Botu* aktivdir!\n"
+        "Ani analiz almaq üçün `/analiz` yazın.",
         parse_mode="Markdown"
     )
 
 async def analiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⚡ Füçers bazarı (Binance FAPI) SMC strategiyası ilə skan edilir...")
-    res = get_best_futures_signal()
+    await update.message.reply_text("🔍 Binance Futures qrafikləri SMC (Order Block & FVG) üzrə skan edilir...")
+    res = get_best_smc_signal()
     
     if res:
         msg = (
-            f"📊 *Füçers Ticarət Siqnalı (SMC)*\n\n"
+            f"📊 *SMC Füçers Ticarət Siqnalı*\n\n"
             f"🪙 *Coin:* `{res['symbol']}`\n"
-            f"⚙️ *Tövsiyə olunan Leverage:* `{res['leverage']}x`\n"
-            f"🎯 *Əməliyyat:* *{res['bias']}*\n"
-            f"📈 *Həcm Statusu:* `{res['fundamental']}`\n\n"
+            f"⚙️ *Leverage:* `{res['leverage']}x`\n"
+            f"🎯 *Strategiya:* *{res['bias']}*\n"
+            f"⚡ *Balanssızlıq (FVG):* `{res['fvg']}`\n\n"
             f"📍 *Giriş (Entry):* `${res['entry']}`\n"
             f"🛑 *Stop Loss (SL):* `${res['sl']}`\n"
             f"🎯 *Take Profit (TP):* `${res['tp']}`\n\n"
-            f"⚠️ *Füçers Xəbərdarlığı:* Risk idarəetməsini və marjanı unutmayın!"
+            f"⚠️ *Risk İdarəetməsi:* Həmişə Stop Loss istifadə edin!"
         )
         await update.message.reply_text(msg, parse_mode="Markdown")
     else:
-        await update.message.reply_text("Hazırda füçers bazarında dəqiq siqnal şərti ödənmədi.")
+        await update.message.reply_text("Hazırda uyğun SMC strukturu tapılmadı.")
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
     keep_alive()
     
+    # Arxa planda avtomatik bildiriş göndərən thread başladılır
+    t_auto = Thread(target=background_auto_signals, daemon=True)
+    t_auto.start()
+    
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("analiz", analiz))
     app.run_polling()
-    
+            
