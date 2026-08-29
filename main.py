@@ -24,7 +24,7 @@ def keep_alive():
     t.start()
 
 TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID", "BURAYA_OZ_CHAT_ID_NIZI_YAZIN") 
+CHAT_ID = os.getenv("CHAT_ID", "1121794078") 
 
 FUTURES_COINS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 LEVERAGE = 10
