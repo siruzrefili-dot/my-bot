@@ -6,7 +6,7 @@ from threading import Thread
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# Render üçün sadə veb server (Port xətasını aradan qaldırmaq üçün)
+# Render üçün veb server
 app_flask = Flask('')
 
 @app_flask.route('/')
@@ -20,7 +20,6 @@ def keep_alive():
     t = Thread(target=run_flask)
     t.start()
 
-# Telegram Bot Konfiqurasiyası
 TOKEN = os.getenv("BOT_TOKEN")
 COINS = ["bitcoin", "ethereum", "solana", "ripple", "binancecoin", "cardano", "avalanche-2", "dogecoin", "polkadot", "chainlink"]
 
@@ -79,7 +78,7 @@ def get_best_crypto_opportunity():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Salam! Trading botum aktivdir və port సమస్య həll olundu.\n"
+        "Salam! Trading botum aktivdir.\n"
         "Analiz almaq üçün /analiz yazın! 🚀",
         parse_mode="Markdown"
     )
@@ -91,10 +90,10 @@ async def analiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
-    keep_alive()  # Veb serveri işə salırıq ki, Render port xətası verməsin
+    keep_alive()
     
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("analiz", analiz))
     app.run_polling()
-        
+    
