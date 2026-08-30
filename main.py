@@ -87,6 +87,9 @@ def fetch_futures_klines(symbol, interval="60", limit=100):
           df["low"] = df["low"].astype(float)
           df["close"] = df["close"].astype(float)
           df["volume"] = df["volume"].astype(float)
+          # Son sətir hələ bağlanmamış (davam edən) şamdır - onu çıxarırıq,
+          # əks halda "cari həcm" süni şəkildə çox aşağı görünür.
+          df = df.iloc[:-1].reset_index(drop=True)
           return df
         else:
           logging.warning(f"{symbol}: Bybit-dən qaytarılan data kifayət qədər deyil (len={len(rows)})")
@@ -281,4 +284,4 @@ def main():
 
 if __name__ == "__main__":
   main()
-  
+          
