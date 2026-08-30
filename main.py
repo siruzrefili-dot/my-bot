@@ -84,6 +84,10 @@ def fetch_binance_futures_klines(symbol, interval="1h", limit=100):
         return df
       else:
         logging.warning(f"{symbol}: Binance-dən qaytarılan data kifayət qədər deyil (len={len(data) if isinstance(data, list) else 'N/A'})")
+    elif response.status_code == 418:
+      logging.error(f"{symbol}: Binance IP MÜVƏQQƏTİ BANLANIB (418) - çox tez-tez sorğu göndərilib. Bir müddət gözləyin.")
+    elif response.status_code == 451:
+      logging.error(f"{symbol}: Binance bu regionu bloklayır (451 - geo-restriction).")
     else:
       logging.error(f"{symbol}: Binance API status {response.status_code} - {response.text[:200]}")
   except Exception as e:
@@ -164,6 +168,7 @@ def get_best_smc_signal():
   for symbol in FUTURES_COINS:
     res = analyze_balanced_smc(symbol)
     all_results.append(res)
+    time.sleep(0.3)  # Binance rate-limit (418 ban) xətasının qarşısını almaq üçün fasilə
 
   for res in all_results:
     if res["passed"]:
