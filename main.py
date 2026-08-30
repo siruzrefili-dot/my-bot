@@ -13,7 +13,7 @@ app_flask = Flask('')
 
 @app_flask.route('/')
 def home():
-    return "Ultra-Stable SMC Bot is running!"
+    return "Real-Data SMC Bot is running!"
 
 def run_flask():
     app_flask.run(host='0.0.0.0', port=int(os.getenv("PORT", 10000)))
@@ -25,7 +25,6 @@ def keep_alive():
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = "1121794078"
 
-# Ən stabil 10 Kriptovalyuta
 FUTURES_COINS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", 
     "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "LINKUSDT", "SUIUSDT"
@@ -56,7 +55,7 @@ def fetch_binance_futures_klines(symbol, interval="1h", limit=100):
 
 def analyze_balanced_smc(symbol):
     df = fetch_binance_futures_klines(symbol)
-    if df is None:
+    if df is None or len(df) < 30:
         return None
 
     current_price = df['close'].iloc[-1]
@@ -70,14 +69,14 @@ def analyze_balanced_smc(symbol):
 
     if current_price < mid_price:
         bias = "🟢 LONG (SMC Discount Zone)"
-        entry = round(current_price, 4)
-        sl = round(recent_low * 0.993, 4)
-        tp = round(entry + ((entry - sl) * 2.5), 4)
+        entry = round(current_price, 2)
+        sl = round(recent_low * 0.993, 2)
+        tp = round(entry + ((entry - sl) * 2.5), 2)
     else:
         bias = "🔴 SHORT (SMC Premium Zone)"
-        entry = round(current_price, 4)
-        sl = round(recent_high * 1.007, 4)
-        tp = round(entry - ((sl - entry) * 2.5), 4)
+        entry = round(current_price, 2)
+        sl = round(recent_high * 1.007, 2)
+        tp = round(entry - ((sl - entry) * 2.5), 2)
 
     volume_status = "Aktiv ⚡" if is_volume_good else "Normal 📊"
 
@@ -96,16 +95,7 @@ def get_best_smc_signal():
         res = analyze_balanced_smc(symbol)
         if res:
             return res
-    # Əgər heç biri alınmasa belə həmişə BTCUSDT-ni qaytarır ki, xəta olmasın
-    return {
-        "symbol": "BTCUSDT",
-        "bias": "🟢 LONG (SMC Discount Zone)",
-        "entry": 60000.0,
-        "sl": 59000.0,
-        "tp": 62500.0,
-        "volume": "Normal 📊",
-        "leverage": 10
-    }
+    return None
 
 def background_auto_signals():
     if not TOKEN:
@@ -116,7 +106,7 @@ def background_auto_signals():
             res = get_best_smc_signal()
             if res:
                 msg = (
-                    f"🚨 *AVTOMATİK BAZAR SİQNALI* 🚨\n\n"
+                    f"🚨 *REAL BAZAR SİQNALİ* 🚨\n\n"
                     f"🪙 *Aktiv:* `{res['symbol']}`\n"
                     f"⚙️ *Leverage:* `{res['leverage']}x`\n"
                     f"🎯 *Strategiya:* *{res['bias']}*\n"
@@ -134,18 +124,18 @@ def background_auto_signals():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⚖️ *Ultra-Stable SMC Bot* aktivdir!\n"
-        "Ani analiz üçün `/analiz` yazın.",
+        "📊 *Real-Time SMC Bot* aktivdir!\n"
+        "Canlı analiz üçün `/analiz` yazın.",
         parse_mode="Markdown"
     )
 
 async def analiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Kriptovalyuta bazarı skan edilir...")
+    await update.message.reply_text("🔍 Binance Futures canlı bazarı skan edilir...")
     res = get_best_smc_signal()
     
     if res:
         msg = (
-            f"📊 *SMC Ticarət Siqnalı*\n\n"
+            f"📊 *Real SMC Ticarət Siqnalı*\n\n"
             f"🪙 *Aktiv:* `{res['symbol']}`\n"
             f"⚙️ *Leverage:* `{res['leverage']}x`\n"
             f"🎯 *Strategiya:* *{res['bias']}*\n"
@@ -156,7 +146,7 @@ async def analiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(msg, parse_mode="Markdown")
     else:
-        await update.message.reply_text("Analiz tamamlandı.")
+        await update.message.reply_text("Hazırda uyğun struktur tapılmadı.")
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
@@ -169,3 +159,4 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("analiz", analiz))
     app.run_polling()
+                
