@@ -98,7 +98,7 @@ def fetch_top_liquid_coins(limit=SCAN_TOP_N_COINS):
   return FALLBACK_COINS
 
 
-
+def fetch_klines(symbol, interval="60", limit=KLINES_LIMIT):
   """
   Bybit Futures (v5, USDT Perpetual = 'linear' category) API-dən şam datası çəkir.
   interval: Bybit formatı - "60" = 1 saat, "D" = günlük.
@@ -453,8 +453,7 @@ def format_diagnostics(all_results, max_detail=8):
       continue
     failed = [name for name, ok in res["conditions"].items() if not ok]
     if failed:
-      # İlk (ən erkən) ödənilməyən şərti "əsas səbəb" kimi qeyd edirik
-      key = failed[0].split(" (")[0]  # detaldan (mötərizədən) əvvəlki hissə
+      key = failed[0].split(" (")[0]
       reason_counts[key] = reason_counts.get(key, 0) + 1
 
   lines = [f"📋 *Xülasə:* {total} coin yoxlanıldı, heç biri bütün şərtləri ödəmədi.\n"]
@@ -539,4 +538,37 @@ async def analiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
       f"🔍 Ən likvid {SCAN_TOP_N_COINS} coin üzərində Professional SMC analiz edilir "
       f"(Daily trend + 1H BOS + Sweep + OB + FVG)... Bu bir az vaxt ala bilər."
   )
-  res, all_results = 
+  res, all_results = get_best_smc_signal()
+
+  if res:
+    msg = format_signal_message(res)
+    await update.message.reply_text(msg, parse_mode="Markdown")
+  else:
+    diag = format_diagnostics(all_results)
+    await update.message.reply_text(
+        "Hazırda peşəkar SMC şərtlərinin hamısını ödəyən struktur tapılmadı.\n\n" + diag,
+        parse_mode="Markdown",
+    )
+
+
+def main():
+  if not TOKEN:
+    logging.error("BOT_TOKEN tapılmadı! Environment variables yoxlayın.")
+    return
+
+  keep_alive()
+
+  application = ApplicationBuilder().token(TOKEN).build()
+  application.add_handler(CommandHandler("start", start))
+  application.add_handler(CommandHandler("analiz", analiz))
+
+  t_auto = Thread(target=background_auto_signals, args=(application,), daemon=True)
+  t_auto.start()
+
+  logging.info("Bot işə düşdü...")
+  application.run_polling()
+
+
+if __name__ == "__main__":
+  main()
+    
