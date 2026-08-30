@@ -52,44 +52,50 @@ MIN_ZONE_DISTANCE_PCT = 0.5   # Premium/Discount zonasının orta xətdən min. 
 MIN_VOLUME_RATIO = 0.7        # Cari həcmin orta həcmə nisbəti minimum həddi
 
 
-def fetch_binance_futures_klines(symbol, interval="1h", limit=100):
-  url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
+def fetch_futures_klines(symbol, interval="60", limit=100):
+  """
+  Bybit Futures (v5, USDT Perpetual = 'linear' category) API-dən şam (kline) datası çəkir.
+  interval: Bybit formatı - "60" = 1 saat (Binance-in "1h" formatına uyğun).
+  """
+  url = (
+      f"https://api.bybit.com/v5/market/kline"
+      f"?category=linear&symbol={symbol}&interval={interval}&limit={limit}"
+  )
   try:
     response = requests.get(url, timeout=5)
     if response.status_code == 200:
-      data = response.json()
-      if isinstance(data, list) and len(data) > 30:
-        df = pd.DataFrame(
-            data,
-            columns=[
-                "timestamp",
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume",
-                "close_time",
-                "quote_asset_volume",
-                "number_of_trades",
-                "taker_buy_base_asset_volume",
-                "taker_buy_quote_asset_volume",
-                "ignore",
-            ],
-        )
-        df["open"] = df["open"].astype(float)
-        df["high"] = df["high"].astype(float)
-        df["low"] = df["low"].astype(float)
-        df["close"] = df["close"].astype(float)
-        df["volume"] = df["volume"].astype(float)
-        return df
+      payload = response.json()
+      if payload.get("retCode") == 0:
+        rows = payload.get("result", {}).get("list", [])
+        if len(rows) > 30:
+          df = pd.DataFrame(
+              rows,
+              columns=[
+                  "timestamp",
+                  "open",
+                  "high",
+                  "low",
+                  "close",
+                  "volume",
+                  "turnover",
+              ],
+          )
+          # Bybit ən yeni şamı birinci qaytarır - xronoloji sıraya (köhnədən yeniyə) salırıq
+          df = df.iloc[::-1].reset_index(drop=True)
+          df["open"] = df["open"].astype(float)
+          df["high"] = df["high"].astype(float)
+          df["low"] = df["low"].astype(float)
+          df["close"] = df["close"].astype(float)
+          df["volume"] = df["volume"].astype(float)
+          return df
+        else:
+          logging.warning(f"{symbol}: Bybit-dən qaytarılan data kifayət qədər deyil (len={len(rows)})")
       else:
-        logging.warning(f"{symbol}: Binance-dən qaytarılan data kifayət qədər deyil (len={len(data) if isinstance(data, list) else 'N/A'})")
-    elif response.status_code == 418:
-      logging.error(f"{symbol}: Binance IP MÜVƏQQƏTİ BANLANIB (418) - çox tez-tez sorğu göndərilib. Bir müddət gözləyin.")
-    elif response.status_code == 451:
-      logging.error(f"{symbol}: Binance bu regionu bloklayır (451 - geo-restriction).")
+        logging.error(f"{symbol}: Bybit API xətası - retCode={payload.get('retCode')}, msg={payload.get('retMsg')}")
+    elif response.status_code == 403:
+      logging.error(f"{symbol}: Bybit bu regionu bloklayır (403 - geo-restriction).")
     else:
-      logging.error(f"{symbol}: Binance API status {response.status_code} - {response.text[:200]}")
+      logging.error(f"{symbol}: Bybit API status {response.status_code} - {response.text[:200]}")
   except Exception as e:
     logging.error(f"API xətası ({symbol}): {e}")
   return None
@@ -100,13 +106,13 @@ def analyze_balanced_smc(symbol):
   Hər coin üçün analiz aparır və bütün şərtlərin nəticəsini
   (keçdi/keçmədi) qaytarır ki, diaqnostika mümkün olsun.
   """
-  df = fetch_binance_futures_klines(symbol)
+  df = fetch_futures_klines(symbol)
 
   if df is None or len(df) < 30:
     return {
         "symbol": symbol,
         "passed": False,
-        "error": "API-dən data alınmadı (şəbəkə/geo-block ola bilər)",
+        "error": "Bybit API-dən data alınmadı (şəbəkə problemi ola bilər)",
         "conditions": {},
     }
 
@@ -168,7 +174,7 @@ def get_best_smc_signal():
   for symbol in FUTURES_COINS:
     res = analyze_balanced_smc(symbol)
     all_results.append(res)
-    time.sleep(0.3)  # Binance rate-limit (418 ban) xətasının qarşısını almaq üçün fasilə
+    time.sleep(0.2)  # Rate-limit xətasının qarşısını almaq üçün kiçik fasilə
 
   for res in all_results:
     if res["passed"]:
@@ -229,7 +235,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def analiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-  await update.message.reply_text("🔍 Binance Futures canlı bazarı skan edilir...")
+  await update.message.reply_text("🔍 Bybit Futures canlı bazarı skan edilir...")
   res, all_results = get_best_smc_signal()
 
   if res:
@@ -275,3 +281,4 @@ def main():
 
 if __name__ == "__main__":
   main()
+  
