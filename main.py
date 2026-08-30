@@ -9,12 +9,11 @@ import time
 from telegram import Bot, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# Render port xətasını önləmək üçün veb server
 app_flask = Flask('')
 
 @app_flask.route('/')
 def home():
-    return "True SMC Futures Bot is running!"
+    return "Expanded 10 Coins + Gold SMC Bot is running!"
 
 def run_flask():
     app_flask.run(host='0.0.0.0', port=int(os.getenv("PORT", 10000)))
@@ -24,13 +23,22 @@ def keep_alive():
     t.start()
 
 TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID", "1121794078") 
+CHAT_ID = "1121794078"
 
-FUTURES_COINS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+# 10 Kriptovalyuta + Qızıl (PAXGUSDT birbaşa qızıl qiymətini izləyir)
+FUTURES_COINS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", 
+    "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "LINKUSDT", "SUIUSDT", "PAXGUSDT"
+]
 LEVERAGE = 10
 
-def fetch_binance_futures_klines(symbol, interval="1h", limit=150):
-    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
+def fetch_binance_futures_klines(symbol, interval="1h", limit=100):
+    # PAXG spot bazarda işlədiyi üçün şərt qoyuruq, digərləri futures-dur
+    if symbol == "PAXGUSDT":
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    else:
+        url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    
     try:
         response = requests.get(url, timeout=10)
         if response.status_code == 200:
@@ -50,71 +58,66 @@ def fetch_binance_futures_klines(symbol, interval="1h", limit=150):
         logging.error(f"API xətası ({symbol}): {e}")
     return None
 
-def analyze_true_smc(symbol):
-    df = fetch_binance_futures_klines(symbol, interval="1h", limit=150)
-    if df is None or len(df) < 100:
+def analyze_balanced_smc(symbol):
+    df = fetch_binance_futures_klines(symbol, interval="1h", limit=100)
+    if df is None or len(df) < 50:
         return None
 
     current_price = df['close'].iloc[-1]
+    recent_high = df['high'].iloc[-30:-1].max()
+    recent_low = df['low'].iloc[-30:-1].min()
+    mid_price = (recent_high + recent_low) / 2
     
-    recent_high = df['high'].iloc[-50:-1].max()
-    recent_low = df['low'].iloc[-50:-1].min()
-    
-    fvg_detected = False
-    for i in range(len(df) - 5, len(df) - 1):
-        if df['low'].iloc[i] > df['high'].iloc[i-2]:
-            fvg_detected = True
-            break
-        elif df['high'].iloc[i] < df['low'].iloc[i-2]:
-            fvg_detected = True
-            break
+    avg_volume = df['volume'].mean()
+    current_volume = df['volume'].iloc[-1]
+    is_volume_good = current_volume > (avg_volume * 0.8)
 
-    price_range = recent_high - recent_low
-    golden_pocket_low = recent_low + (price_range * 0.5)
-    
-    if current_price < golden_pocket_low:
-        bias = "🟢 LONG (SMC Bullish OB + Discount)"
+    if current_price < mid_price:
+        bias = "🟢 LONG (SMC Discount Zone)"
         entry = round(current_price, 4)
-        sl = round(recent_low * 0.991, 4)
-        tp = round(entry + ((entry - sl) * 3), 4)
+        sl = round(recent_low * 0.993, 4)
+        tp = round(entry + ((entry - sl) * 2.5), 4)
     else:
-        bias = "🔴 SHORT (SMC Bearish OB + Premium)"
+        bias = "🔴 SHORT (SMC Premium Zone)"
         entry = round(current_price, 4)
-        sl = round(recent_high * 1.009, 4)
-        tp = round(entry - ((sl - entry) * 3), 4)
+        sl = round(recent_high * 1.007, 4)
+        tp = round(entry - ((sl - entry) * 2.5), 4)
+
+    volume_status = "Aktiv ⚡" if is_volume_good else "Normal 📊"
+    display_name = "QIZIL (PAXG)" if symbol == "PAXGUSDT" else symbol
 
     return {
-        "symbol": symbol,
+        "symbol": display_name,
         "bias": bias,
         "entry": entry,
         "sl": sl,
         "tp": tp,
-        "fvg": "Var ⚡" if fvg_detected else "Normal 📊",
-        "leverage": LEVERAGE
+        "volume": volume_status,
+        "leverage": 5 if symbol == "PAXGUSDT" else LEVERAGE
     }
 
 def get_best_smc_signal():
     for symbol in FUTURES_COINS:
-        res = analyze_true_smc(symbol)
+        res = analyze_balanced_smc(symbol)
         if res:
             return res
-    return None
+    return analyze_balanced_smc("BTCUSDT")
 
 def background_auto_signals():
-    if not TOKEN or CHAT_ID == "BURAYA_OZ_CHAT_ID_NIZI_YAZIN":
+    if not TOKEN:
         return
     
     while True:
         try:
-            time.sleep(7200)
+            time.sleep(3600) # Hər 1 saatdan bir
             res = get_best_smc_signal()
             if res:
                 msg = (
-                    f"🚨 *AVTOMATİK SMC FÜÇERS SİQNALI* 🚨\n\n"
-                    f"🪙 *Coin:* `{res['symbol']}`\n"
+                    f"🚨 *AVTOMATİK BAZAR SİQNALI* 🚨\n\n"
+                    f"🪙 *Aktiv:* `{res['symbol']}`\n"
                     f"⚙️ *Leverage:* `{res['leverage']}x`\n"
                     f"🎯 *Strategiya:* *{res['bias']}*\n"
-                    f"⚡ *Balanssızlıq:* `{res['fvg']}`\n\n"
+                    f"⚡ *Həcm:* `{res['volume']}`\n\n"
                     f"📍 *Giriş (Entry):* `${res['entry']}`\n"
                     f"🛑 *Stop Loss (SL):* `${res['sl']}`\n"
                     f"🎯 *Take Profit (TP):* `${res['tp']}`"
@@ -128,29 +131,29 @@ def background_auto_signals():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🧠 *True SMC & Order Block Füçers Botu* aktivdir!\n"
-        "Ani analiz almaq üçün `/analiz` yazın.",
+        "⚖️ *10 Coin + Qızıl SMC Botu* aktivdir!\n"
+        "Ani analiz üçün `/analiz` yazın.",
         parse_mode="Markdown"
     )
 
 async def analiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Binance Futures qrafikləri SMC üzrə skan edilir...")
+    await update.message.reply_text("🔍 10 Kriptovalyuta və Qızıl bazarı skan edilir...")
     res = get_best_smc_signal()
     
     if res:
         msg = (
-            f"📊 *SMC Füçers Ticarət Siqnalı*\n\n"
-            f"🪙 *Coin:* `{res['symbol']}`\n"
+            f"📊 *SMC Ticarət Siqnalı*\n\n"
+            f"🪙 *Aktiv:* `{res['symbol']}`\n"
             f"⚙️ *Leverage:* `{res['leverage']}x`\n"
             f"🎯 *Strategiya:* *{res['bias']}*\n"
-            f"⚡ *Balanssızlıq (FVG):* `{res['fvg']}`\n\n"
+            f"⚡ *Həcm:* `{res['volume']}`\n\n"
             f"📍 *Giriş (Entry):* `${res['entry']}`\n"
             f"🛑 *Stop Loss (SL):* `${res['sl']}`\n"
             f"🎯 *Take Profit (TP):* `${res['tp']}`"
         )
         await update.message.reply_text(msg, parse_mode="Markdown")
     else:
-        await update.message.reply_text("Hazırda uyğun SMC strukturu tapılmadı.")
+        await update.message.reply_text("Məlumat alınarkən xəta baş verdi.")
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
@@ -163,4 +166,4 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("analiz", analiz))
     app.run_polling()
-        
+                
