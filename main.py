@@ -41,18 +41,15 @@ def env_bool(name, default=True):
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID", "1121794078")
 
-FUTURES_COINS = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "SOLUSDT",
-    "BNBUSDT",
-    "XRPUSDT",
-    "ADAUSDT",
-    "AVAXUSDT",
-    "DOGEUSDT",
-    "LINKUSDT",
-    "SUIUSDT",
+# Əgər dinamik siyahı çəkilə bilməzsə, ehtiyat (fallback) siyahı
+FALLBACK_COINS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+    "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "LINKUSDT", "SUIUSDT",
 ]
+
+SCAN_TOP_N_COINS = int(os.getenv("SCAN_TOP_N_COINS", "40"))  # Neçə ən likvid coin taransın
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))  # Neçə saniyədə bir avtomatik yoxlansın (defolt: 5 dəqiqə)
+NOTIFY_COOLDOWN_SECONDS = int(os.getenv("NOTIFY_COOLDOWN_SECONDS", "7200"))  # Eyni coin üçün təkrar bildiriş arası minimum vaxt (defolt: 2 saat)
 LEVERAGE = 10
 
 # --- SMC PARAMETRLƏRİ ---
@@ -76,7 +73,32 @@ RISK_PERCENT = float(os.getenv("RISK_PERCENT", "1"))           # Əməliyyat ba�
 #                       DATA ÇƏKİLMƏSİ
 # ============================================================
 
-def fetch_klines(symbol, interval="60", limit=KLINES_LIMIT):
+def fetch_top_liquid_coins(limit=SCAN_TOP_N_COINS):
+  """
+  Bybit-dəki bütün USDT Perpetual coinləri 24 saatlıq dövriyyəyə (turnover)
+  görə sıralayıb ən likvid olanları qaytarır. Bu, statik 10 coin siyahısından
+  daha geniş bazar taraması təmin edir - eyni sərt SMC qaydaları ilə.
+  """
+  url = "https://api.bybit.com/v5/market/tickers?category=linear"
+  try:
+    response = requests.get(url, timeout=8)
+    if response.status_code == 200:
+      payload = response.json()
+      if payload.get("retCode") == 0:
+        rows = payload.get("result", {}).get("list", [])
+        usdt_pairs = [r for r in rows if r.get("symbol", "").endswith("USDT")]
+        usdt_pairs.sort(key=lambda r: float(r.get("turnover24h") or 0), reverse=True)
+        symbols = [r["symbol"] for r in usdt_pairs[:limit]]
+        if symbols:
+          logging.info(f"Dinamik siyahı: {len(symbols)} ən likvid coin taranacaq.")
+          return symbols
+  except Exception as e:
+    logging.error(f"Ən likvid coin siyahısı çəkilə bilmədi: {e}")
+  logging.warning("Ehtiyat (fallback) coin siyahısı istifadə olunur.")
+  return FALLBACK_COINS
+
+
+
   """
   Bybit Futures (v5, USDT Perpetual = 'linear' category) API-dən şam datası çəkir.
   interval: Bybit formatı - "60" = 1 saat, "D" = günlük.
@@ -400,13 +422,14 @@ def analyze_smc_pro(symbol, session_active, session_name):
 
 
 def get_best_smc_signal():
-  """Bütün coinləri yoxlayır, ilk uyğun siqnalı və hər coin üçün diaqnostikanı qaytarır."""
+  """Bütün coinləri (dinamik ən likvid siyahı) yoxlayır, ilk uyğun siqnalı və hər coin üçün diaqnostikanı qaytarır."""
   session_active, session_name = get_trading_session()
+  coins_to_scan = fetch_top_liquid_coins()
   all_results = []
-  for symbol in FUTURES_COINS:
+  for symbol in coins_to_scan:
     res = analyze_smc_pro(symbol, session_active, session_name)
     all_results.append(res)
-    time.sleep(0.2)
+    time.sleep(0.15)
 
   for res in all_results:
     if res["passed"]:
@@ -415,21 +438,44 @@ def get_best_smc_signal():
   return None, all_results
 
 
-def format_diagnostics(all_results):
-  """Heç bir siqnal tapılmayanda, hər coin üçün nə baş verdiyini göstərir."""
-  lines = ["📋 *Analiz Detalları (nəyə görə siqnal tapılmadı):*\n"]
+def format_diagnostics(all_results, max_detail=8):
+  """
+  Heç bir siqnal tapılmayanda, ümumi xülasə (hansı şərtdə neçə coin dayandı)
+  + ilk bir neçə coin üçün ətraflı detal göstərir (mesaj çox uzun olmasın deyə).
+  """
+  total = len(all_results)
+  reason_counts = {}
+  error_count = 0
+
   for res in all_results:
+    if res["error"]:
+      error_count += 1
+      continue
+    failed = [name for name, ok in res["conditions"].items() if not ok]
+    if failed:
+      # İlk (ən erkən) ödənilməyən şərti "əsas səbəb" kimi qeyd edirik
+      key = failed[0].split(" (")[0]  # detaldan (mötərizədən) əvvəlki hissə
+      reason_counts[key] = reason_counts.get(key, 0) + 1
+
+  lines = [f"📋 *Xülasə:* {total} coin yoxlanıldı, heç biri bütün şərtləri ödəmədi.\n"]
+  lines.append("*Səbəblərin bölgüsü:*")
+  for reason, count in sorted(reason_counts.items(), key=lambda x: -x[1]):
+    lines.append(f"• {reason}: `{count}` coin")
+  if error_count:
+    lines.append(f"• API xətası: `{error_count}` coin")
+
+  lines.append(f"\n*Ətraflı (ilk {max_detail} coin):*")
+  for res in all_results[:max_detail]:
     symbol = res["symbol"]
     if res["error"]:
       lines.append(f"• `{symbol}`: ❌ {res['error']}")
     else:
       failed = [name for name, ok in res["conditions"].items() if not ok]
       if failed:
-        lines.append(f"• `{symbol}`: ❌ Ödənilməyən şərt:")
-        for f in failed:
-          lines.append(f"   - {f}")
+        lines.append(f"• `{symbol}`: ❌ {failed[0]}")
       else:
         lines.append(f"• `{symbol}`: ✅ Bütün şərtlər ödənildi")
+
   return "\n".join(lines)
 
 
@@ -451,16 +497,27 @@ def format_signal_message(res, title="📊 *Professional SMC Ticarət Siqnalı*"
   )
 
 
+_last_notified = {}  # {symbol: son_bildiriş_vaxtı (unix timestamp)}
+
+
 def background_auto_signals(application):
   if not TOKEN:
     return
   while True:
-    time.sleep(3600)
+    time.sleep(CHECK_INTERVAL_SECONDS)
     try:
       res, _ = get_best_smc_signal()
       if res:
-        msg = format_signal_message(res, title="🚨 *AVTOMATİK PROFESSIONAL SİQNAL* 🚨")
-        application.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+        symbol = res["symbol"]
+        now = time.time()
+        last_time = _last_notified.get(symbol, 0)
+        if now - last_time >= NOTIFY_COOLDOWN_SECONDS:
+          msg = format_signal_message(res, title="🚨 *AVTOMATİK PROFESSIONAL SİQNAL* 🚨")
+          application.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+          _last_notified[symbol] = now
+          logging.info(f"{symbol}: bildiriş göndərildi.")
+        else:
+          logging.info(f"{symbol}: siqnal var, amma cooldown aktivdir - bildiriş göndərilmədi.")
     except Exception as e:
       logging.error(f"Avtomatik xəta: {e}")
 
@@ -469,6 +526,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
   await update.message.reply_text(
       "📊 *Professional SMC Bot* aktivdir!\n"
       "Canlı analiz üçün `/analiz` yazın.\n\n"
+      f"🔔 Bot arxa planda hər {CHECK_INTERVAL_SECONDS // 60} dəqiqədən bir avtomatik yoxlayır "
+      "və uyğun siqnal tapılan kimi sizə bildiriş göndərəcək.\n\n"
       "Metodologiya: Daily Trend + 1H BOS + Liquidity Sweep + Order Block + FVG "
       "+ Liquidity Target + Risk İdarəçiliyi + Seans Filtri",
       parse_mode="Markdown",
@@ -477,39 +536,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def analiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
   await update.message.reply_text(
-      "🔍 Professional SMC analiz edilir (Daily trend + 1H BOS + Sweep + OB + FVG)..."
+      f"🔍 Ən likvid {SCAN_TOP_N_COINS} coin üzərində Professional SMC analiz edilir "
+      f"(Daily trend + 1H BOS + Sweep + OB + FVG)... Bu bir az vaxt ala bilər."
   )
-  res, all_results = get_best_smc_signal()
-
-  if res:
-    msg = format_signal_message(res)
-    await update.message.reply_text(msg, parse_mode="Markdown")
-  else:
-    diag = format_diagnostics(all_results)
-    await update.message.reply_text(
-        "Hazırda peşəkar SMC şərtlərinin hamısını ödəyən struktur tapılmadı.\n\n" + diag,
-        parse_mode="Markdown",
-    )
-
-
-def main():
-  if not TOKEN:
-    logging.error("BOT_TOKEN tapılmadı! Environment variables yoxlayın.")
-    return
-
-  keep_alive()
-
-  application = ApplicationBuilder().token(TOKEN).build()
-  application.add_handler(CommandHandler("start", start))
-  application.add_handler(CommandHandler("analiz", analiz))
-
-  t_auto = Thread(target=background_auto_signals, args=(application,), daemon=True)
-  t_auto.start()
-
-  logging.info("Bot işə düşdü...")
-  application.run_polling()
-
-
-if __name__ == "__main__":
-  main()
-    
+  res, all_results = 
