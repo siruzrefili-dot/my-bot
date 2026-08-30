@@ -13,7 +13,7 @@ app_flask = Flask('')
 
 @app_flask.route('/')
 def home():
-    return "Expanded 10 Coins + Gold SMC Bot is running!"
+    return "Fixed 10 Coins + Gold SMC Bot is running!"
 
 def run_flask():
     app_flask.run(host='0.0.0.0', port=int(os.getenv("PORT", 10000)))
@@ -25,7 +25,6 @@ def keep_alive():
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = "1121794078"
 
-# 10 Kriptovalyuta + Qızıl (PAXGUSDT birbaşa qızıl qiymətini izləyir)
 FUTURES_COINS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", 
     "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "LINKUSDT", "SUIUSDT", "PAXGUSDT"
@@ -33,7 +32,6 @@ FUTURES_COINS = [
 LEVERAGE = 10
 
 def fetch_binance_futures_klines(symbol, interval="1h", limit=100):
-    # PAXG spot bazarda işlədiyi üçün şərt qoyuruq, digərləri futures-dur
     if symbol == "PAXGUSDT":
         url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
     else:
@@ -43,6 +41,8 @@ def fetch_binance_futures_klines(symbol, interval="1h", limit=100):
         response = requests.get(url, timeout=10)
         if response.status_code == 200:
             data = response.json()
+            if not data or not isinstance(data, list):
+                return None
             df = pd.DataFrame(data, columns=[
                 'timestamp', 'open', 'high', 'low', 'close', 'volume',
                 'close_time', 'quote_asset_volume', 'number_of_trades',
@@ -60,7 +60,7 @@ def fetch_binance_futures_klines(symbol, interval="1h", limit=100):
 
 def analyze_balanced_smc(symbol):
     df = fetch_binance_futures_klines(symbol, interval="1h", limit=100)
-    if df is None or len(df) < 50:
+    if df is None or len(df) < 30:
         return None
 
     current_price = df['close'].iloc[-1]
@@ -109,7 +109,7 @@ def background_auto_signals():
     
     while True:
         try:
-            time.sleep(3600) # Hər 1 saatdan bir
+            time.sleep(3600)
             res = get_best_smc_signal()
             if res:
                 msg = (
@@ -166,4 +166,4 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("analiz", analiz))
     app.run_polling()
-                
+        
