@@ -5,6 +5,7 @@ import pandas as pd
 from flask import Flask
 from threading import Thread
 import time
+from datetime import datetime, timezone
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
@@ -17,7 +18,7 @@ app_flask = Flask('')
 
 @app_flask.route('/')
 def home():
-  return "Real SMC Bot is running!"
+  return "Professional SMC Bot is running!"
 
 
 def run_flask():
@@ -28,6 +29,13 @@ def run_flask():
 def keep_alive():
   t = Thread(target=run_flask, daemon=True)
   t.start()
+
+
+def env_bool(name, default=True):
+  val = os.getenv(name)
+  if val is None:
+    return default
+  return val.strip().lower() in ("1", "true", "yes", "beli", "bəli")
 
 
 TOKEN = os.getenv("BOT_TOKEN")
@@ -48,15 +56,30 @@ FUTURES_COINS = [
 LEVERAGE = 10
 
 # --- SMC PARAMETRLƏRİ ---
-SWING_LOOKBACK = 2      # Swing high/low təyin etmək üçün hər tərəfdən neçə şama baxılsın
-MIN_RR_RATIO = 1.5      # Minimum Risk/Mükafat nisbəti (1:1.5)
-KLINES_LIMIT = 150      # Analiz üçün çəkiləcək şam sayı
+SWING_LOOKBACK = 2          # Swing high/low təyin etmək üçün hər tərəfdən neçə şama baxılsın
+MIN_RR_RATIO = 2.0          # Minimum Risk/Mükafat nisbəti (peşəkar standart: 1:2)
+KLINES_LIMIT = 150          # 1H analiz üçün çəkiləcək şam sayı
+DAILY_KLINES_LIMIT = 120    # Günlük trend üçün çəkiləcək şam sayı
+
+# --- ƏLAVƏ ŞƏRTLƏRİ AÇ/BAĞLA (Environment Variables ilə tənzimlənə bilər) ---
+REQUIRE_TREND_ALIGN = env_bool("REQUIRE_TREND_ALIGN", True)        # 1H BOS günlük trendlə üst-üstə düşməlidir
+REQUIRE_LIQUIDITY_SWEEP = env_bool("REQUIRE_LIQUIDITY_SWEEP", True)  # BOS-dan əvvəl liquidity sweep olmalıdır
+REQUIRE_FVG = env_bool("REQUIRE_FVG", True)                        # Fair Value Gap mövcud olmalıdır
+REQUIRE_SESSION_FILTER = env_bool("REQUIRE_SESSION_FILTER", True)  # Yalnız London/NY seansında siqnal
+
+# --- RİSK İDARƏÇİLİYİ ---
+ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "1000"))  # Fərz edilən balans (USDT)
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "1"))           # Əməliyyat başına risk (%)
 
 
-def fetch_futures_klines(symbol, interval="60", limit=KLINES_LIMIT):
+# ============================================================
+#                       DATA ÇƏKİLMƏSİ
+# ============================================================
+
+def fetch_klines(symbol, interval="60", limit=KLINES_LIMIT):
   """
-  Bybit Futures (v5, USDT Perpetual = 'linear' category) API-dən şam (kline) datası çəkir.
-  interval: Bybit formatı - "60" = 1 saat.
+  Bybit Futures (v5, USDT Perpetual = 'linear' category) API-dən şam datası çəkir.
+  interval: Bybit formatı - "60" = 1 saat, "D" = günlük.
   """
   url = (
       f"https://api.bybit.com/v5/market/kline"
@@ -68,28 +91,15 @@ def fetch_futures_klines(symbol, interval="60", limit=KLINES_LIMIT):
       payload = response.json()
       if payload.get("retCode") == 0:
         rows = payload.get("result", {}).get("list", [])
-        if len(rows) > 60:
+        if len(rows) > 30:
           df = pd.DataFrame(
               rows,
-              columns=[
-                  "timestamp",
-                  "open",
-                  "high",
-                  "low",
-                  "close",
-                  "volume",
-                  "turnover",
-              ],
+              columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
           )
-          # Bybit ən yeni şamı birinci qaytarır - xronoloji sıraya (köhnədən yeniyə) salırıq
-          df = df.iloc[::-1].reset_index(drop=True)
-          df["open"] = df["open"].astype(float)
-          df["high"] = df["high"].astype(float)
-          df["low"] = df["low"].astype(float)
-          df["close"] = df["close"].astype(float)
-          df["volume"] = df["volume"].astype(float)
-          # Son sətir hələ bağlanmamış (davam edən) şamdır - onu çıxarırıq
-          df = df.iloc[:-1].reset_index(drop=True)
+          df = df.iloc[::-1].reset_index(drop=True)  # köhnədən yeniyə sırala
+          for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = df[col].astype(float)
+          df = df.iloc[:-1].reset_index(drop=True)  # son (natamam) şamı çıxar
           return df
         else:
           logging.warning(f"{symbol}: Bybit-dən qaytarılan data kifayət qədər deyil (len={len(rows)})")
@@ -104,45 +114,50 @@ def fetch_futures_klines(symbol, interval="60", limit=KLINES_LIMIT):
   return None
 
 
+# ============================================================
+#                    STRUKTUR / SMC FUNKSİYALARI
+# ============================================================
+
 def find_swing_points(df, lookback=SWING_LOOKBACK):
-  """
-  Fraktal əsaslı swing high/low nöqtələrini tapır.
-  Bir şam yalnız o halda 'swing high'dır ki, hər iki tərəfdəki
-  'lookback' qədər şamdan da yüksək olsun (eyni qayda swing low üçün).
-  """
+  """Fraktal əsaslı swing high/low nöqtələrini tapır."""
   highs = df["high"].values
   lows = df["low"].values
   n = len(df)
-  swing_highs = []  # [(index, qiymət), ...]
-  swing_lows = []
+  swing_highs, swing_lows = [], []
 
   for i in range(lookback, n - lookback):
-    left_high = highs[i - lookback:i]
-    right_high = highs[i + 1:i + lookback + 1]
-    if highs[i] > left_high.max() and highs[i] > right_high.max():
+    left_h, right_h = highs[i - lookback:i], highs[i + 1:i + lookback + 1]
+    if highs[i] > left_h.max() and highs[i] > right_h.max():
       swing_highs.append((i, highs[i]))
-
-    left_low = lows[i - lookback:i]
-    right_low = lows[i + 1:i + lookback + 1]
-    if lows[i] < left_low.min() and lows[i] < right_low.min():
+    left_l, right_l = lows[i - lookback:i], lows[i + 1:i + lookback + 1]
+    if lows[i] < left_l.min() and lows[i] < right_l.min():
       swing_lows.append((i, lows[i]))
 
   return swing_highs, swing_lows
 
 
+def determine_trend_bias(swing_highs, swing_lows):
+  """HH/HL -> bullish, LH/LL -> bearish, əks halda ranging."""
+  if len(swing_highs) < 2 or len(swing_lows) < 2:
+    return None
+  hh = swing_highs[-1][1] > swing_highs[-2][1]
+  hl = swing_lows[-1][1] > swing_lows[-2][1]
+  lh = swing_highs[-1][1] < swing_highs[-2][1]
+  ll = swing_lows[-1][1] < swing_lows[-2][1]
+  if hh and hl:
+    return "bullish"
+  if lh and ll:
+    return "bearish"
+  return "ranging"
+
+
 def detect_bos(df, swing_highs, swing_lows):
-  """
-  BOS (Break of Structure) aşkarlayır: cari (son bağlanmış) qiymət
-  son swing high-ı keçibsə -> bullish BOS,
-  son swing low-u keçibsə -> bearish BOS.
-  """
+  """Cari qiymət son swing-i keçibsə BOS aşkarlanır."""
   if not swing_highs or not swing_lows:
     return None, None
-
   last_close = df["close"].iloc[-1]
   last_sh_idx, last_sh_price = swing_highs[-1]
   last_sl_idx, last_sl_price = swing_lows[-1]
-
   if last_close > last_sh_price:
     return "bullish", last_sh_idx
   if last_close < last_sl_price:
@@ -151,30 +166,66 @@ def detect_bos(df, swing_highs, swing_lows):
 
 
 def find_order_block(df, direction, break_idx):
-  """
-  BOS-a səbəb olan impulsiv hərəkətdən əvvəlki son ƏKS istiqamətli
-  şamı (Order Block) tapır.
-  Bullish BOS -> son qırmızı (bearish) şam axtarılır.
-  Bearish BOS -> son yaşıl (bullish) şam axtarılır.
-  """
+  """BOS-a səbəb olan impulsdan əvvəlki son əks-istiqamətli şam (OB)."""
   segment = df.iloc[break_idx:-1]
   if segment.empty:
     return None
-
   if direction == "bullish":
     candidates = segment[segment["close"] < segment["open"]]
   else:
     candidates = segment[segment["close"] > segment["open"]]
-
   if candidates.empty:
     return None
-
   ob = candidates.iloc[-1]
   return {"high": float(ob["high"]), "low": float(ob["low"])}
 
 
+def detect_liquidity_sweep(df, direction, break_idx, lookback_window=15):
+  """
+  BOS-dan əvvəlki pəncərədə 'stop-hunt' (liquidity sweep) axtarır:
+  qiymət əvvəlki bir dibi/zirvəni kəsib keçir, sonra geri qayıdıb bağlanır.
+  """
+  start = max(0, break_idx - lookback_window)
+  segment = df.iloc[start:break_idx + 1].reset_index(drop=True)
+  if len(segment) < 3:
+    return False
+
+  if direction == "bullish":
+    for i in range(2, len(segment)):
+      prior_min = segment["low"].iloc[:i].min()
+      if segment["low"].iloc[i] < prior_min and segment["close"].iloc[i] > prior_min:
+        return True
+  else:
+    for i in range(2, len(segment)):
+      prior_max = segment["high"].iloc[:i].max()
+      if segment["high"].iloc[i] > prior_max and segment["close"].iloc[i] < prior_max:
+        return True
+  return False
+
+
+def detect_fvg(df, direction, break_idx, lookback_window=15):
+  """
+  Impuls seqmentində Fair Value Gap (3-şam boşluğu) axtarır.
+  Bullish FVG: şam[i-1].high < şam[i+1].low
+  Bearish FVG: şam[i-1].low > şam[i+1].high
+  """
+  start = max(0, break_idx - lookback_window)
+  segment = df.iloc[start:break_idx + 1].reset_index(drop=True)
+  if len(segment) < 3:
+    return False
+
+  for i in range(1, len(segment) - 1):
+    if direction == "bullish":
+      if segment["high"].iloc[i - 1] < segment["low"].iloc[i + 1]:
+        return True
+    else:
+      if segment["low"].iloc[i - 1] > segment["high"].iloc[i + 1]:
+        return True
+  return False
+
+
 def find_next_liquidity(direction, current_price, swing_highs, swing_lows):
-  """TP hədəfi kimi növbəti (hələ toxunulmamış) likvidlik səviyyəsini tapır."""
+  """TP hədəfi: növbəti (hələ toxunulmamış) likvidlik səviyyəsi."""
   if direction == "bullish":
     targets = [p for _, p in swing_highs if p > current_price]
     return min(targets) if targets else None
@@ -183,46 +234,107 @@ def find_next_liquidity(direction, current_price, swing_highs, swing_lows):
     return max(targets) if targets else None
 
 
-def analyze_smc(symbol):
-  """
-  Əsl Smart Money Concepts məntiqi ilə analiz:
-  1. Swing nöqtələri (bazar strukturu)
-  2. BOS (Break of Structure)
-  3. Order Block (impulsu yaradan əks şam)
-  4. Qiymətin OB zonasına geri çəkilməsi (retracement)
-  5. Növbəti likvidlik səviyyəsi (TP)
-  6. Risk/Mükafat yoxlanması
-  """
-  df = fetch_futures_klines(symbol)
+def get_trading_session():
+  """Hazırda London/New York (yüksək likvidlik) seansındayıqmı yoxlayır."""
+  hour = datetime.now(timezone.utc).hour
+  in_london = 7 <= hour < 16
+  in_ny = 13 <= hour < 22
+  active = in_london or in_ny
+  labels = []
+  if in_london:
+    labels.append("London")
+  if in_ny:
+    labels.append("New York")
+  session_name = " + ".join(labels) if labels else "Asiya seansı (aşağı likvidlik)"
+  return active, session_name
 
+
+# ============================================================
+#                    ƏSAS ANALİZ FUNKSİYASI
+# ============================================================
+
+def get_daily_trend_bias(symbol):
+  """Günlük (Daily) timeframe-də ümumi trend istiqamətini müəyyənləşdirir."""
+  df_daily = fetch_klines(symbol, interval="D", limit=DAILY_KLINES_LIMIT)
+  if df_daily is None or len(df_daily) < 30:
+    return None
+  sh, sl = find_swing_points(df_daily, lookback=2)
+  return determine_trend_bias(sh, sl)
+
+
+def analyze_smc_pro(symbol, session_active, session_name):
+  """
+  Peşəkar SMC analiz zənciri:
+  1. Günlük trend bias
+  2. 1H bazar strukturu + BOS
+  3. BOS-un günlük trendlə uyğunluğu (Trend Filter)
+  4. Liquidity Sweep
+  5. Order Block
+  6. Fair Value Gap (əlavə təsdiq)
+  7. Qiymətin OB zonasına retracement-i
+  8. Liquidity Target (TP)
+  9. Risk/Mükafat nisbəti
+  10. Aktiv treyding seansı (London/NY)
+  """
+  conditions = {}
+
+  # --- 1. Günlük trend ---
+  daily_bias = get_daily_trend_bias(symbol)
+  cond_daily = daily_bias in ("bullish", "bearish")
+  conditions[f"Günlük trend aydındır (nəticə: {daily_bias or 'naməlum'})"] = cond_daily
+  if not cond_daily:
+    return {"symbol": symbol, "passed": False, "error": None, "conditions": conditions}
+
+  # --- 2. 1H data və struktur ---
+  df = fetch_klines(symbol, interval="60", limit=KLINES_LIMIT)
   if df is None or len(df) < 60:
     return {
-        "symbol": symbol,
-        "passed": False,
-        "error": "Bybit API-dən data alınmadı (şəbəkə problemi ola bilər)",
+        "symbol": symbol, "passed": False,
+        "error": "Bybit API-dən 1H data alınmadı (şəbəkə problemi ola bilər)",
         "conditions": {},
     }
 
-  conditions = {}
-
   swing_highs, swing_lows = find_swing_points(df)
   cond_structure = len(swing_highs) >= 2 and len(swing_lows) >= 2
-  conditions["Kifayət qədər bazar strukturu (swing nöqtələri) mövcuddur"] = cond_structure
+  conditions["1H bazar strukturu (swing nöqtələri) kifayətdir"] = cond_structure
   if not cond_structure:
     return {"symbol": symbol, "passed": False, "error": None, "conditions": conditions}
 
   direction, break_idx = detect_bos(df, swing_highs, swing_lows)
   cond_bos = direction is not None
-  conditions["BOS baş verib (struktur qırılıb)"] = cond_bos
+  conditions["1H-da BOS baş verib (struktur qırılıb)"] = cond_bos
   if not cond_bos:
     return {"symbol": symbol, "passed": False, "error": None, "conditions": conditions}
 
+  # --- 3. Trend Filter ---
+  if REQUIRE_TREND_ALIGN:
+    cond_trend_align = (direction == daily_bias)
+    conditions[f"1H BOS günlük trendlə üst-üstə düşür ({direction} vs {daily_bias})"] = cond_trend_align
+    if not cond_trend_align:
+      return {"symbol": symbol, "passed": False, "error": None, "conditions": conditions}
+
+  # --- 4. Liquidity Sweep ---
+  if REQUIRE_LIQUIDITY_SWEEP:
+    cond_sweep = detect_liquidity_sweep(df, direction, break_idx)
+    conditions["Liquidity Sweep (stop-hunt) aşkarlanıb"] = cond_sweep
+    if not cond_sweep:
+      return {"symbol": symbol, "passed": False, "error": None, "conditions": conditions}
+
+  # --- 5. Order Block ---
   ob = find_order_block(df, direction, break_idx)
   cond_ob = ob is not None
   conditions["Order Block (OB) tapıldı"] = cond_ob
   if not cond_ob:
     return {"symbol": symbol, "passed": False, "error": None, "conditions": conditions}
 
+  # --- 6. Fair Value Gap ---
+  if REQUIRE_FVG:
+    cond_fvg = detect_fvg(df, direction, break_idx)
+    conditions["Fair Value Gap (FVG) mövcuddur"] = cond_fvg
+    if not cond_fvg:
+      return {"symbol": symbol, "passed": False, "error": None, "conditions": conditions}
+
+  # --- 7. Retracement OB zonasına ---
   current_price = df["close"].iloc[-1]
   buffer = (ob["high"] - ob["low"]) * 0.1
   in_zone = (ob["low"] - buffer) <= current_price <= (ob["high"] + buffer)
@@ -232,6 +344,7 @@ def analyze_smc(symbol):
   if not in_zone:
     return {"symbol": symbol, "passed": False, "error": None, "conditions": conditions}
 
+  # --- 8. Liquidity Target (TP) ---
   liquidity_target = find_next_liquidity(direction, current_price, swing_highs, swing_lows)
   cond_liquidity = liquidity_target is not None
   conditions["Növbəti likvidlik səviyyəsi (TP hədəfi) mövcuddur"] = cond_liquidity
@@ -242,23 +355,35 @@ def analyze_smc(symbol):
   if direction == "bullish":
     sl = round(ob["low"] * 0.997, 4)
     tp = round(liquidity_target, 4)
-    bias = "🟢 LONG (Bullish Order Block Retest)"
+    bias = "🟢 LONG (Bullish OB Retest + Trend Aligned)"
   else:
     sl = round(ob["high"] * 1.003, 4)
     tp = round(liquidity_target, 4)
-    bias = "🔴 SHORT (Bearish Order Block Retest)"
+    bias = "🔴 SHORT (Bearish OB Retest + Trend Aligned)"
 
   risk = abs(entry - sl)
   reward = abs(tp - entry)
   rr_ratio = (reward / risk) if risk > 0 else 0
+
+  # --- 9. Risk/Mükafat ---
   cond_rr = rr_ratio >= MIN_RR_RATIO
   conditions[f"Risk/Mükafat nisbəti kifayətdir (>= 1:{MIN_RR_RATIO}, faktiki: 1:{rr_ratio:.2f})"] = cond_rr
+  if not cond_rr:
+    return {"symbol": symbol, "passed": False, "error": None, "conditions": conditions}
 
-  passed = cond_rr
+  # --- 10. Seans filtri ---
+  if REQUIRE_SESSION_FILTER:
+    conditions[f"Aktiv treyding seansındayıq (hazırda: {session_name})"] = session_active
+    if not session_active:
+      return {"symbol": symbol, "passed": False, "error": None, "conditions": conditions}
+
+  # --- Risk idarəçiliyi: pozisiya ölçüsü ---
+  risk_amount = ACCOUNT_BALANCE * (RISK_PERCENT / 100)
+  position_size = (risk_amount / risk) if risk > 0 else 0
 
   return {
       "symbol": symbol,
-      "passed": passed,
+      "passed": True,
       "error": None,
       "conditions": conditions,
       "bias": bias,
@@ -267,19 +392,21 @@ def analyze_smc(symbol):
       "tp": tp,
       "rr_ratio": round(rr_ratio, 2),
       "leverage": LEVERAGE,
+      "risk_amount": round(risk_amount, 2),
+      "position_size": round(position_size, 4),
+      "daily_bias": daily_bias,
+      "session": session_name,
   }
 
 
 def get_best_smc_signal():
-  """
-  Bütün coinləri yoxlayır. Şərtləri ödəyən ilk siqnalı,
-  və HƏR coin üçün diaqnostik nəticələri qaytarır.
-  """
+  """Bütün coinləri yoxlayır, ilk uyğun siqnalı və hər coin üçün diaqnostikanı qaytarır."""
+  session_active, session_name = get_trading_session()
   all_results = []
   for symbol in FUTURES_COINS:
-    res = analyze_smc(symbol)
+    res = analyze_smc_pro(symbol, session_active, session_name)
     all_results.append(res)
-    time.sleep(0.2)  # Rate-limit xətasının qarşısını almaq üçün kiçik fasilə
+    time.sleep(0.2)
 
   for res in all_results:
     if res["passed"]:
@@ -306,6 +433,24 @@ def format_diagnostics(all_results):
   return "\n".join(lines)
 
 
+def format_signal_message(res, title="📊 *Professional SMC Ticarət Siqnalı*"):
+  return (
+      f"{title}\n\n"
+      f"🪙 *Aktiv:* `{res['symbol']}`\n"
+      f"⚙️ *Leverage:* `{res['leverage']}x`\n"
+      f"🎯 *Strategiya:* *{res['bias']}*\n"
+      f"📈 *Günlük Trend:* `{res['daily_bias']}`\n"
+      f"🕒 *Seans:* `{res['session']}`\n"
+      f"⚖️ *Risk/Mükafat:* `1:{res['rr_ratio']}`\n\n"
+      f"📍 *Giriş (Entry):* `${res['entry']}`\n"
+      f"🛑 *Stop Loss (SL):* `${res['sl']}`\n"
+      f"🎯 *Take Profit (TP):* `${res['tp']}`\n\n"
+      f"💰 *Risk İdarəçiliyi:*\n"
+      f"   Balans: `${ACCOUNT_BALANCE}` | Risk: `{RISK_PERCENT}%` (`${res['risk_amount']}`)\n"
+      f"   Tövsiyə olunan pozisiya ölçüsü: `{res['position_size']}` {res['symbol'].replace('USDT','')}"
+  )
+
+
 def background_auto_signals(application):
   if not TOKEN:
     return
@@ -314,52 +459,35 @@ def background_auto_signals(application):
     try:
       res, _ = get_best_smc_signal()
       if res:
-        msg = (
-            f"🚨 *REAL SMC SİQNALİ* 🚨\n\n"
-            f"🪙 *Aktiv:* `{res['symbol']}`\n"
-            f"⚙️ *Leverage:* `{res['leverage']}x`\n"
-            f"🎯 *Strategiya:* *{res['bias']}*\n"
-            f"⚖️ *Risk/Mükafat:* `1:{res['rr_ratio']}`\n\n"
-            f"📍 *Giriş (Entry):* `${res['entry']}`\n"
-            f"🛑 *Stop Loss (SL):* `${res['sl']}`\n"
-            f"🎯 *Take Profit (TP):* `${res['tp']}`"
-        )
-        application.bot.send_message(
-            chat_id=CHAT_ID, text=msg, parse_mode="Markdown"
-        )
+        msg = format_signal_message(res, title="🚨 *AVTOMATİK PROFESSIONAL SİQNAL* 🚨")
+        application.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
     except Exception as e:
       logging.error(f"Avtomatik xəta: {e}")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
   await update.message.reply_text(
-      "📊 *Real SMC Bot* aktivdir!\n"
+      "📊 *Professional SMC Bot* aktivdir!\n"
       "Canlı analiz üçün `/analiz` yazın.\n\n"
-      "Metodologiya: Market Structure (BOS) + Order Block + Liquidity Target",
+      "Metodologiya: Daily Trend + 1H BOS + Liquidity Sweep + Order Block + FVG "
+      "+ Liquidity Target + Risk İdarəçiliyi + Seans Filtri",
       parse_mode="Markdown",
   )
 
 
 async def analiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-  await update.message.reply_text("🔍 Real SMC (BOS + Order Block) əsasında bazar skan edilir...")
+  await update.message.reply_text(
+      "🔍 Professional SMC analiz edilir (Daily trend + 1H BOS + Sweep + OB + FVG)..."
+  )
   res, all_results = get_best_smc_signal()
 
   if res:
-    msg = (
-        f"📊 *Real SMC Ticarət Siqnalı*\n\n"
-        f"🪙 *Aktiv:* `{res['symbol']}`\n"
-        f"⚙️ *Leverage:* `{res['leverage']}x`\n"
-        f"🎯 *Strategiya:* *{res['bias']}*\n"
-        f"⚖️ *Risk/Mükafat:* `1:{res['rr_ratio']}`\n\n"
-        f"📍 *Giriş (Entry):* `${res['entry']}`\n"
-        f"🛑 *Stop Loss (SL):* `${res['sl']}`\n"
-        f"🎯 *Take Profit (TP):* `${res['tp']}`"
-    )
+    msg = format_signal_message(res)
     await update.message.reply_text(msg, parse_mode="Markdown")
   else:
     diag = format_diagnostics(all_results)
     await update.message.reply_text(
-        "Hazırda uyğun SMC strukturu tapılmadı.\n\n" + diag,
+        "Hazırda peşəkar SMC şərtlərinin hamısını ödəyən struktur tapılmadı.\n\n" + diag,
         parse_mode="Markdown",
     )
 
@@ -372,13 +500,10 @@ def main():
   keep_alive()
 
   application = ApplicationBuilder().token(TOKEN).build()
-
   application.add_handler(CommandHandler("start", start))
   application.add_handler(CommandHandler("analiz", analiz))
 
-  t_auto = Thread(
-      target=background_auto_signals, args=(application,), daemon=True
-  )
+  t_auto = Thread(target=background_auto_signals, args=(application,), daemon=True)
   t_auto.start()
 
   logging.info("Bot işə düşdü...")
@@ -387,4 +512,4 @@ def main():
 
 if __name__ == "__main__":
   main()
-  
+    
