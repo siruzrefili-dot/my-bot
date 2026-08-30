@@ -47,6 +47,10 @@ FUTURES_COINS = [
 ]
 LEVERAGE = 10
 
+# --- ŞƏRT PARAMETRLƏRİ (istəsəniz bunları dəyişə bilərsiniz) ---
+MIN_ZONE_DISTANCE_PCT = 0.5   # Premium/Discount zonasının orta xətdən min. uzaqlığı (%)
+MIN_VOLUME_RATIO = 0.7        # Cari həcmin orta həcmə nisbəti minimum həddi
+
 
 def fetch_binance_futures_klines(symbol, interval="1h", limit=100):
   url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
@@ -78,15 +82,29 @@ def fetch_binance_futures_klines(symbol, interval="1h", limit=100):
         df["close"] = df["close"].astype(float)
         df["volume"] = df["volume"].astype(float)
         return df
+      else:
+        logging.warning(f"{symbol}: Binance-dən qaytarılan data kifayət qədər deyil (len={len(data) if isinstance(data, list) else 'N/A'})")
+    else:
+      logging.error(f"{symbol}: Binance API status {response.status_code} - {response.text[:200]}")
   except Exception as e:
     logging.error(f"API xətası ({symbol}): {e}")
   return None
 
 
 def analyze_balanced_smc(symbol):
+  """
+  Hər coin üçün analiz aparır və bütün şərtlərin nəticəsini
+  (keçdi/keçmədi) qaytarır ki, diaqnostika mümkün olsun.
+  """
   df = fetch_binance_futures_klines(symbol)
+
   if df is None or len(df) < 30:
-    return None
+    return {
+        "symbol": symbol,
+        "passed": False,
+        "error": "API-dən data alınmadı (şəbəkə/geo-block ola bilər)",
+        "conditions": {},
+    }
 
   current_price = df["close"].iloc[-1]
   recent_high = df["high"].iloc[-30:-1].max()
@@ -95,7 +113,20 @@ def analyze_balanced_smc(symbol):
 
   avg_volume = df["volume"].mean()
   current_volume = df["volume"].iloc[-1]
-  is_volume_good = current_volume > (avg_volume * 0.7)
+  volume_ratio = (current_volume / avg_volume) if avg_volume > 0 else 0
+
+  zone_distance_pct = abs(current_price - mid_price) / mid_price * 100
+
+  # --- Şərtlər ---
+  cond_zone_clear = zone_distance_pct >= MIN_ZONE_DISTANCE_PCT
+  cond_volume_ok = volume_ratio >= MIN_VOLUME_RATIO
+
+  conditions = {
+      f"Aydın Premium/Discount zonası (>= {MIN_ZONE_DISTANCE_PCT}%, faktiki: {zone_distance_pct:.2f}%)": cond_zone_clear,
+      f"Həcm aktivdir (>= {MIN_VOLUME_RATIO*100:.0f}% orta, faktiki: {volume_ratio*100:.0f}%)": cond_volume_ok,
+  }
+
+  passed = all(conditions.values())
 
   if current_price < mid_price:
     bias = "🟢 LONG (SMC Discount Zone)"
@@ -108,10 +139,13 @@ def analyze_balanced_smc(symbol):
     sl = round(recent_high * 1.007, 2)
     tp = round(entry - ((sl - entry) * 2.5), 2)
 
-  volume_status = "Aktiv ⚡" if is_volume_good else "Normal 📊"
+  volume_status = "Aktiv ⚡" if cond_volume_ok else "Normal 📊"
 
   return {
       "symbol": symbol,
+      "passed": passed,
+      "error": None,
+      "conditions": conditions,
       "bias": bias,
       "entry": entry,
       "sl": sl,
@@ -122,11 +156,38 @@ def analyze_balanced_smc(symbol):
 
 
 def get_best_smc_signal():
+  """
+  Bütün coinləri yoxlayır. Şərtləri ödəyən ilk siqnalı,
+  və HƏR coin üçün diaqnostik nəticələri qaytarır.
+  """
+  all_results = []
   for symbol in FUTURES_COINS:
     res = analyze_balanced_smc(symbol)
-    if res:
-      return res
-  return None
+    all_results.append(res)
+
+  for res in all_results:
+    if res["passed"]:
+      return res, all_results
+
+  return None, all_results
+
+
+def format_diagnostics(all_results):
+  """Heç bir siqnal tapılmayanda, hər coin üçün nə baş verdiyini göstərir."""
+  lines = ["📋 *Analiz Detalları (nəyə görə siqnal tapılmadı):*\n"]
+  for res in all_results:
+    symbol = res["symbol"]
+    if res["error"]:
+      lines.append(f"• `{symbol}`: ❌ {res['error']}")
+    else:
+      failed = [name for name, ok in res["conditions"].items() if not ok]
+      if failed:
+        lines.append(f"• `{symbol}`: ❌ Ödənilməyən şərt(lər):")
+        for f in failed:
+          lines.append(f"   - {f}")
+      else:
+        lines.append(f"• `{symbol}`: ✅ Bütün şərtlər ödənildi")
+  return "\n".join(lines)
 
 
 def background_auto_signals(application):
@@ -135,7 +196,7 @@ def background_auto_signals(application):
   while True:
     time.sleep(3600)
     try:
-      res = get_best_smc_signal()
+      res, _ = get_best_smc_signal()
       if res:
         msg = (
             f"🚨 *REAL BAZAR SİQNALİ* 🚨\n\n"
@@ -147,7 +208,6 @@ def background_auto_signals(application):
             f"🛑 *Stop Loss (SL):* `${res['sl']}`\n"
             f"🎯 *Take Profit (TP):* `${res['tp']}`"
         )
-        # Botun daxili request mexanizmindən istifadə edirik
         application.bot.send_message(
             chat_id=CHAT_ID, text=msg, parse_mode="Markdown"
         )
@@ -165,7 +225,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def analiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
   await update.message.reply_text("🔍 Binance Futures canlı bazarı skan edilir...")
-  res = get_best_smc_signal()
+  res, all_results = get_best_smc_signal()
 
   if res:
     msg = (
@@ -180,7 +240,11 @@ async def analiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
   else:
-    await update.message.reply_text("Hazırda uyğun struktur tapılmadı.")
+    diag = format_diagnostics(all_results)
+    await update.message.reply_text(
+        "Hazırda uyğun struktur tapılmadı.\n\n" + diag,
+        parse_mode="Markdown",
+    )
 
 
 def main():
@@ -188,26 +252,21 @@ def main():
     logging.error("BOT_TOKEN tapılmadı! Environment variables yoxlayın.")
     return
 
-  # 1. Flask serverini arxa planda işə salırıq (Render yuxuya getməsin deyə)
   keep_alive()
 
-  # 2. Telegram botunu qururuq
   application = ApplicationBuilder().token(TOKEN).build()
 
   application.add_handler(CommandHandler("start", start))
   application.add_handler(CommandHandler("analiz", analiz))
 
-  # 3. Avtomatik siqnal göndərən thread-i başladırıq
   t_auto = Thread(
       target=background_auto_signals, args=(application,), daemon=True
   )
   t_auto.start()
 
-  # 4. Botu işə salırıq
   logging.info("Bot işə düşdü...")
   application.run_polling()
 
 
 if __name__ == "__main__":
   main()
-    
