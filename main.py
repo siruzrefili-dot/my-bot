@@ -59,10 +59,13 @@ KLINES_LIMIT = 150          # 1H analiz üçün çəkiləcək şam sayı
 DAILY_KLINES_LIMIT = 120    # Günlük trend üçün çəkiləcək şam sayı
 
 # --- ƏLAVƏ ŞƏRTLƏRİ AÇ/BAĞLA (Environment Variables ilə tənzimlənə bilər) ---
-REQUIRE_TREND_ALIGN = env_bool("REQUIRE_TREND_ALIGN", True)        # 1H BOS günlük trendlə üst-üstə düşməlidir
-REQUIRE_LIQUIDITY_SWEEP = env_bool("REQUIRE_LIQUIDITY_SWEEP", True)  # BOS-dan əvvəl liquidity sweep olmalıdır
+REQUIRE_TREND_ALIGN = env_bool("REQUIRE_TREND_ALIGN", True)        # 1H struktur günlük trendlə üst-üstə düşməlidir
+REQUIRE_LIQUIDITY_SWEEP = env_bool("REQUIRE_LIQUIDITY_SWEEP", True)  # BOS/CHoCH-dan əvvəl liquidity sweep olmalıdır
 REQUIRE_FVG = env_bool("REQUIRE_FVG", True)                        # Fair Value Gap mövcud olmalıdır
 REQUIRE_SESSION_FILTER = env_bool("REQUIRE_SESSION_FILTER", True)  # Yalnız London/NY seansında siqnal
+REQUIRE_OB_UNMITIGATED = env_bool("REQUIRE_OB_UNMITIGATED", True)  # OB artıq 'sındırılmış' olmamalıdır
+REQUIRE_CHOCH_ONLY = env_bool("REQUIRE_CHOCH_ONLY", False)         # Yalnız CHoCH (trend dönüşü) qəbul et, BOS yox
+REQUIRE_EQUAL_LEVEL_SWEEP = env_bool("REQUIRE_EQUAL_LEVEL_SWEEP", False)  # Sweep məhz Equal High/Low-a yaxın olmalıdır
 
 # --- RİSK İDARƏÇİLİYİ ---
 ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "1000"))  # Fərz edilən balans (USDT)
@@ -173,33 +176,123 @@ def determine_trend_bias(swing_highs, swing_lows):
   return "ranging"
 
 
-def detect_bos(df, swing_highs, swing_lows):
-  """Cari qiymət son swing-i keçibsə BOS aşkarlanır."""
-  if not swing_highs or not swing_lows:
-    return None, None
-  last_close = df["close"].iloc[-1]
-  last_sh_idx, last_sh_price = swing_highs[-1]
-  last_sl_idx, last_sl_price = swing_lows[-1]
-  if last_close > last_sh_price:
-    return "bullish", last_sh_idx
-  if last_close < last_sl_price:
-    return "bearish", last_sl_idx
-  return None, None
+def compute_atr(df, period=100):
+  """LuxAlgo-dakı ATR hesablama məntiqi - True Range-in sadə hərəkətli ortası."""
+  high, low, close = df["high"], df["low"], df["close"]
+  prev_close = close.shift(1)
+  tr = pd.concat([
+      (high - low),
+      (high - prev_close).abs(),
+      (low - prev_close).abs(),
+  ], axis=1).max(axis=1)
+  return tr.rolling(period, min_periods=1).mean()
 
 
-def find_order_block(df, direction, break_idx):
-  """BOS-a səbəb olan impulsdan əvvəlki son əks-istiqamətli şam (OB)."""
-  segment = df.iloc[break_idx:-1]
-  if segment.empty:
+def compute_structure_events(df, swing_highs, swing_lows):
+  """
+  LuxAlgo-nun CHoCH/BOS ayrımına uyğun: bar-bar keçərək aktiv (hələ
+  qırılmamış) son swing high/low-u izləyir, trend bias-ı yadda saxlayır.
+  - Trend davam edən qırılma -> BOS
+  - Trend əks istiqamətə dönən İLK qırılma -> CHoCH (daha güclü siqnal)
+  Nəticə: xronoloji sıra ilə hadisələr siyahısı, hər biri
+  {"index", "bias", "kind" (BOS/CHoCH)}.
+  """
+  n = len(df)
+  close = df["close"].values
+  events = []
+  trend_bias = None
+
+  all_pivots = sorted(
+      [(idx, price, "high") for idx, price in swing_highs] +
+      [(idx, price, "low") for idx, price in swing_lows]
+  )
+  pivot_ptr = 0
+  active_high, active_low = None, None
+  high_crossed, low_crossed = True, True
+
+  for i in range(n):
+    while pivot_ptr < len(all_pivots) and all_pivots[pivot_ptr][0] == i:
+      idx, price, kind = all_pivots[pivot_ptr]
+      if kind == "high":
+        active_high = (idx, price)
+        high_crossed = False
+      else:
+        active_low = (idx, price)
+        low_crossed = False
+      pivot_ptr += 1
+
+    if active_high is not None and not high_crossed and i > 0:
+      if close[i - 1] <= active_high[1] < close[i]:
+        kind = "CHoCH" if trend_bias == "bearish" else "BOS"
+        trend_bias = "bullish"
+        high_crossed = True
+        events.append({"index": i, "bias": "bullish", "kind": kind, "level": active_high[1]})
+
+    if active_low is not None and not low_crossed and i > 0:
+      if close[i - 1] >= active_low[1] > close[i]:
+        kind = "CHoCH" if trend_bias == "bullish" else "BOS"
+        trend_bias = "bearish"
+        low_crossed = True
+        events.append({"index": i, "bias": "bearish", "kind": kind, "level": active_low[1]})
+
+  return events
+
+
+def detect_equal_levels(df, swing_highs, swing_lows, atr_series, threshold=0.1):
+  """
+  LuxAlgo-nun EQH/EQL (Equal High/Low) məntiqi: ardıcıl swing nöqtələri
+  ATR-ə görə kifayət qədər yaxındırsa, bu, real 'liquidity pool' hesab olunur.
+  """
+  equal_highs, equal_lows = [], []
+  for i in range(1, len(swing_highs)):
+    idx1, p1 = swing_highs[i - 1]
+    idx2, p2 = swing_highs[i]
+    atr_val = atr_series.iloc[idx2] if idx2 < len(atr_series) else atr_series.iloc[-1]
+    if atr_val and abs(p1 - p2) < threshold * atr_val:
+      equal_highs.append((idx1, idx2, (p1 + p2) / 2))
+  for i in range(1, len(swing_lows)):
+    idx1, p1 = swing_lows[i - 1]
+    idx2, p2 = swing_lows[i]
+    atr_val = atr_series.iloc[idx2] if idx2 < len(atr_series) else atr_series.iloc[-1]
+    if atr_val and abs(p1 - p2) < threshold * atr_val:
+      equal_lows.append((idx1, idx2, (p1 + p2) / 2))
+  return equal_highs, equal_lows
+
+
+def find_order_block_advanced(df, direction, break_idx, lookback=50):
+  """
+  LuxAlgo metodu: break-dən əvvəlki pəncərədə (məs. 50 bar) EKSTREMUM
+  qiymətli şam (bullish üçün ən aşağı low, bearish üçün ən yüksək high)
+  Order Block kimi qəbul olunur - sadəcə 'son əks-rəngli şam' əvəzinə.
+  Həmçinin bu OB-nin break-dən sonra artıq 'mitigate' (sındırılıb) olub-
+  olmadığı yoxlanılır.
+  """
+  lookback_start = max(0, break_idx - lookback)
+  window_high = df["high"].iloc[lookback_start:break_idx + 1]
+  window_low = df["low"].iloc[lookback_start:break_idx + 1]
+  if window_high.empty:
     return None
+
   if direction == "bullish":
-    candidates = segment[segment["close"] < segment["open"]]
+    ob_idx = int(window_low.values.argmin()) + lookback_start
   else:
-    candidates = segment[segment["close"] > segment["open"]]
-  if candidates.empty:
-    return None
-  ob = candidates.iloc[-1]
-  return {"high": float(ob["high"]), "low": float(ob["low"])}
+    ob_idx = int(window_high.values.argmax()) + lookback_start
+
+  ob_high = float(df["high"].iloc[ob_idx])
+  ob_low = float(df["low"].iloc[ob_idx])
+
+  # Mitigation yoxlanması: OB-dən sonra qiymət artıq onu 'sındırıbmı'?
+  mitigated = False
+  close = df["close"].values
+  for j in range(ob_idx + 1, len(df)):
+    if direction == "bullish" and close[j] < ob_low:
+      mitigated = True
+      break
+    if direction == "bearish" and close[j] > ob_high:
+      mitigated = True
+      break
+
+  return {"high": ob_high, "low": ob_low, "index": ob_idx, "mitigated": mitigated}
 
 
 def detect_liquidity_sweep(df, direction, break_idx, lookback_window=15):
@@ -286,12 +379,12 @@ def get_daily_trend_bias(symbol):
 
 def analyze_smc_pro(symbol, session_active, session_name):
   """
-  Peşəkar SMC analiz zənciri:
+  Peşəkar SMC analiz zənciri (LuxAlgo metodologiyasına uyğunlaşdırılıb):
   1. Günlük trend bias
-  2. 1H bazar strukturu + BOS
-  3. BOS-un günlük trendlə uyğunluğu (Trend Filter)
-  4. Liquidity Sweep
-  5. Order Block
+  2. 1H bazar strukturu + BOS/CHoCH (trend-track edilmiş)
+  3. Struktur hadisəsinin günlük trendlə uyğunluğu (Trend Filter)
+  4. Liquidity Sweep (istəyə görə Equal Level ilə təsdiqlənmiş)
+  5. Order Block (ekstremum-əsaslı, mitigation yoxlanılmış)
   6. Fair Value Gap (əlavə təsdiq)
   7. Qiymətin OB zonasına retracement-i
   8. Liquidity Target (TP)
@@ -322,18 +415,34 @@ def analyze_smc_pro(symbol, session_active, session_name):
   if not cond_structure:
     return {"symbol": symbol, "passed": False, "error": None, "conditions": conditions}
 
-  direction, break_idx = detect_bos(df, swing_highs, swing_lows)
-  cond_bos = direction is not None
-  conditions["1H-da BOS baş verib (struktur qırılıb)"] = cond_bos
-  if not cond_bos:
+  # --- BOS/CHoCH (trend-track edilmiş hadisələr) ---
+  structure_events = compute_structure_events(df, swing_highs, swing_lows)
+  cond_event = len(structure_events) > 0
+  conditions["Struktur hadisəsi (BOS/CHoCH) baş verib"] = cond_event
+  if not cond_event:
     return {"symbol": symbol, "passed": False, "error": None, "conditions": conditions}
+
+  last_event = structure_events[-1]
+  direction = last_event["bias"]
+  break_idx = last_event["index"]
+  event_kind = last_event["kind"]  # "BOS" və ya "CHoCH"
+
+  if REQUIRE_CHOCH_ONLY:
+    cond_choch = (event_kind == "CHoCH")
+    conditions["Son struktur hadisəsi CHoCH-dur (trend dönüşü)"] = cond_choch
+    if not cond_choch:
+      return {"symbol": symbol, "passed": False, "error": None, "conditions": conditions}
 
   # --- 3. Trend Filter ---
   if REQUIRE_TREND_ALIGN:
     cond_trend_align = (direction == daily_bias)
-    conditions[f"1H BOS günlük trendlə üst-üstə düşür ({direction} vs {daily_bias})"] = cond_trend_align
+    conditions[f"1H {event_kind} günlük trendlə üst-üstə düşür ({direction} vs {daily_bias})"] = cond_trend_align
     if not cond_trend_align:
       return {"symbol": symbol, "passed": False, "error": None, "conditions": conditions}
+
+  # --- Equal High/Low (liquidity pool) ---
+  atr_series = compute_atr(df)
+  equal_highs, equal_lows = detect_equal_levels(df, swing_highs, swing_lows, atr_series)
 
   # --- 4. Liquidity Sweep ---
   if REQUIRE_LIQUIDITY_SWEEP:
@@ -342,12 +451,25 @@ def analyze_smc_pro(symbol, session_active, session_name):
     if not cond_sweep:
       return {"symbol": symbol, "passed": False, "error": None, "conditions": conditions}
 
-  # --- 5. Order Block ---
-  ob = find_order_block(df, direction, break_idx)
+    if REQUIRE_EQUAL_LEVEL_SWEEP:
+      relevant_levels = equal_lows if direction == "bullish" else equal_highs
+      cond_eq_sweep = len(relevant_levels) > 0
+      conditions["Sweep real Equal High/Low (liquidity pool) yaxınlığındadır"] = cond_eq_sweep
+      if not cond_eq_sweep:
+        return {"symbol": symbol, "passed": False, "error": None, "conditions": conditions}
+
+  # --- 5. Order Block (ekstremum-əsaslı + mitigation) ---
+  ob = find_order_block_advanced(df, direction, break_idx)
   cond_ob = ob is not None
   conditions["Order Block (OB) tapıldı"] = cond_ob
   if not cond_ob:
     return {"symbol": symbol, "passed": False, "error": None, "conditions": conditions}
+
+  if REQUIRE_OB_UNMITIGATED:
+    cond_unmitigated = not ob["mitigated"]
+    conditions["Order Block hələ mitigate olunmayıb (etibarlıdır)"] = cond_unmitigated
+    if not cond_unmitigated:
+      return {"symbol": symbol, "passed": False, "error": None, "conditions": conditions}
 
   # --- 6. Fair Value Gap ---
   if REQUIRE_FVG:
@@ -377,11 +499,11 @@ def analyze_smc_pro(symbol, session_active, session_name):
   if direction == "bullish":
     sl = round(ob["low"] * 0.997, 4)
     tp = round(liquidity_target, 4)
-    bias = "🟢 LONG (Bullish OB Retest + Trend Aligned)"
+    bias = f"🟢 LONG ({event_kind}: Bullish OB Retest + Trend Aligned)"
   else:
     sl = round(ob["high"] * 1.003, 4)
     tp = round(liquidity_target, 4)
-    bias = "🔴 SHORT (Bearish OB Retest + Trend Aligned)"
+    bias = f"🔴 SHORT ({event_kind}: Bearish OB Retest + Trend Aligned)"
 
   risk = abs(entry - sl)
   reward = abs(tp - entry)
@@ -409,6 +531,7 @@ def analyze_smc_pro(symbol, session_active, session_name):
       "error": None,
       "conditions": conditions,
       "bias": bias,
+      "event_kind": event_kind,
       "entry": entry,
       "sl": sl,
       "tp": tp,
@@ -571,4 +694,3 @@ def main():
 
 if __name__ == "__main__":
   main()
-    
