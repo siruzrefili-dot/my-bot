@@ -1,2158 +1,1026 @@
-import os
-import logging
-import requests
-import pandas as pd
-import numpy as np
-import time
+"""
+PROFESSIONAL SMC AI BOT - VERSION 3.0
+"""
+
 import asyncio
-from flask import Flask
-from threading import Thread
+import json
+import logging
+import math
+import os
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from threading import Thread
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import requests
+from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ================= CONFIG =================
+# ============================================================================
+# KONFİQURASİYA
+# ============================================================================
 
+@dataclass
+class Config:
+    bot_token: str = field(default_factory=lambda: os.getenv("BOT_TOKEN", ""))
+    chat_id: str = field(default_factory=lambda: os.getenv("CHAT_ID", "1121794078"))
+    scan_top_n_coins: int = int(os.getenv("SCAN_TOP_N_COINS", "40"))
+    check_interval_seconds: int = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
+    notify_cooldown_seconds: int = int(os.getenv("NOTIFY_COOLDOWN_SECONDS", "7200"))
+    leverage: int = int(os.getenv("LEVERAGE", "10"))
+    account_balance: float = float(os.getenv("ACCOUNT_BALANCE", "1000"))
+    risk_percent: float = float(os.getenv("RISK_PERCENT", "1"))
+    commission_percent: float = float(os.getenv("COMMISSION_PERCENT", "0.04"))
+    slippage_percent: float = float(os.getenv("SLIPPAGE_PERCENT", "0.02"))
+    swing_lookback: int = int(os.getenv("SWING_LOOKBACK", "2"))
+    klines_limit: int = int(os.getenv("KLINES_LIMIT", "200"))
+    daily_klines_limit: int = int(os.getenv("DAILY_KLINES_LIMIT", "150"))
+    entry_klines_limit: int = int(os.getenv("ENTRY_KLINES_LIMIT", "200"))
+    atr_period: int = int(os.getenv("ATR_PERIOD", "14"))
+    volume_period: int = int(os.getenv("VOLUME_PERIOD", "20"))
+    min_rr_ratio: float = float(os.getenv("MIN_RR_RATIO", "2.0"))
+    min_signal_score: float = float(os.getenv("MIN_SIGNAL_SCORE", "70"))
+    max_event_age_bars: int = int(os.getenv("MAX_EVENT_AGE_BARS", "20"))
+    ote_fib_low: float = float(os.getenv("OTE_FIB_LOW", "0.618"))
+    ote_fib_high: float = float(os.getenv("OTE_FIB_HIGH", "0.786"))
+    require_trend_align: bool = True
+    require_liquidity_sweep: bool = True
+    require_fvg: bool = True
+    require_volume: bool = True
+    require_displacement: bool = True
+    require_poi: bool = True
+    require_15m_confirmation: bool = True
+    require_btc_filter: bool = True
+    require_ote: bool = True
+    require_4h_alignment: bool = True
+    require_cvd_trend: bool = True
+    require_unmitigated: bool = True
+    flask_port: int = int(os.getenv("PORT", "10000"))
+    fallback_coins: List[str] = field(default_factory=lambda: [
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+        "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "LINKUSDT", "SUIUSDT",
+        "ARBUSDT", "OPUSDT"
+    ])
+
+    def __post_init__(self) -> None:
+        if not self.bot_token:
+            raise ValueError("BOT_TOKEN environment variable is required!")
+
+# ============================================================================
+# LOGGING
+# ============================================================================
+
+logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s"
 )
 
-def env_bool(name, default=True):
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in ("1", "true", "yes", "on")
+# ============================================================================
+# BYBIT CLIENT
+# ============================================================================
 
-TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID", "1121794078")
+class BybitClient:
+    BASE_URL = "https://api.bybit.com/v5"
 
-SCAN_TOP_N_COINS = int(os.getenv("SCAN_TOP_N_COINS", "40"))
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
-NOTIFY_COOLDOWN_SECONDS = int(os.getenv("NOTIFY_COOLDOWN_SECONDS", "7200"))
+    def __init__(self, timeout: int = 8, retries: int = 2) -> None:
+        self.session = requests.Session()
+        self.timeout = timeout
+        self.retries = retries
 
-LEVERAGE = int(os.getenv("LEVERAGE", "10"))
-ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "1000"))
-RISK_PERCENT = float(os.getenv("RISK_PERCENT", "1"))
+    def _safe_get(self, endpoint: str, params: Optional[Dict] = None) -> Optional[requests.Response]:
+        for attempt in range(self.retries + 1):
+            try:
+                resp = self.session.get(f"{self.BASE_URL}/{endpoint}", params=params, timeout=self.timeout)
+                if resp.status_code == 200:
+                    return resp
+                logger.warning(f"HTTP {resp.status_code}: {endpoint}")
+            except Exception as e:
+                logger.warning(f"Request error {attempt+1}: {e}")
+            time.sleep(1 + attempt)
+        return None
 
-SWING_LOOKBACK = int(os.getenv("SWING_LOOKBACK", "2"))
-KLINES_LIMIT = int(os.getenv("KLINES_LIMIT", "200"))
-DAILY_KLINES_LIMIT = int(os.getenv("DAILY_KLINES_LIMIT", "150"))
-ENTRY_KLINES_LIMIT = int(os.getenv("ENTRY_KLINES_LIMIT", "200"))
-
-ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
-VOLUME_PERIOD = int(os.getenv("VOLUME_PERIOD", "20"))
-
-MIN_RR_RATIO = float(os.getenv("MIN_RR_RATIO", "2.0"))
-MIN_SIGNAL_SCORE = float(os.getenv("MIN_SIGNAL_SCORE", "70"))
-MAX_EVENT_AGE_BARS = int(os.getenv("MAX_EVENT_AGE_BARS", "20"))
-
-# ================= FILTERS =================
-
-REQUIRE_TREND_ALIGN = env_bool("REQUIRE_TREND_ALIGN", True)
-REQUIRE_LIQUIDITY_SWEEP = env_bool("REQUIRE_LIQUIDITY_SWEEP", True)
-REQUIRE_FVG = env_bool("REQUIRE_FVG", True)
-REQUIRE_VOLUME = env_bool("REQUIRE_VOLUME", True)
-REQUIRE_DISPLACEMENT = env_bool("REQUIRE_DISPLACEMENT", True)
-REQUIRE_POI = env_bool("REQUIRE_POI", True)
-REQUIRE_15M_CONFIRMATION = env_bool("REQUIRE_15M_CONFIRMATION", True)
-REQUIRE_BTC_FILTER = env_bool("REQUIRE_BTC_FILTER", True)
-
-# ================= COINS =================
-
-FALLBACK_COINS = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "SOLUSDT",
-    "BNBUSDT",
-    "XRPUSDT",
-    "ADAUSDT",
-    "AVAXUSDT",
-    "DOGEUSDT",
-    "LINKUSDT",
-    "SUIUSDT",
-    "ARBUSDT",
-    "OPUSDT"
-]
-
-# ================= HTTP =================
-
-session_http = requests.Session()
-_last_notified = {}
-
-def safe_get(url, params=None, timeout=8, retries=2):
-    for attempt in range(retries + 1):
+    def fetch_tickers(self, category: str = "linear") -> List[Dict]:
+        resp = self._safe_get("market/tickers", {"category": category})
+        if not resp:
+            return []
         try:
-            response = session_http.get(
-                url,
-                params=params,
-                timeout=timeout
-            )
+            data = resp.json()
+            if data.get("retCode") == 0:
+                return data.get("result", {}).get("list", [])
+        except Exception:
+            pass
+        return []
 
-            if response.status_code == 200:
-                return response
-
-            logging.warning(
-                f"HTTP {response.status_code}: {url}"
-            )
-
+    def fetch_klines(self, symbol: str, interval: str = "60", limit: int = 200) -> Optional[pd.DataFrame]:
+        params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit}
+        resp = self._safe_get("market/kline", params)
+        if not resp:
+            return None
+        try:
+            data = resp.json()
+            if data.get("retCode") != 0:
+                return None
+            rows = data.get("result", {}).get("list", [])
+            if len(rows) < 30:
+                return None
+            df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"])
+            df = df.iloc[::-1].reset_index(drop=True)
+            for col in ["open", "high", "low", "close", "volume", "turnover"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+            df = df.dropna().reset_index(drop=True)
+            if len(df) > 5:
+                return df.iloc[:-1].reset_index(drop=True)
         except Exception as e:
-            logging.warning(
-                f"Request error {attempt + 1}: {e}"
-            )
-
-        time.sleep(1 + attempt)
-
-    return None
-
-# ================= BYBIT COINS =================
-
-def fetch_top_liquid_coins(limit=SCAN_TOP_N_COINS):
-
-    url = "https://api.bybit.com/v5/market/tickers"
-
-    response = safe_get(
-        url,
-        {"category": "linear"},
-        timeout=10
-    )
-
-    try:
-
-        if response:
-
-            payload = response.json()
-
-            if payload.get("retCode") == 0:
-
-                rows = payload.get(
-                    "result",
-                    {}
-                ).get(
-                    "list",
-                    []
-                )
-
-                rows = [
-                    r for r in rows
-                    if r.get(
-                        "symbol",
-                        ""
-                    ).endswith("USDT")
-                    and float(
-                        r.get(
-                            "turnover24h",
-                            0
-                        ) or 0
-                    ) > 0
-                ]
-
-                rows.sort(
-                    key=lambda r: float(
-                        r.get(
-                            "turnover24h",
-                            0
-                        ) or 0
-                    ),
-                    reverse=True
-                )
-
-                symbols = [
-                    r["symbol"]
-                    for r in rows[:limit]
-                ]
-
-                if symbols:
-
-                    logging.info(
-                        f"{len(symbols)} likvid coin taranır"
-                    )
-
-                    return symbols
-
-    except Exception as e:
-
-        logging.error(
-            f"Coin siyahısı xətası: {e}"
-        )
-
-    return FALLBACK_COINS
-
-# ================= KLINES =================
-
-def fetch_klines(symbol, interval="60", limit=200):
-
-    url = "https://api.bybit.com/v5/market/kline"
-
-    params = {
-        "category": "linear",
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit
-    }
-
-    response = safe_get(
-        url,
-        params,
-        timeout=8
-    )
-
-    try:
-
-        if response:
-
-            payload = response.json()
-
-            if payload.get("retCode") == 0:
-
-                rows = payload.get(
-                    "result",
-                    {}
-                ).get(
-                    "list",
-                    []
-                )
-
-                if len(rows) > 30:
-
-                    df = pd.DataFrame(
-                        rows,
-                        columns=[
-                            "timestamp",
-                            "open",
-                            "high",
-                            "low",
-                            "close",
-                            "volume",
-                            "turnover"
-                        ]
-                    )
-
-                    df = df.iloc[::-1].reset_index(
-                        drop=True
-                    )
-
-                    for col in [
-                        "open",
-                        "high",
-                        "low",
-                        "close",
-                        "volume",
-                        "turnover"
-                    ]:
-
-                        df[col] = pd.to_numeric(
-                            df[col],
-                            errors="coerce"
-                        )
-
-                    df["timestamp"] = pd.to_numeric(
-                        df["timestamp"],
-                        errors="coerce"
-                    )
-
-                    df = df.dropna().reset_index(
-                        drop=True
-                    )
-
-                    if len(df) > 5:
-
-                        # Açıq və hələ bağlanmamış
-                        # son şamı analizdən çıxarırıq
-                        return df.iloc[:-1].reset_index(
-                            drop=True
-                        )
-
-            else:
-
-                logging.warning(
-                    f"{symbol} API error: "
-                    f"{payload.get('retMsg')}"
-                )
-
-    except Exception as e:
-
-        logging.error(
-            f"{symbol} kline error: {e}"
-        )
-
-    return None
-
-# ================= ATR =================
-
-def compute_atr(df, period=ATR_PERIOD):
-
-    previous_close = df["close"].shift(1)
-
-    tr1 = df["high"] - df["low"]
-
-    tr2 = (
-        df["high"] - previous_close
-    ).abs()
-
-    tr3 = (
-        df["low"] - previous_close
-    ).abs()
-
-    true_range = pd.concat(
-        [
-            tr1,
-            tr2,
-            tr3
-        ],
-        axis=1
-    ).max(axis=1)
-
-    atr = true_range.rolling(
-        period,
-        min_periods=1
-    ).mean()
-
-    return atr
-
-# ================= VOLUME =================
-
-def compute_volume_ratio(
-    df,
-    period=VOLUME_PERIOD
-):
-
-    average_volume = df[
-        "volume"
-    ].rolling(
-        period,
-        min_periods=5
-    ).mean()
-
-    ratio = df["volume"] / average_volume.replace(
-        0,
-        np.nan
-    )
-
-    return ratio
-
-# ================= EMA =================
-
-def compute_ema(
-    series,
-    period
-):
-
-    return series.ewm(
-        span=period,
-        adjust=False
-    ).mean()
-
-# ================= SWING POINTS =================
-
-def find_swing_points(
-    df,
-    lookback=SWING_LOOKBACK
-):
-
-    highs = df["high"].values
-    lows = df["low"].values
-
-    swing_highs = []
-    swing_lows = []
-
-    for i in range(
-        lookback,
-        len(df) - lookback
-    ):
-
-        left_high = highs[
-            i - lookback:i
-        ]
-
-        right_high = highs[
-            i + 1:i + lookback + 1
-        ]
-
-        if (
-            highs[i] > np.max(left_high)
-            and highs[i] > np.max(right_high)
-        ):
-
-            swing_highs.append(
-                (
-                    i,
-                    float(highs[i])
-                )
-            )
-
-        left_low = lows[
-            i - lookback:i
-        ]
-
-        right_low = lows[
-            i + 1:i + lookback + 1
-        ]
-
-        if (
-            lows[i] < np.min(left_low)
-            and lows[i] < np.min(right_low)
-        ):
-
-            swing_lows.append(
-                (
-                    i,
-                    float(lows[i])
-                )
-            )
-
-    return swing_highs, swing_lows
-
-# ================= DAILY TREND =================
-
-def determine_trend_bias(
-    swing_highs,
-    swing_lows
-):
-
-    if (
-        len(swing_highs) < 2
-        or len(swing_lows) < 2
-    ):
-
+            logger.error(f"{symbol} kline error: {e}")
         return None
 
-    last_high = swing_highs[-1][1]
-    previous_high = swing_highs[-2][1]
-
-    last_low = swing_lows[-1][1]
-    previous_low = swing_lows[-2][1]
-
-    higher_high = (
-        last_high > previous_high
-    )
-
-    higher_low = (
-        last_low > previous_low
-    )
-
-    lower_high = (
-        last_high < previous_high
-    )
-
-    lower_low = (
-        last_low < previous_low
-    )
-
-    if higher_high and higher_low:
-
-        return "bullish"
-
-    if lower_high and lower_low:
-
-        return "bearish"
-
-    return "ranging"
-
-def get_daily_trend_bias(symbol):
-
-    df = fetch_klines(
-        symbol,
-        "D",
-        DAILY_KLINES_LIMIT
-    )
-
-    if df is None or len(df) < 40:
-
-        return None
-
-    swing_highs, swing_lows = find_swing_points(
-        df,
-        SWING_LOOKBACK
-    )
-
-    return determine_trend_bias(
-        swing_highs,
-        swing_lows
-    )
-
-# ================= BTC MARKET FILTER =================
-
-def get_btc_market_bias():
-
-    df = fetch_klines(
-        "BTCUSDT",
-        "240",
-        120
-    )
-
-    if df is None or len(df) < 60:
-
-        return None
-
-    close = df["close"]
-
-    ema20 = compute_ema(
-        close,
-        20
-    ).iloc[-1]
-
-    ema50 = compute_ema(
-        close,
-        50
-    ).iloc[-1]
-
-    price = close.iloc[-1]
-
-    if (
-        price > ema20
-        and ema20 > ema50
-    ):
-
-        return "bullish"
-
-    if (
-        price < ema20
-        and ema20 < ema50
-    ):
-
-        return "bearish"
-
-    return "neutral"
-
-# ================= TRADING SESSION =================
-
-def get_trading_session():
-
-    hour = datetime.now(
-        timezone.utc
-    ).hour
-
-    london = (
-        7 <= hour < 16
-    )
-
-    new_york = (
-        13 <= hour < 22
-    )
-
-    active = london or new_york
-
-    sessions = []
-
-    if london:
-        sessions.append("London")
-
-    if new_york:
-        sessions.append("New York")
-
-    session_name = (
-        " + ".join(sessions)
-        if sessions
-        else "Asia"
-    )
-
-    return active, session_name
-
-# ================= FLASK KEEP ALIVE =================
-
-app_flask = Flask(__name__)
-
-@app_flask.route("/")
-def home():
-
-    return (
-        "Professional SMC AI Bot "
-        "is running!"
-    )
-
-def run_flask():
-
-    port = int(
-        os.getenv(
-            "PORT",
-            "10000"
-        )
-    )
-
-    app_flask.run(
-        host="0.0.0.0",
-        port=port
-    )
-
-def keep_alive():
-
-    Thread(
-        target=run_flask,
-        daemon=True
-    ).start()
-    # ================= MARKET STRUCTURE =================
-
-def compute_structure_events(df, swing_highs, swing_lows):
-    events = []
-    close = df["close"].values
-    trend_bias = None
-    pivots = sorted(
-        [(i, p, "high") for i, p in swing_highs] +
-        [(i, p, "low") for i, p in swing_lows],
-        key=lambda x: x[0]
-    )
-    active_high = None
-    active_low = None
-    high_crossed = True
-    low_crossed = True
-    pivot_ptr = 0
-    for i in range(len(df)):
-        while pivot_ptr < len(pivots) and pivots[pivot_ptr][0] == i:
-            idx, price, pivot_type = pivots[pivot_ptr]
-            if pivot_type == "high":
-                active_high = (idx, price)
-                high_crossed = False
-            else:
-                active_low = (idx, price)
-                low_crossed = False
-            pivot_ptr += 1
-        if i == 0:
-            continue
-        if active_high and not high_crossed:
-            if close[i - 1] <= active_high[1] and close[i] > active_high[1]:
-                kind = "CHoCH" if trend_bias == "bearish" else "BOS"
-                trend_bias = "bullish"
-                high_crossed = True
-                events.append({
-                    "index": i,
-                    "bias": "bullish",
-                    "kind": kind,
-                    "level": active_high[1]
-                })
-        if active_low and not low_crossed:
-            if close[i - 1] >= active_low[1] and close[i] < active_low[1]:
-                kind = "CHoCH" if trend_bias == "bullish" else "BOS"
-                trend_bias = "bearish"
-                low_crossed = True
-                events.append({
-                    "index": i,
-                    "bias": "bearish",
-                    "kind": kind,
-                    "level": active_low[1]
-                })
-    return events
-
-# ================= LIQUIDITY SWEEP =================
-
-def detect_liquidity_sweep(df, direction, break_idx, lookback_window=20):
-    start = max(0, break_idx - lookback_window)
-    segment = df.iloc[start:break_idx + 1].reset_index(drop=True)
-    if len(segment) < 4:
-        return False
-    if direction == "bullish":
-        for i in range(2, len(segment)):
-            prior_low = segment["low"].iloc[:i].min()
-            current_low = float(segment["low"].iloc[i])
-            current_close = float(segment["close"].iloc[i])
-            if current_low < prior_low and current_close > prior_low:
-                return True
-    elif direction == "bearish":
-        for i in range(2, len(segment)):
-            prior_high = segment["high"].iloc[:i].max()
-            current_high = float(segment["high"].iloc[i])
-            current_close = float(segment["close"].iloc[i])
-            if current_high > prior_high and current_close < prior_high:
-                return True
-    return False
-
-# ================= EQUAL HIGHS / LOWS =================
-
-def detect_equal_levels(swing_highs, swing_lows, atr_series, threshold=0.15):
-    equal_highs = []
-    equal_lows = []
-    for i in range(1, len(swing_highs)):
-        idx1, price1 = swing_highs[i - 1]
-        idx2, price2 = swing_highs[i]
-        atr = float(atr_series.iloc[min(idx2, len(atr_series) - 1)])
-        if atr > 0 and abs(price1 - price2) <= atr * threshold:
-            equal_highs.append({
-                "index1": idx1,
-                "index2": idx2,
-                "price": (price1 + price2) / 2
-            })
-    for i in range(1, len(swing_lows)):
-        idx1, price1 = swing_lows[i - 1]
-        idx2, price2 = swing_lows[i]
-        atr = float(atr_series.iloc[min(idx2, len(atr_series) - 1)])
-        if atr > 0 and abs(price1 - price2) <= atr * threshold:
-            equal_lows.append({
-                "index1": idx1,
-                "index2": idx2,
-                "price": (price1 + price2) / 2
-            })
-    return equal_highs, equal_lows
-
-# ================= FAIR VALUE GAP =================
-
-def find_fvg(df, direction, break_idx, lookback_window=25):
-    start = max(0, break_idx - lookback_window)
-    end = min(len(df), break_idx + 1)
-    segment = df.iloc[start:end].reset_index(drop=True)
-    found = []
-    for i in range(1, len(segment) - 1):
-        first = segment.iloc[i - 1]
-        third = segment.iloc[i + 1]
-        if direction == "bullish":
-            if float(first["high"]) < float(third["low"]):
-                low = float(first["high"])
-                high = float(third["low"])
-                found.append({
-                    "low": low,
-                    "high": high,
-                    "mid": (low + high) / 2,
-                    "direction": "bullish"
-                })
-        elif direction == "bearish":
-            if float(first["low"]) > float(third["high"]):
-                low = float(third["high"])
-                high = float(first["low"])
-                found.append({
-                    "low": low,
-                    "high": high,
-                    "mid": (low + high) / 2,
-                    "direction": "bearish"
-                })
-    return found[-1] if found else None
-
-# ================= DISPLACEMENT =================
-
-def detect_displacement(df, break_idx, atr_series):
-    if break_idx <= 0 or break_idx >= len(df):
-        return False, 0.0
-    candle = df.iloc[break_idx]
-    body = abs(float(candle["close"]) - float(candle["open"]))
-    atr = float(atr_series.iloc[break_idx])
-    if atr <= 0:
-        return False, 0.0
-    ratio = body / atr
-    strong = ratio >= 0.6
-    return strong, ratio
-
-# ================= ORDER BLOCK =================
-
-def find_order_block(df, direction, break_idx, lookback=30):
-    start = max(0, break_idx - lookback)
-    if direction == "bullish":
-        candidates = [
-            i for i in range(break_idx - 1, start - 1, -1)
-            if float(df["close"].iloc[i]) < float(df["open"].iloc[i])
-        ]
-    else:
-        candidates = [
-            i for i in range(break_idx - 1, start - 1, -1)
-            if float(df["close"].iloc[i]) > float(df["open"].iloc[i])
-        ]
-    if not candidates:
-        return None
-    ob_idx = candidates[0]
-    ob_high = float(df["high"].iloc[ob_idx])
-    ob_low = float(df["low"].iloc[ob_idx])
-    mitigated = False
-    for j in range(break_idx + 1, len(df)):
-        high = float(df["high"].iloc[j])
-        low = float(df["low"].iloc[j])
-        if direction == "bullish":
-            if low <= ob_low:
-                mitigated = True
-                break
-        else:
-            if high >= ob_high:
-                mitigated = True
-                break
-    return {
-        "index": ob_idx,
-        "high": ob_high,
-        "low": ob_low,
-        "mid": (ob_high + ob_low) / 2,
-        "mitigated": mitigated,
-        "direction": direction
-    }
-
-# ================= POI ZONE =================
-
-def price_in_zone(price, zone, buffer_percent=0.15):
-    if zone is None:
-        return False
-    low = float(zone["low"])
-    high = float(zone["high"])
-    size = high - low
-    if size <= 0:
-        return low <= price <= high
-    buffer = size * buffer_percent
-    return (low - buffer) <= price <= (high + buffer)
-
-def get_poi_status(current_price, ob, fvg):
-    in_ob = price_in_zone(current_price, ob)
-    in_fvg = price_in_zone(current_price, fvg)
-    return in_ob or in_fvg, in_ob, in_fvg
-
-# ================= LIQUIDITY TARGET =================
-
-def find_next_liquidity(direction, current_price, swing_highs, swing_lows):
-    if direction == "bullish":
-        targets = [price for _, price in swing_highs if price > current_price]
-        return min(targets) if targets else None
-    targets = [price for _, price in swing_lows if price < current_price]
-    return max(targets) if targets else None
-
-# ================= RISK / REWARD =================
-
-def calculate_trade_levels(direction, entry, ob, liquidity_target, atr_value):
-    if ob is None or liquidity_target is None:
-        return None
-    atr_buffer = atr_value * 0.15
-    if direction == "bullish":
-        sl = float(ob["low"]) - atr_buffer
-        tp = float(liquidity_target)
-    else:
-        sl = float(ob["high"]) + atr_buffer
-        tp = float(liquidity_target)
-    risk = abs(entry - sl)
-    reward = abs(tp - entry)
-    if risk <= 0:
-        return None
-    rr_ratio = reward / risk
-    return {
-        "entry": entry,
-        "sl": sl,
-        "tp": tp,
-        "risk": risk,
-        "reward": reward,
-        "rr_ratio": rr_ratio
-    }
-
-# ================= POSITION SIZE =================
-
-def calculate_position_size(entry, sl):
-    risk_amount = ACCOUNT_BALANCE * RISK_PERCENT / 100
-    stop_distance = abs(entry - sl)
-    if stop_distance <= 0:
-        return {
-            "risk_amount": risk_amount,
-            "position_size": 0,
-            "notional_value": 0,
-            "margin_required": 0
-        }
-    position_size = risk_amount / stop_distance
-    notional_value = position_size * entry
-    margin_required = notional_value / LEVERAGE if LEVERAGE > 0 else notional_value
-    return {
-        "risk_amount": risk_amount,
-        "position_size": position_size,
-        "notional_value": notional_value,
-        "margin_required": margin_required
-    }
-
-# ================= SMC DATA =================
-
-def analyze_1h_smc(symbol):
-    df = fetch_klines(symbol, "60", KLINES_LIMIT)
-    if df is None or len(df) < 70:
-        return None, "1H data alınmadı"
-    swing_highs, swing_lows = find_swing_points(df, SWING_LOOKBACK)
-    if len(swing_highs) < 2 or len(swing_lows) < 2:
-        return None, "Kifayət qədər swing yoxdur"
-    events = compute_structure_events(df, swing_highs, swing_lows)
-    if not events:
-        return None, "BOS/CHoCH yoxdur"
-    last_event = events[-1]
-    break_idx = last_event["index"]
-    event_age = len(df) - 1 - break_idx
-    if event_age > MAX_EVENT_AGE_BARS:
-        return None, "Structure event köhnədir"
-    atr = compute_atr(df, ATR_PERIOD)
-    volume_series = compute_volume_ratio(df, VOLUME_PERIOD)
-    displacement_ok, displacement_ratio = detect_displacement(
-        df,
-        break_idx,
-        atr
-    )
-    volume_ratio = float(volume_series.iloc[break_idx]) if not pd.isna(volume_series.iloc[break_idx]) else 0.0
-    sweep = detect_liquidity_sweep(
-        df,
-        last_event["bias"],
-        break_idx
-    )
-    fvg = find_fvg(
-        df,
-        last_event["bias"],
-        break_idx
-    )
-    ob = find_order_block(
-        df,
-        last_event["bias"],
-        break_idx
-    )
-    current_price = float(df["close"].iloc[-1])
-    poi_ok, in_ob, in_fvg = get_poi_status(
-        current_price,
-        ob,
-        fvg
-    )
-    equal_highs, equal_lows = detect_equal_levels(
-        swing_highs,
-        swing_lows,
-        atr
-    )
-    target = find_next_liquidity(
-        last_event["bias"],
-        current_price,
-        swing_highs,
-        swing_lows
-    )
-    return {
-        "df": df,
-        "direction": last_event["bias"],
-        "event_kind": last_event["kind"],
-        "break_idx": break_idx,
-        "event_age": event_age,
-        "swing_highs": swing_highs,
-        "swing_lows": swing_lows,
-        "equal_highs": equal_highs,
-        "equal_lows": equal_lows,
-        "atr": atr,
-        "atr_value": float(atr.iloc[-1]),
-        "volume_ratio": volume_ratio,
-        "displacement_ok": displacement_ok,
-        "displacement_ratio": displacement_ratio,
-        "sweep": sweep,
-        "fvg": fvg,
-        "ob": ob,
-        "current_price": current_price,
-        "poi_ok": poi_ok,
-        "in_ob": in_ob,
-        "in_fvg": in_fvg,
-        "target": target
-    }, None
-    # ================= FUNDAMENTAL ANALYSIS =================
-
-def get_fear_greed():
-    try:
-        response = safe_get(
-            "https://api.alternative.me/fng/",
-            {"limit": 1},
-            timeout=6,
-            retries=1
-        )
-        if response:
-            data = response.json().get("data", [])
-            if data:
-                value = int(data[0].get("value", 50))
-                classification = data[0].get(
-                    "value_classification",
-                    "Unknown"
-                )
-                return value, classification
-    except Exception as e:
-        logging.warning(f"Fear and Greed error: {e}")
-    return None, "Unknown"
-
-def get_funding_rate(symbol):
-    url = "https://api.bybit.com/v5/market/funding/history"
-    params = {
-        "category": "linear",
-        "symbol": symbol,
-        "limit": 1
-    }
-    try:
-        response = safe_get(
-            url,
-            params,
-            timeout=6,
-            retries=1
-        )
-        if response:
-            rows = response.json().get(
-                "result",
-                {}
-            ).get(
-                "list",
-                []
-            )
+    def fetch_funding_rate(self, symbol: str) -> Optional[float]:
+        resp = self._safe_get("market/funding/history", {"category": "linear", "symbol": symbol, "limit": 1})
+        if not resp:
+            return None
+        try:
+            rows = resp.json().get("result", {}).get("list", [])
             if rows:
-                return float(
-                    rows[0].get(
-                        "fundingRate",
-                        0
-                    )
-                )
-    except Exception as e:
-        logging.warning(
-            f"Funding error {symbol}: {e}"
-        )
-    return None
+                return float(rows[0].get("fundingRate", 0))
+        except Exception:
+            pass
+        return None
 
-def get_open_interest_trend(symbol):
-    url = "https://api.bybit.com/v5/market/open-interest"
-    params = {
-        "category": "linear",
-        "symbol": symbol,
-        "intervalTime": "1h",
-        "limit": 10
-    }
-    try:
-        response = safe_get(
-            url,
-            params,
-            timeout=6,
-            retries=1
-        )
-        if response:
-            rows = response.json().get(
-                "result",
-                {}
-            ).get(
-                "list",
-                []
-            )
+    def fetch_open_interest_trend(self, symbol: str) -> Optional[float]:
+        resp = self._safe_get("market/open-interest", {
+            "category": "linear", "symbol": symbol, "intervalTime": "1h", "limit": 10
+        })
+        if not resp:
+            return None
+        try:
+            rows = resp.json().get("result", {}).get("list", [])
             if len(rows) >= 2:
                 rows = rows[::-1]
-                first = float(
-                    rows[0].get(
-                        "openInterest",
-                        0
-                    )
-                )
-                last = float(
-                    rows[-1].get(
-                        "openInterest",
-                        0
-                    )
-                )
+                first = float(rows[0].get("openInterest", 0))
+                last = float(rows[-1].get("openInterest", 0))
                 if first > 0:
-                    return (
-                        (last - first)
-                        / first
-                    ) * 100
-    except Exception as e:
-        logging.warning(
-            f"Open Interest error {symbol}: {e}"
-        )
-    return None
+                    return ((last - first) / first) * 100
+        except Exception:
+            pass
+        return None
+        # ============================================================================
+# SMC KÖMƏKÇİ ALƏTLƏR
+# ============================================================================
 
-def fundamental_score(symbol, direction):
-    score = 0
-    data = {}
-
-    btc_bias = get_btc_market_bias()
-    data["btc_bias"] = btc_bias
-
-    if btc_bias == direction:
-        score += 10
-        data["btc_alignment"] = True
-    elif btc_bias == "neutral":
-        score += 3
-        data["btc_alignment"] = None
-    else:
-        score -= 8
-        data["btc_alignment"] = False
-
-    fear_greed, fg_class = get_fear_greed()
-
-    data["fear_greed"] = fear_greed
-    data["fear_greed_class"] = fg_class
-
-    if fear_greed is not None:
+class SMCHelpers:
+    @staticmethod
+    def calculate_ote(df: pd.DataFrame, direction: str) -> Optional[Tuple[float, float]]:
+        if len(df) < 20:
+            return None
+        recent_high = df["high"].iloc[-20:].max()
+        recent_low = df["low"].iloc[-20:].min()
+        diff = recent_high - recent_low
+        if diff <= 0:
+            return None
         if direction == "bullish":
-            if fear_greed < 80:
-                score += 5
-            if fear_greed >= 90:
-                score -= 5
+            fib_low = recent_high - diff * 0.618
+            fib_high = recent_high - diff * 0.786
+            return fib_low, fib_high
         else:
-            if fear_greed > 20:
-                score += 5
-            if fear_greed <= 10:
-                score -= 5
-
-    funding = get_funding_rate(symbol)
-    data["funding"] = funding
-
-    if funding is not None:
-        if direction == "bullish":
-            if funding < 0:
-                score += 5
-            elif funding > 0.001:
-                score -= 5
-        else:
-            if funding > 0:
-                score += 5
-            elif funding < -0.001:
-                score -= 5
-
-    oi_change = get_open_interest_trend(symbol)
-    data["oi_change"] = oi_change
-
-    if oi_change is not None:
-        if oi_change > 0:
-            score += 3
-        elif oi_change < -5:
-            score -= 3
-
-    return score, data
-
-# ================= 15M CONFIRMATION =================
-
-def check_15m_confirmation(symbol, direction):
-    df = fetch_klines(
-        symbol,
-        "15",
-        ENTRY_KLINES_LIMIT
-    )
-
-    if df is None or len(df) < 50:
-        return False, {
-            "reason": "15M data yoxdur"
-        }
-
-    swing_highs, swing_lows = find_swing_points(
-        df,
-        SWING_LOOKBACK
-    )
-
-    events = compute_structure_events(
-        df,
-        swing_highs,
-        swing_lows
-    )
-
-    if not events:
-        return False, {
-            "reason": "15M structure yoxdur"
-        }
-
-    last = events[-1]
-
-    age = (
-        len(df)
-        - 1
-        - last["index"]
-    )
-
-    atr = compute_atr(
-        df,
-        ATR_PERIOD
-    )
-
-    volume_series = compute_volume_ratio(
-        df,
-        VOLUME_PERIOD
-    )
-
-    _, displacement_ratio = detect_displacement(
-        df,
-        last["index"],
-        atr
-    )
-
-    volume_ratio = volume_series.iloc[-1]
-
-    direction_ok = (
-        last["bias"] == direction
-    )
-
-    fresh = age <= 12
-
-    displacement_ok = (
-        displacement_ratio >= 0.5
-    )
-
-    volume_ok = (
-        not pd.isna(volume_ratio)
-        and float(volume_ratio) >= 0.7
-    )
-
-    confirmed = (
-        direction_ok
-        and fresh
-        and displacement_ok
-        and volume_ok
-    )
-
-    return confirmed, {
-        "event": last["kind"],
-        "direction_ok": direction_ok,
-        "age": age,
-        "fresh": fresh,
-        "displacement": round(
-            displacement_ratio,
-            2
-        ),
-        "volume_ratio": round(
-            float(volume_ratio),
-            2
-        )
-        if not pd.isna(volume_ratio)
-        else 0.0
-    }
-
-# ================= SIGNAL SCORE =================
-
-def calculate_signal_score(
-    event_kind,
-    rr_ratio,
-    sweep,
-    fvg,
-    poi_ok,
-    displacement_ratio,
-    volume_ratio,
-    entry_confirmed,
-    fundamental
-):
-    score = 0
-
-    if event_kind == "CHoCH":
-        score += 15
-    else:
-        score += 12
-
-    if sweep:
-        score += 12
-
-    if fvg:
-        score += 8
-
-    if poi_ok:
-        score += 10
-
-    if rr_ratio >= 4:
-        score += 18
-    elif rr_ratio >= 3:
-        score += 14
-    elif rr_ratio >= 2:
-        score += 10
-
-    if displacement_ratio >= 1.5:
-        score += 10
-    elif displacement_ratio >= 0.8:
-        score += 7
-    elif displacement_ratio >= 0.5:
-        score += 4
-
-    if volume_ratio >= 1.5:
-        score += 8
-    elif volume_ratio >= 1.0:
-        score += 5
-    elif volume_ratio >= 0.7:
-        score += 2
-
-    if entry_confirmed:
-        score += 15
-
-    score += fundamental
-
-    return round(
-        max(
-            0,
-            min(score, 100)
-        ),
-        1
-    )
-
-# ================= MAIN SMC ANALYSIS =================
-
-def analyze_smc_pro(
-    symbol,
-    session_active,
-    session_name
-):
-    conditions = {}
-
-    daily_bias = get_daily_trend_bias(
-        symbol
-    )
-
-    daily_valid = (
-        daily_bias
-        in (
-            "bullish",
-            "bearish"
-        )
-    )
-
-    conditions["Daily trend valid"] = daily_valid
-
-    if not daily_valid:
-        return {
-            "symbol": symbol,
-            "passed": False,
-            "conditions": conditions,
-            "score": 0
-        }
-
-    smc, error = analyze_1h_smc(symbol)
-
-    if smc is None:
-        return {
-            "symbol": symbol,
-            "passed": False,
-            "error": error,
-            "conditions": conditions,
-            "score": 0
-        }
-
-    direction = smc["direction"]
-
-    trend_aligned = (
-        direction == daily_bias
-    )
-
-    conditions[
-        "Daily and 1H trend aligned"
-    ] = trend_aligned
-
-    if REQUIRE_TREND_ALIGN:
-        if not trend_aligned:
-            return {
-                "symbol": symbol,
-                "passed": False,
-                "conditions": conditions,
-                "score": 0
-            }
-
-    sweep = smc["sweep"]
-
-    conditions[
-        "Liquidity sweep"
-    ] = sweep
-
-    if REQUIRE_LIQUIDITY_SWEEP:
-        if not sweep:
-            return {
-                "symbol": symbol,
-                "passed": False,
-                "conditions": conditions,
-                "score": 0
-            }
-
-    displacement_ok = smc[
-        "displacement_ok"
-    ]
-
-    displacement_ratio = smc[
-        "displacement_ratio"
-    ]
-
-    conditions[
-        "Displacement"
-    ] = displacement_ok
-
-    if REQUIRE_DISPLACEMENT:
-        if not displacement_ok:
-            return {
-                "symbol": symbol,
-                "passed": False,
-                "conditions": conditions,
-                "score": 0
-            }
-
-    volume_ratio = smc[
-        "volume_ratio"
-    ]
-
-    volume_ok = (
-        volume_ratio >= 0.7
-    )
-
-    conditions[
-        "Volume confirmation"
-    ] = volume_ok
-
-    if REQUIRE_VOLUME:
-        if not volume_ok:
-            return {
-                "symbol": symbol,
-                "passed": False,
-                "conditions": conditions,
-                "score": 0
-            }
-
-    ob = smc["ob"]
-
-    ob_ok = (
-        ob is not None
-    )
-
-    conditions[
-        "Order Block found"
-    ] = ob_ok
-
-    if not ob_ok:
-        return {
-            "symbol": symbol,
-            "passed": False,
-            "conditions": conditions,
-            "score": 0
-        }
-
-    fvg = smc["fvg"]
-
-    fvg_ok = (
-        fvg is not None
-    )
-
-    conditions[
-        "Fair Value Gap"
-    ] = fvg_ok
-
-    if REQUIRE_FVG:
-        if not fvg_ok:
-            return {
-                "symbol": symbol,
-                "passed": False,
-                "conditions": conditions,
-                "score": 0
-            }
-
-    poi_ok = smc[
-        "poi_ok"
-    ]
-
-    conditions[
-        "Price in POI zone"
-    ] = poi_ok
-
-    if REQUIRE_POI:
-        if not poi_ok:
-            return {
-                "symbol": symbol,
-                "passed": False,
-                "conditions": conditions,
-                "score": 0
-            }
-
-    target = smc["target"]
-
-    target_ok = (
-        target is not None
-    )
-
-    conditions[
-        "Liquidity target"
-    ] = target_ok
-
-    if not target_ok:
-        return {
-            "symbol": symbol,
-            "passed": False,
-            "conditions": conditions,
-            "score": 0
-        }
-
-    entry = smc[
-        "current_price"
-    ]
-
-    levels = calculate_trade_levels(
-        direction,
-        entry,
-        ob,
-        target,
-        smc["atr_value"]
-    )
-
-    if levels is None:
-        return {
-            "symbol": symbol,
-            "passed": False,
-            "conditions": conditions,
-            "score": 0
-        }
-
-    rr_ratio = levels[
-        "rr_ratio"
-    ]
-
-    rr_ok = (
-        rr_ratio >= MIN_RR_RATIO
-    )
-
-    conditions[
-        f"Risk Reward >= 1:{MIN_RR_RATIO}"
-    ] = rr_ok
-
-    if not rr_ok:
-        return {
-            "symbol": symbol,
-            "passed": False,
-            "conditions": conditions,
-            "score": 0
-        }
-
-    conditions[
-        "Active trading session"
-    ] = session_active
-
-    entry_confirmed, entry_data = (
-        check_15m_confirmation(
-            symbol,
-            direction
-        )
-    )
-
-    conditions[
-        "15M confirmation"
-    ] = entry_confirmed
-
-    if REQUIRE_15M_CONFIRMATION:
-        if not entry_confirmed:
-            return {
-                "symbol": symbol,
-                "passed": False,
-                "conditions": conditions,
-                "score": 0
-            }
-
-    fundamental, fundamental_data = (
-        fundamental_score(
-            symbol,
-            direction
-        )
-    )
-
-    btc_alignment = fundamental_data.get(
-        "btc_alignment"
-    )
-
-    btc_ok = (
-        btc_alignment is not False
-    )
-
-    conditions[
-        "BTC market alignment"
-    ] = btc_ok
-
-    if REQUIRE_BTC_FILTER:
-        if not btc_ok:
-            return {
-                "symbol": symbol,
-                "passed": False,
-                "conditions": conditions,
-                "score": 0
-            }
-
-    score = calculate_signal_score(
-        smc["event_kind"],
-        rr_ratio,
-        sweep,
-        fvg_ok,
-        poi_ok,
-        displacement_ratio,
-        volume_ratio,
-        entry_confirmed,
-        fundamental
-    )
-
-    score_ok = (
-        score >= MIN_SIGNAL_SCORE
-    )
-
-    conditions[
-        "Minimum signal score"
-    ] = score_ok
-
-    if not score_ok:
-        return {
-            "symbol": symbol,
-            "passed": False,
-            "conditions": conditions,
-            "score": score
-        }
-
-    position_data = calculate_position_size(
-        levels["entry"],
-        levels["sl"]
-    )
-
-    bias = (
-        "🟢 LONG"
-        if direction == "bullish"
-        else "🔴 SHORT"
-    )
-
-    signal_id = (
-        f"{symbol}_"
-        f"{direction}_"
-        f"{smc['event_kind']}_"
-        f"{int(time.time() // 900)}"
-    )
-
-    return {
-        "symbol": symbol,
-        "passed": True,
-        "conditions": conditions,
-        "score": score,
-        "bias": bias,
-        "direction": direction,
-        "event_kind": smc["event_kind"],
-        "entry": round(
-            levels["entry"],
-            8
-        ),
-        "sl": round(
-            levels["sl"],
-            8
-        ),
-        "tp": round(
-            levels["tp"],
-            8
-        ),
-        "rr_ratio": round(
-            rr_ratio,
-            2
-        ),
-        "leverage": LEVERAGE,
-        "daily_bias": daily_bias,
-        "session": session_name,
-        "risk_amount": round(
-            position_data[
-                "risk_amount"
-            ],
-            2
-        ),
-        "position_size": round(
-            position_data[
-                "position_size"
-            ],
-            6
-        ),
-        "notional_value": round(
-            position_data[
-                "notional_value"
-            ],
-            2
-        ),
-        "margin_required": round(
-            position_data[
-                "margin_required"
-            ],
-            2
-        ),
-        "sweep": sweep,
-        "poi_ok": poi_ok,
-        "fvg_ok": fvg_ok,
-        "displacement_ratio": round(
-            displacement_ratio,
-            2
-        ),
-        "volume_ratio": round(
-            volume_ratio,
-            2
-        ),
-        "entry_confirmation": entry_data,
-        "fundamental": fundamental_data,
-        "signal_id": signal_id
-    }
-
-# ================= SCAN MARKET =================
-
-def get_best_smc_signal():
-
-    session_active, session_name = (
-        get_trading_session()
-    )
-
-    coins = fetch_top_liquid_coins()
-
-    all_results = []
-
-    for symbol in coins:
-
-        try:
-
-            result = analyze_smc_pro(
-                symbol,
-                session_active,
-                session_name
-            )
-
-            all_results.append(
-                result
-            )
-
-        except Exception as e:
-
-            logging.error(
-                f"{symbol} analiz error: {e}"
-            )
-
-            all_results.append({
-                "symbol": symbol,
-                "passed": False,
-                "error": str(e),
-                "conditions": {},
-                "score": 0
-            })
-
-        time.sleep(0.15)
-
-    valid = [
-        result
-        for result in all_results
-        if result.get("passed")
-    ]
-
-    valid.sort(
-        key=lambda x: (
-            x.get("score", 0),
-            x.get("rr_ratio", 0)
-        ),
-        reverse=True
-    )
-
-    return (
-        valid[0]
-        if valid
-        else None,
-        all_results
-    )
-
-# ================= DIAGNOSTICS =================
-
-def format_diagnostics(
-    all_results,
-    max_detail=10
-):
-
-    total = len(all_results)
-
-    reasons = {}
-
-    for result in all_results:
-
-        failed = [
-            name
-            for name, ok in result.get(
-                "conditions",
-                {}
-            ).items()
-            if not ok
-        ]
-
-        if failed:
-
-            reason = failed[0]
-
-            reasons[reason] = (
-                reasons.get(
-                    reason,
-                    0
-                )
-                + 1
-            )
-
-    lines = [
-        "📋 *Xülasə:* "
-        f"`{total}` coin yoxlanıldı.",
-        "",
-        "*Ən çox dayandıran şərtlər:*"
-    ]
-
-    for reason, count in sorted(
-        reasons.items(),
-        key=lambda x: x[1],
-        reverse=True
-    )[:10]:
-
-        lines.append(
-            f"• {reason}: `{count}`"
-        )
-
-    lines.append(
-        ""
-    )
-
-    lines.append(
-        f"*İlk {min(max_detail, total)} coin:*"
-    )
-
-    for result in all_results[
-        :max_detail
-    ]:
-
-        symbol = result.get(
-            "symbol",
-            "?"
-        )
-
-        score = result.get(
-            "score",
-            0
-        )
-
-        if result.get("passed"):
-
-            lines.append(
-                f"• `{symbol}` "
-                f"✅ PASS "
-                f"| Score `{score}`"
-            )
-
-        elif result.get("error"):
-
-            lines.append(
-                f"• `{symbol}` ❌ "
-                f"{str(result['error'])[:60]}"
-            )
-
-        else:
-
-            failed = [
-                name
-                for name, ok
-                in result.get(
-                    "conditions",
-                    {}
-                ).items()
-                if not ok
-            ]
-
-            reason = (
-                failed[0]
-                if failed
-                else "No setup"
-            )
-
-            lines.append(
-                f"• `{symbol}` ❌ "
-                f"{reason} "
-                f"| Score `{score}`"
-            )
-
-    return "\n".join(
-        lines
-    )
-
-# ================= SIGNAL MESSAGE =================
-
-def format_signal_message(
-    res,
-    title="🚨 *AUTOMATIC SMC SIGNAL* 🚨"
-):
-
-    fundamental = res.get(
-        "fundamental",
-        {}
-    )
-
-    fg = fundamental.get(
-        "fear_greed"
-    )
-
-    funding = fundamental.get(
-        "funding"
-    )
-
-    oi = fundamental.get(
-        "oi_change"
-    )
-
-    entry_confirmation = res.get(
-        "entry_confirmation",
-        {}
-    )
-
-    strength = (
-        "🔥 VERY STRONG"
-        if res["score"] >= 90
-        else "🟢 STRONG"
-    )
-
-    return f"""{title}
-
-{strength}
-
-🪙 *Coin:* `{res['symbol']}`
-⭐ *Score:* `{res['score']}/100`
-🎯 *Setup:* {res['bias']} ({res['event_kind']})
-
-📈 *Daily Trend:* `{res['daily_bias']}`
-🕒 *Session:* `{res['session']}`
-⚖️ *Risk Reward:* `1:{res['rr_ratio']}`
-
-📍 *ENTRY:* `{res['entry']}`
-🛑 *STOP LOSS:* `{res['sl']}`
-🎯 *TAKE PROFIT:* `{res['tp']}`
-
-⚙️ *Leverage:* `{res['leverage']}x`
-💰 *Position Value:* `${res['notional_value']}`
-💳 *Estimated Margin:* `${res['margin_required']}`
-⚠️ *Risk:* `${res['risk_amount']}`
-
-🔎 *SMC ANALYSIS*
-💧 Liquidity Sweep: `{res['sweep']}`
-📦 POI Zone: `{res['poi_ok']}`
-📊 FVG: `{res['fvg_ok']}`
-⚡ Displacement: `{res['displacement_ratio']}`
-📈 Volume Ratio: `{res['volume_ratio']}`
-
-⏱ *15M Confirmation:*
-`{entry_confirmation}`
-
-🌍 *FUNDAMENTAL*
-₿ BTC Bias: `{fundamental.get('btc_bias')}`
-😨 Fear and Greed: `{fg}`
-💰 Funding: `{funding}`
-📊 Open Interest: `{oi}`
-
-🆔 *Signal ID:*
-`{res['signal_id']}`"""
-
-# ================= TELEGRAM COMMANDS =================
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    message = f"""📊 *Professional SMC AI Bot aktivdir!*
-
-Canlı analiz üçün:
-
-/analiz
-
-Bot avtomatik olaraq hər
-`{CHECK_INTERVAL_SECONDS // 60}` dəqiqədən bir
-bazarı skan edir.
-
-Sistem:
-
-Daily Trend
-⬇️
-1H Market Structure
-⬇️
-BOS / CHoCH
-⬇️
-Liquidity Sweep
-⬇️
-Displacement
-⬇️
-Volume
-⬇️
-Order Block
-⬇️
-FVG
-⬇️
-POI Zone
-⬇️
-15M Confirmation
-⬇️
-Fundamental Analysis
-⬇️
-Signal Score
-⬇️
-Best Signal 🚨"""
-
-    await update.message.reply_text(
-        message,
-        parse_mode="Markdown"
-    )
-
-async def analiz(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    await update.message.reply_text(
-        f"🔍 Ən likvid "
-        f"`{SCAN_TOP_N_COINS}` coin "
-        f"taranır...",
-        parse_mode="Markdown"
-    )
-
-    result, all_results = (
-        await asyncio.to_thread(
-            get_best_smc_signal
-        )
-    )
-
-    if result:
-
-        await update.message.reply_text(
-            format_signal_message(
-                result,
-                "📊 *LIVE SMC ANALYSIS*"
-            ),
-            parse_mode="Markdown"
-        )
-
-    else:
-
-        diagnostics = format_diagnostics(
-            all_results
-        )
-
-        message = (
-            "❌ Hazırda minimum "
-            "keyfiyyət şərtlərini keçən "
-            "setup yoxdur.\n\n"
-            + diagnostics
-        )
-
-        await update.message.reply_text(
-            message,
-            parse_mode="Markdown"
-        )
-
-# ================= SEND SIGNAL =================
-
-async def send_auto_signal(
-    application,
-    result
-):
-
-    try:
-
-        await application.bot.send_message(
-            chat_id=CHAT_ID,
-            text=format_signal_message(
-                result
-            ),
-            parse_mode="Markdown"
-        )
-
-        logging.info(
-            f"Signal sent: "
-            f"{result['signal_id']}"
-        )
-
-    except Exception as e:
-
-        logging.error(
-            f"Telegram send error: {e}"
-        )
-
-# ================= AUTO SCANNER =================
-
-async def auto_signal_loop(
-    application
-):
-
-    await asyncio.sleep(15)
-
-    while True:
-
-        try:
-
-            logging.info(
-                "Automatic market scan started..."
-            )
-
-            result, _ = (
-                await asyncio.to_thread(
-                    get_best_smc_signal
-                )
-            )
-
-            if result:
-
-                signal_id = result[
-                    "signal_id"
-                ]
-
-                now = time.time()
-
-                last_time = (
-                    _last_notified.get(
-                        signal_id,
-                        0
-                    )
-                )
-
-                if (
-                    now - last_time
-                    >= NOTIFY_COOLDOWN_SECONDS
-                ):
-
-                    await send_auto_signal(
-                        application,
-                        result
-                    )
-
-                    _last_notified[
-                        signal_id
-                    ] = now
-
-                else:
-
-                    logging.info(
-                        "Signal cooldown active"
-                    )
-
+            fib_low = recent_low + diff * 0.618
+            fib_high = recent_low + diff * 0.786
+            return fib_low, fib_high
+
+    @staticmethod
+    def compute_cvd(df: pd.DataFrame) -> pd.Series:
+        delta = []
+        for i in range(len(df)):
+            if float(df["close"].iloc[i]) > float(df["open"].iloc[i]):
+                delta.append(float(df["volume"].iloc[i]))
+            elif float(df["close"].iloc[i]) < float(df["open"].iloc[i]):
+                delta.append(-float(df["volume"].iloc[i]))
             else:
+                delta.append(0)
+        return pd.Series(delta).cumsum()
 
-                logging.info(
-                    "No valid setup found"
-                )
+    @staticmethod
+    def detect_fvg_advanced(df: pd.DataFrame, direction: str, break_idx: int, lookback_window: int = 25) -> Optional[Dict]:
+        start = max(0, break_idx - lookback_window)
+        segment = df.iloc[start:break_idx + 1].reset_index(drop=True)
+        for i in range(1, len(segment) - 1):
+            first = segment.iloc[i - 1]
+            third = segment.iloc[i + 1]
+            if direction == "bullish" and float(first["high"]) < float(third["low"]):
+                low = float(first["high"])
+                high = float(third["low"])
+                fvg_type = "standard"
+                if i < len(segment) - 1:
+                    candle = segment.iloc[i]
+                    body = abs(float(candle["close"]) - float(candle["open"]))
+                    atr = (segment["high"].max() - segment["low"].min()) / 14
+                    if atr > 0 and body / atr > 1.0:
+                        fvg_type = "breakaway"
+                    wick = max(float(candle["high"]) - max(float(candle["open"]), float(candle["close"])),
+                               min(float(candle["open"]), float(candle["close"])) - float(candle["low"]))
+                    if body > 0 and wick / body > 0.6:
+                        fvg_type = "rejection"
+                return {"low": low, "high": high, "mid": (low + high) / 2, "direction": direction, "type": fvg_type}
+            if direction == "bearish" and float(first["low"]) > float(third["high"]):
+                low = float(third["high"])
+                high = float(first["low"])
+                fvg_type = "standard"
+                if i < len(segment) - 1:
+                    candle = segment.iloc[i]
+                    body = abs(float(candle["close"]) - float(candle["open"]))
+                    atr = (segment["high"].max() - segment["low"].min()) / 14
+                    if atr > 0 and body / atr > 1.0:
+                        fvg_type = "breakaway"
+                    wick = max(float(candle["high"]) - max(float(candle["open"]), float(candle["close"])),
+                               min(float(candle["open"]), float(candle["close"])) - float(candle["low"]))
+                    if body > 0 and wick / body > 0.6:
+                        fvg_type = "rejection"
+                return {"low": low, "high": high, "mid": (low + high) / 2, "direction": direction, "type": fvg_type}
+        return None
 
+    @staticmethod
+    def get_session_levels(df: pd.DataFrame, lookback_days: int = 5) -> Dict[str, Dict]:
+        if len(df) < 1:
+            return {}
+        sessions = {"Asia": {"high": -np.inf, "low": np.inf},
+                    "London": {"high": -np.inf, "low": np.inf},
+                    "NY": {"high": -np.inf, "low": np.inf}}
+        for idx, row in df.iterrows():
+            ts = datetime.fromtimestamp(row["timestamp"] / 1000, tz=timezone.utc)
+            hour = ts.hour
+            if 0 <= hour < 8:
+                sess = "Asia"
+            elif 8 <= hour < 16:
+                sess = "London"
+            else:
+                sess = "NY"
+            high = float(row["high"])
+            low = float(row["low"])
+            if high > sessions[sess]["high"]:
+                sessions[sess]["high"] = high
+            if low < sessions[sess]["low"]:
+                sessions[sess]["low"] = low
+        for sess in sessions:
+            if sessions[sess]["high"] == -np.inf:
+                sessions[sess]["high"] = None
+            if sessions[sess]["low"] == np.inf:
+                sessions[sess]["low"] = None
+        return sessions
+
+# ============================================================================
+# SMC ANALİZER (HİSSƏ 1)
+# ============================================================================
+
+class SMCAnalyzer:
+    def __init__(self, config: Config, client: BybitClient) -> None:
+        self.config = config
+        self.client = client
+        self.helpers = SMCHelpers()
+
+    @staticmethod
+    def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+        prev_close = df["close"].shift(1)
+        tr1 = df["high"] - df["low"]
+        tr2 = (df["high"] - prev_close).abs()
+        tr3 = (df["low"] - prev_close).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        return tr.rolling(period, min_periods=1).mean()
+
+    @staticmethod
+    def compute_volume_ratio(df: pd.DataFrame, period: int = 20) -> pd.Series:
+        avg = df["volume"].rolling(period, min_periods=5).mean()
+        return df["volume"] / avg.replace(0, np.nan)
+
+    @staticmethod
+    def compute_ema(series: pd.Series, period: int) -> pd.Series:
+        return series.ewm(span=period, adjust=False).mean()
+
+    @staticmethod
+    def find_swing_points(df: pd.DataFrame, lookback: int = 2) -> Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]:
+        highs = df["high"].values
+        lows = df["low"].values
+        swing_highs, swing_lows = [], []
+        for i in range(lookback, len(df) - lookback):
+            if highs[i] > np.max(highs[i - lookback:i]) and highs[i] > np.max(highs[i + 1:i + lookback + 1]):
+                swing_highs.append((i, float(highs[i])))
+            if lows[i] < np.min(lows[i - lookback:i]) and lows[i] < np.min(lows[i + 1:i + lookback + 1]):
+                swing_lows.append((i, float(lows[i])))
+        return swing_highs, swing_lows
+
+    @staticmethod
+    def determine_trend_bias(sh: List, sl: List) -> Optional[str]:
+        if len(sh) < 2 or len(sl) < 2:
+            return None
+        hh = sh[-1][1] > sh[-2][1]
+        hl = sl[-1][1] > sl[-2][1]
+        lh = sh[-1][1] < sh[-2][1]
+        ll = sl[-1][1] < sl[-2][1]
+        if hh and hl:
+            return "bullish"
+        if lh and ll:
+            return "bearish"
+        return "ranging"
+
+    def compute_structure_events(self, df: pd.DataFrame, sh: List, sl: List) -> List[Dict]:
+        events = []
+        close = df["close"].values
+        trend_bias = None
+        pivots = sorted([(i, p, "high") for i, p in sh] + [(i, p, "low") for i, p in sl], key=lambda x: x[0])
+        active_high, active_low = None, None
+        high_crossed, low_crossed = True, True
+        ptr = 0
+        for i in range(1, len(df)):
+            while ptr < len(pivots) and pivots[ptr][0] == i:
+                idx, price, typ = pivots[ptr]
+                if typ == "high":
+                    active_high = (idx, price)
+                    high_crossed = False
+                else:
+                    active_low = (idx, price)
+                    low_crossed = False
+                ptr += 1
+            if active_high and not high_crossed:
+                if close[i - 1] <= active_high[1] and close[i] > active_high[1]:
+                    kind = "CHoCH" if trend_bias == "bearish" else "BOS"
+                    trend_bias = "bullish"
+                    high_crossed = True
+                    events.append({"index": i, "bias": "bullish", "kind": kind, "level": active_high[1]})
+            if active_low and not low_crossed:
+                if close[i - 1] >= active_low[1] and close[i] < active_low[1]:
+                    kind = "CHoCH" if trend_bias == "bullish" else "BOS"
+                    trend_bias = "bearish"
+                    low_crossed = True
+                    events.append({"index": i, "bias": "bearish", "kind": kind, "level": active_low[1]})
+        return events
+
+    def detect_liquidity_sweep(self, df: pd.DataFrame, direction: str, break_idx: int, window: int = 20) -> bool:
+        start = max(0, break_idx - window)
+        seg = df.iloc[start:break_idx + 1].reset_index(drop=True)
+        if len(seg) < 4:
+            return False
+        if direction == "bullish":
+            for i in range(2, len(seg)):
+                prior_low = seg["low"].iloc[:i].min()
+                cur_low = float(seg["low"].iloc[i])
+                cur_close = float(seg["close"].iloc[i])
+                if cur_low < prior_low and cur_close > prior_low:
+                    return True
+        else:
+            for i in range(2, len(seg)):
+                prior_high = seg["high"].iloc[:i].max()
+                cur_high = float(seg["high"].iloc[i])
+                cur_close = float(seg["close"].iloc[i])
+                if cur_high > prior_high and cur_close < prior_high:
+                    return True
+        return False
+
+    def find_order_block(self, df: pd.DataFrame, direction: str, break_idx: int, lookback: int = 30) -> Optional[Dict]:
+        start = max(0, break_idx - lookback)
+        if direction == "bullish":
+            candidates = [i for i in range(break_idx - 1, start - 1, -1)
+                          if float(df["close"].iloc[i]) < float(df["open"].iloc[i])]
+        else:
+            candidates = [i for i in range(break_idx - 1, start - 1, -1)
+                          if float(df["close"].iloc[i]) > float(df["open"].iloc[i])]
+        if not candidates:
+            return None
+        ob_idx = candidates[0]
+        ob_high = float(df["high"].iloc[ob_idx])
+        ob_low = float(df["low"].iloc[ob_idx])
+        mitigated = False
+        for j in range(ob_idx + 1, len(df)):
+            if direction == "bullish" and float(df["low"].iloc[j]) <= ob_low:
+                mitigated = True
+                break
+            if direction == "bearish" and float(df["high"].iloc[j]) >= ob_high:
+                mitigated = True
+                break
+        return {"index": ob_idx, "high": ob_high, "low": ob_low, "mid": (ob_high + ob_low) / 2, "mitigated": mitigated, "direction": direction}
+        # ============================================================================
+# SMC ANALİZER (HİSSƏ 2)
+# ============================================================================
+
+    def check_ote(self, df: pd.DataFrame, direction: str, current_price: float) -> Tuple[bool, Optional[Tuple[float, float]]]:
+        ote = self.helpers.calculate_ote(df, direction)
+        if not ote:
+            return False, None
+        low, high = ote
+        return low <= current_price <= high, ote
+
+    def check_cvd_trend(self, df: pd.DataFrame, direction: str) -> bool:
+        cvd = self.helpers.compute_cvd(df)
+        if len(cvd) < 10:
+            return True
+        slope = np.polyfit(range(10), cvd.iloc[-10:], 1)[0]
+        if direction == "bullish":
+            return slope > 0
+        else:
+            return slope < 0
+
+    def get_session_liquidity_targets(self, df: pd.DataFrame) -> List[float]:
+        levels = self.helpers.get_session_levels(df)
+        targets = []
+        for sess in ["Asia", "London", "NY"]:
+            if levels.get(sess, {}).get("high"):
+                targets.append(levels[sess]["high"])
+            if levels.get(sess, {}).get("low"):
+                targets.append(levels[sess]["low"])
+        return targets
+
+    def detect_displacement(self, df: pd.DataFrame, break_idx: int, atr_series: pd.Series) -> Tuple[bool, float]:
+        if break_idx <= 0 or break_idx >= len(df):
+            return False, 0.0
+        candle = df.iloc[break_idx]
+        body = abs(float(candle["close"]) - float(candle["open"]))
+        atr = float(atr_series.iloc[break_idx])
+        if atr <= 0:
+            return False, 0.0
+        ratio = body / atr
+        return ratio >= 0.6, ratio
+
+    @staticmethod
+    def price_in_zone(price: float, zone: Optional[Dict], buffer: float = 0.15) -> bool:
+        if zone is None:
+            return False
+        low = float(zone["low"])
+        high = float(zone["high"])
+        size = high - low
+        if size <= 0:
+            return low <= price <= high
+        buff = size * buffer
+        return (low - buff) <= price <= (high + buff)
+
+    def get_poi_status(self, price: float, ob: Optional[Dict], fvg: Optional[Dict]) -> Tuple[bool, bool, bool]:
+        in_ob = self.price_in_zone(price, ob)
+        in_fvg = self.price_in_zone(price, fvg)
+        return in_ob or in_fvg, in_ob, in_fvg
+
+    def get_daily_trend_bias(self, symbol: str) -> Optional[str]:
+        df = self.client.fetch_klines(symbol, "D", self.config.daily_klines_limit)
+        if df is None or len(df) < 40:
+            return None
+        sh, sl = self.find_swing_points(df, self.config.swing_lookback)
+        return self.determine_trend_bias(sh, sl)
+
+    def get_4h_trend_bias(self, symbol: str) -> Optional[str]:
+        df = self.client.fetch_klines(symbol, "240", self.config.klines_limit)
+        if df is None or len(df) < 40:
+            return None
+        sh, sl = self.find_swing_points(df, self.config.swing_lookback)
+        return self.determine_trend_bias(sh, sl)
+
+    def get_btc_market_bias(self) -> Optional[str]:
+        df = self.client.fetch_klines("BTCUSDT", "240", 120)
+        if df is None or len(df) < 60:
+            return None
+        close = df["close"]
+        ema20 = self.compute_ema(close, 20).iloc[-1]
+        ema50 = self.compute_ema(close, 50).iloc[-1]
+        price = close.iloc[-1]
+        if price > ema20 and ema20 > ema50:
+            return "bullish"
+        if price < ema20 and ema20 < ema50:
+            return "bearish"
+        return "neutral"
+
+    @staticmethod
+    def get_trading_session() -> Tuple[bool, str]:
+        hour = datetime.now(timezone.utc).hour
+        london = 7 <= hour < 16
+        new_york = 13 <= hour < 22
+        active = london or new_york
+        sessions = []
+        if london:
+            sessions.append("London")
+        if new_york:
+            sessions.append("New York")
+        return active, " + ".join(sessions) if sessions else "Asia"
+
+    def get_fear_greed(self) -> Tuple[Optional[int], str]:
+        try:
+            resp = requests.get("https://api.alternative.me/fng/", params={"limit": 1}, timeout=6)
+            if resp:
+                data = resp.json().get("data", [])
+                if data:
+                    return int(data[0].get("value", 50)), data[0].get("value_classification", "Unknown")
+        except Exception:
+            pass
+        return None, "Unknown"
+
+    def fundamental_score(self, symbol: str, direction: str) -> Tuple[int, Dict]:
+        score = 0
+        data = {}
+        btc = self.get_btc_market_bias()
+        data["btc_bias"] = btc
+        if btc == direction:
+            score += 10
+            data["btc_alignment"] = True
+        elif btc == "neutral":
+            score += 3
+            data["btc_alignment"] = None
+        else:
+            score -= 8
+            data["btc_alignment"] = False
+        fg, fg_class = self.get_fear_greed()
+        data["fear_greed"] = fg
+        data["fear_greed_class"] = fg_class
+        if fg is not None:
+            if direction == "bullish":
+                if fg < 80:
+                    score += 5
+                if fg >= 90:
+                    score -= 5
+            else:
+                if fg > 20:
+                    score += 5
+                if fg <= 10:
+                    score -= 5
+        funding = self.client.fetch_funding_rate(symbol)
+        data["funding"] = funding
+        if funding is not None:
+            if direction == "bullish" and funding < 0:
+                score += 5
+            elif direction == "bearish" and funding > 0:
+                score += 5
+        oi = self.client.fetch_open_interest_trend(symbol)
+        data["oi_change"] = oi
+        if oi is not None:
+            if oi > 0:
+                score += 3
+            elif oi < -5:
+                score -= 3
+        return score, data
+
+    def check_15m_confirmation(self, symbol: str, direction: str) -> Tuple[bool, Dict]:
+        df = self.client.fetch_klines(symbol, "15", self.config.entry_klines_limit)
+        if df is None or len(df) < 50:
+            return False, {"reason": "15M data yoxdur"}
+        sh, sl = self.find_swing_points(df, self.config.swing_lookback)
+        events = self.compute_structure_events(df, sh, sl)
+        if not events:
+            return False, {"reason": "15M structure yoxdur"}
+        last = events[-1]
+        age = len(df) - 1 - last["index"]
+        atr = self.compute_atr(df, self.config.atr_period)
+        vol_series = self.compute_volume_ratio(df, self.config.volume_period)
+        _, disp_ratio = self.detect_displacement(df, last["index"], atr)
+        vol_ratio = float(vol_series.iloc[-1]) if not pd.isna(vol_series.iloc[-1]) else 0.0
+        confirmed = (last["bias"] == direction and age <= 12 and disp_ratio >= 0.5 and vol_ratio >= 0.7)
+        return confirmed, {"event": last["kind"], "direction_ok": last["bias"] == direction, "age": age, "fresh": age <= 12, "displacement": round(disp_ratio, 2), "volume_ratio": round(vol_ratio, 2)}
+
+    def calculate_trade_levels(self, direction: str, df: pd.DataFrame, entry: float, ob: Optional[Dict], liquidity_target: Optional[float], atr_value: float) -> Optional[Dict]:
+        if ob is None or liquidity_target is None:
+            return None
+        sh, sl = self.find_swing_points(df, self.config.swing_lookback)
+        if direction == "bullish":
+            if sl and sl[-1][1] < entry:
+                sl_price = sl[-1][1] * 0.999
+            else:
+                sl_price = ob["low"] - atr_value * 0.5
+            tp = liquidity_target
+        else:
+            if sh and sh[-1][1] > entry:
+                sl_price = sh[-1][1] * 1.001
+            else:
+                sl_price = ob["high"] + atr_value * 0.5
+            tp = liquidity_target
+        cost_multiplier = 1 + (self.config.commission_percent / 100) + (self.config.slippage_percent / 100)
+        entry_adj = entry * cost_multiplier
+        sl_adj = sl_price * cost_multiplier
+        tp_adj = tp / cost_multiplier
+        risk = abs(entry_adj - sl_adj)
+        reward = abs(tp_adj - entry_adj)
+        if risk <= 0:
+            return None
+        return {"entry": entry, "entry_adjusted": entry_adj, "sl": sl_price, "sl_adjusted": sl_adj, "tp": tp, "tp_adjusted": tp_adj, "risk": risk, "reward": reward, "rr_ratio": reward / risk}
+
+    def calculate_position_size(self, entry: float, sl: float) -> Dict:
+        risk_amount = self.config.account_balance * self.config.risk_percent / 100
+        stop_distance = abs(entry - sl)
+        if stop_distance <= 0:
+            return {"risk_amount": risk_amount, "position_size": 0, "notional_value": 0, "margin_required": 0}
+        pos_size = risk_amount / stop_distance
+        notional = pos_size * entry
+        margin = notional / self.config.leverage if self.config.leverage > 0 else notional
+        return {"risk_amount": risk_amount, "position_size": pos_size, "notional_value": notional, "margin_required": margin}
+
+    def analyze_1h_smc(self, symbol: str) -> Tuple[Optional[Dict], Optional[str]]:
+        df = self.client.fetch_klines(symbol, "60", self.config.klines_limit)
+        if df is None or len(df) < 70:
+            return None, "1H data alınmadı"
+        sh, sl = self.find_swing_points(df, self.config.swing_lookback)
+        if len(sh) < 2 or len(sl) < 2:
+            return None, "Kifayət qədər swing yoxdur"
+        events = self.compute_structure_events(df, sh, sl)
+        if not events:
+            return None, "BOS/CHoCH yoxdur"
+        last = events[-1]
+        break_idx = last["index"]
+        if len(df) - 1 - break_idx > self.config.max_event_age_bars:
+            return None, "Structure event köhnədir"
+        atr = self.compute_atr(df, self.config.atr_period)
+        vol_series = self.compute_volume_ratio(df, self.config.volume_period)
+        disp_ok, disp_ratio = self.detect_displacement(df, break_idx, atr)
+        vol_ratio = float(vol_series.iloc[break_idx]) if not pd.isna(vol_series.iloc[break_idx]) else 0.0
+        sweep = self.detect_liquidity_sweep(df, last["bias"], break_idx)
+        fvg = self.helpers.detect_fvg_advanced(df, last["bias"], break_idx)
+        ob = self.find_order_block(df, last["bias"], break_idx)
+        current_price = float(df["close"].iloc[-1])
+        poi_ok, in_ob, in_fvg = self.get_poi_status(current_price, ob, fvg)
+        target = self.find_next_liquidity(last["bias"], current_price, sh, sl)
+        ote_ok, ote_zone = self.check_ote(df, last["bias"], current_price)
+        cvd_ok = self.check_cvd_trend(df, last["bias"])
+        session_targets = self.get_session_liquidity_targets(df)
+        return {"df": df, "direction": last["bias"], "event_kind": last["kind"], "break_idx": break_idx, "atr_value": float(atr.iloc[-1]), "volume_ratio": vol_ratio, "displacement_ok": disp_ok, "displacement_ratio": disp_ratio, "sweep": sweep, "fvg": fvg, "ob": ob, "current_price": current_price, "poi_ok": poi_ok, "in_ob": in_ob, "in_fvg": in_fvg, "target": target, "ote_ok": ote_ok, "ote_zone": ote_zone, "cvd_ok": cvd_ok, "session_targets": session_targets, "swing_highs": sh, "swing_lows": sl}, None
+
+    def find_next_liquidity(self, direction: str, price: float, sh: List, sl: List) -> Optional[float]:
+        if direction == "bullish":
+            targets = [p for _, p in sh if p > price]
+            return min(targets) if targets else None
+        targets = [p for _, p in sl if p < price]
+        return max(targets) if targets else None
+        # ============================================================================
+# SMC ANALİZER (HİSSƏ 3)
+# ============================================================================
+
+    def analyze_smc_pro(self, symbol: str, session_active: bool, session_name: str) -> Dict:
+        conditions = {}
+        daily = self.get_daily_trend_bias(symbol)
+        conditions["Daily trend"] = daily in ("bullish", "bearish")
+        if not conditions["Daily trend"]:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
+        h4 = self.get_4h_trend_bias(symbol)
+        conditions["4H trend"] = h4 in ("bullish", "bearish")
+        if self.config.require_4h_alignment and not conditions["4H trend"]:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
+        smc, err = self.analyze_1h_smc(symbol)
+        if smc is None:
+            return {"symbol": symbol, "passed": False, "error": err, "conditions": conditions, "score": 0}
+        direction = smc["direction"]
+        align = direction == daily and direction == h4
+        conditions["Triple trend alignment (D/4H/1H)"] = align
+        if self.config.require_trend_align and not align:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
+        sweep = smc["sweep"]
+        conditions["Liquidity sweep"] = sweep
+        if self.config.require_liquidity_sweep and not sweep:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
+        disp_ok = smc["displacement_ok"]
+        conditions["Displacement"] = disp_ok
+        if self.config.require_displacement and not disp_ok:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
+        vol_ok = smc["volume_ratio"] >= 0.7
+        conditions["Volume"] = vol_ok
+        if self.config.require_volume and not vol_ok:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
+        ob = smc["ob"]
+        ob_ok = ob is not None and not ob["mitigated"]
+        conditions["Unmitigated Order Block"] = ob_ok
+        if self.config.require_unmitigated and not ob_ok:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
+        fvg = smc["fvg"]
+        fvg_ok = fvg is not None
+        if fvg_ok:
+            fvg_type = fvg.get("type", "standard")
+            conditions[f"FVG ({fvg_type})"] = True
+        else:
+            conditions["FVG"] = False
+        if self.config.require_fvg and not fvg_ok:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
+        poi_ok = smc["poi_ok"]
+        conditions["POI"] = poi_ok
+        if self.config.require_poi and not poi_ok:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
+        ote_ok = smc["ote_ok"]
+        conditions["OTE (0.618-0.786)"] = ote_ok
+        if self.config.require_ote and not ote_ok:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
+        cvd_ok = smc["cvd_ok"]
+        conditions["CVD trend"] = cvd_ok
+        if self.config.require_cvd_trend and not cvd_ok:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
+        target = smc["target"]
+        conditions["Liquidity target"] = target is not None
+        if target is None:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
+        entry = smc["current_price"]
+        levels = self.calculate_trade_levels(direction, smc["df"], entry, ob, target, smc["atr_value"])
+        if levels is None:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
+        rr = levels["rr_ratio"]
+        conditions[f"RR >= 1:{self.config.min_rr_ratio}"] = rr >= self.config.min_rr_ratio
+        if rr < self.config.min_rr_ratio:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
+        conditions["Active session"] = session_active
+        entry_conf, entry_data = self.check_15m_confirmation(symbol, direction)
+        conditions["15M confirmation"] = entry_conf
+        if self.config.require_15m_confirmation and not entry_conf:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
+        fund_score, fund_data = self.fundamental_score(symbol, direction)
+        btc_ok = fund_data.get("btc_alignment") is not False
+        conditions["BTC alignment"] = btc_ok
+        if self.config.require_btc_filter and not btc_ok:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
+        score = self.calculate_signal_score(smc["event_kind"], rr, sweep, fvg_ok, poi_ok, smc["displacement_ratio"], smc["volume_ratio"], entry_conf, fund_score)
+        conditions["Min score"] = score >= self.config.min_signal_score
+        if score < self.config.min_signal_score:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": score}
+        pos = self.calculate_position_size(levels["entry_adjusted"], levels["sl_adjusted"])
+        signal_id = f"{symbol}_{direction}_{smc['event_kind']}_{int(time.time() // 900)}"
+        return {"symbol": symbol, "passed": True, "conditions": conditions, "score": score, "bias": "🟢 LONG" if direction == "bullish" else "🔴 SHORT", "direction": direction, "event_kind": smc["event_kind"], "entry": round(levels["entry"], 8), "entry_adj": round(levels["entry_adjusted"], 8), "sl": round(levels["sl"], 8), "sl_adj": round(levels["sl_adjusted"], 8), "tp": round(levels["tp"], 8), "tp_adj": round(levels["tp_adjusted"], 8), "rr_ratio": round(rr, 2), "leverage": self.config.leverage, "daily_bias": daily, "h4_bias": h4, "session": session_name, "risk_amount": round(pos["risk_amount"], 2), "position_size": round(pos["position_size"], 6), "notional_value": round(pos["notional_value"], 2), "margin_required": round(pos["margin_required"], 2), "sweep": sweep, "poi_ok": poi_ok, "fvg_ok": fvg_ok, "fvg_type": fvg.get("type") if fvg else None, "ote_ok": ote_ok, "cvd_ok": cvd_ok, "displacement_ratio": round(smc["displacement_ratio"], 2), "volume_ratio": round(smc["volume_ratio"], 2), "entry_confirmation": entry_data, "fundamental": fund_data, "signal_id": signal_id}
+
+    def calculate_signal_score(self, event_kind, rr, sweep, fvg_ok, poi_ok, disp_ratio, vol_ratio, entry_conf, fund_score) -> float:
+        score = 15 if event_kind == "CHoCH" else 12
+        score += 12 if sweep else 0
+        score += 8 if fvg_ok else 0
+        score += 10 if poi_ok else 0
+        if rr >= 4:
+            score += 18
+        elif rr >= 3:
+            score += 14
+        elif rr >= 2:
+            score += 10
+        if disp_ratio >= 1.5:
+            score += 10
+        elif disp_ratio >= 0.8:
+            score += 7
+        elif disp_ratio >= 0.5:
+            score += 4
+        if vol_ratio >= 1.5:
+            score += 8
+        elif vol_ratio >= 1.0:
+            score += 5
+        elif vol_ratio >= 0.7:
+            score += 2
+        score += 15 if entry_conf else 0
+        score += fund_score
+        return round(max(0, min(score, 100)), 1)
+
+# ============================================================================
+# PERFORMANS MONİTORU
+# ============================================================================
+
+class PerformanceTracker:
+    HISTORY_FILE = "signals_history.json"
+
+    @classmethod
+    def save_signal(cls, signal: Dict) -> None:
+        try:
+            data = cls.load_history()
+            data.append({"timestamp": datetime.now(timezone.utc).isoformat(), "symbol": signal["symbol"], "direction": signal["direction"], "entry": signal["entry"], "sl": signal["sl"], "tp": signal["tp"], "rr": signal["rr_ratio"], "score": signal["score"]})
+            with open(cls.HISTORY_FILE, "w") as f:
+                json.dump(data, f, indent=2)
         except Exception as e:
+            logger.warning(f"Could not save signal: {e}")
 
-            logging.error(
-                f"Auto scanner error: {e}"
-            )
+    @classmethod
+    def load_history(cls) -> List[Dict]:
+        try:
+            with open(cls.HISTORY_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return []
 
-        await asyncio.sleep(
-            CHECK_INTERVAL_SECONDS
-        )
+    @classmethod
+    def calculate_stats(cls) -> Dict:
+        data = cls.load_history()
+        if not data:
+            return {"total": 0, "win_rate": 0, "avg_rr": 0, "sharpe": 0, "drawdown": 0}
+        total = len(data)
+        wins = sum(1 for d in data if d.get("rr", 0) > 0)
+        win_rate = (wins / total * 100) if total > 0 else 0
+        avg_rr = np.mean([d["rr"] for d in data]) if data else 0
+        std_rr = np.std([d["rr"] for d in data]) if len(data) > 1 else 1
+        sharpe = (avg_rr / std_rr) if std_rr > 0 else 0
+        max_dd = 0
+        peak = 0
+        cumulative = 0
+        for d in data:
+            cumulative += d["rr"]
+            if cumulative > peak:
+                peak = cumulative
+            dd = peak - cumulative
+            if dd > max_dd:
+                max_dd = dd
+        return {"total": total, "win_rate": round(win_rate, 2), "avg_rr": round(avg_rr, 2), "sharpe": round(sharpe, 2), "drawdown": round(max_dd, 2)}
 
-# ================= BOT START =================
+# ============================================================================
+# SKANER
+# ============================================================================
+
+class SignalScanner:
+    def __init__(self, config: Config, client: BybitClient, analyzer: SMCAnalyzer) -> None:
+        self.config = config
+        self.client = client
+        self.analyzer = analyzer
+
+    def fetch_top_liquid_coins(self, limit: int) -> List[str]:
+        tickers = self.client.fetch_tickers()
+        if not tickers:
+            return self.config.fallback_coins
+        filtered = [r for r in tickers if r.get("symbol", "").endswith("USDT") and float(r.get("turnover24h", 0) or 0) > 0]
+        filtered.sort(key=lambda r: float(r.get("turnover24h", 0) or 0), reverse=True)
+        symbols = [r["symbol"] for r in filtered[:limit]]
+        if symbols:
+            logger.info(f"{len(symbols)} likvid coin taranır")
+            return symbols
+        return self.config.fallback_coins
+
+    def scan(self) -> Tuple[Optional[Dict], List[Dict]]:
+        session_active, session_name = self.analyzer.get_trading_session()
+        coins = self.fetch_top_liquid_coins(self.config.scan_top_n_coins)
+        results = []
+        for symbol in coins:
+            try:
+                res = self.analyzer.analyze_smc_pro(symbol, session_active, session_name)
+                results.append(res)
+            except Exception as e:
+                logger.error(f"{symbol} error: {e}")
+                results.append({"symbol": symbol, "passed": False, "error": str(e), "conditions": {}, "score": 0})
+            time.sleep(0.15)
+        valid = [r for r in results if r.get("passed")]
+        valid.sort(key=lambda x: (x.get("score", 0), x.get("rr_ratio", 0)), reverse=True)
+        return valid[0] if valid else None, results
+        # ============================================================================
+# TELEGRAM BOT
+# ============================================================================
+
+class TelegramBot:
+    def __init__(self, config: Config, scanner: SignalScanner) -> None:
+        self.config = config
+        self.scanner = scanner
+        self._last_notified: Dict[str, float] = {}
+
+    def format_signal(self, res: Dict, title: str = "🚨 *PRO SMC SIGNAL* 🚨") -> str:
+        f = res.get("fundamental", {})
+        ec = res.get("entry_confirmation", {})
+        strength = "🔥 VERY STRONG" if res["score"] >= 90 else "🟢 STRONG"
+        fvg_info = f"{res.get('fvg_type', 'N/A')}" if res.get('fvg_ok') else "❌"
+        return f"""{title}
+
+{strength} | Score: `{res['score']}/100`
+
+🪙 *{res['symbol']}* | {res['bias']} ({res['event_kind']})
+
+📈 Daily: `{res['daily_bias']}` | 4H: `{res['h4_bias']}`
+🕒 Session: `{res['session']}`
+⚖️ RR: `1:{res['rr_ratio']}`
+
+📍 ENTRY: `{res['entry']}` (Adj: `{res['entry_adj']}`)
+🛑 SL: `{res['sl']}` (Adj: `{res['sl_adj']}`)
+🎯 TP: `{res['tp']}` (Adj: `{res['tp_adj']}`)
+
+⚙️ Lev: `{res['leverage']}x` | 💰 Margin: `${res['margin_required']}`
+
+🔎 *SMC Filters*
+💧 Sweep: `{res['sweep']}` | 📦 POI: `{res['poi_ok']}`
+📊 FVG: `{res['fvg_ok']}` ({fvg_info})
+🎯 OTE: `{res['ote_ok']}` | 📈 CVD: `{res['cvd_ok']}`
+⚡ Displacement: `{res['displacement_ratio']}` | Vol: `{res['volume_ratio']}`
+
+⏱ 15M: `{ec.get('event')}` (Age: `{ec.get('age')}`)
+🌍 BTC: `{f.get('btc_bias')}` | FG: `{f.get('fear_greed')}`
+🆔 `{res['signal_id']}`"""
+
+    def format_diagnostics(self, all_results: List[Dict], max_detail: int = 10) -> str:
+        total = len(all_results)
+        reasons = {}
+        for r in all_results:
+            failed = [name for name, ok in r.get("conditions", {}).items() if not ok]
+            if failed:
+                reason = failed[0]
+                reasons[reason] = reasons.get(reason, 0) + 1
+        lines = [f"📋 *Xülasə:* `{total}` coin.", "", "*Ən çox dayanan:*"]
+        for reason, count in sorted(reasons.items(), key=lambda x: x[1], reverse=True)[:10]:
+            lines.append(f"• {reason}: `{count}`")
+        lines.append("")
+        for r in all_results[:max_detail]:
+            sym = r.get("symbol", "?")
+            sc = r.get("score", 0)
+            if r.get("passed"):
+                lines.append(f"• `{sym}` ✅ PASS | Score `{sc}`")
+            elif r.get("error"):
+                lines.append(f"• `{sym}` ❌ {str(r['error'])[:50]}")
+            else:
+                failed = [n for n, ok in r.get("conditions", {}).items() if not ok]
+                reason = failed[0] if failed else "No setup"
+                lines.append(f"• `{sym}` ❌ {reason} | Score `{sc}`")
+        return "\n".join(lines)
+
+    async def send_signal(self, application, result: Dict) -> None:
+        try:
+            await application.bot.send_message(chat_id=self.config.chat_id, text=self.format_signal(result), parse_mode="Markdown")
+            PerformanceTracker.save_signal(result)
+            logger.info(f"Signal sent: {result['signal_id']}")
+        except Exception as e:
+            logger.error(f"Send error: {e}")
+
+    async def auto_scan_loop(self, application) -> None:
+        await asyncio.sleep(15)
+        while True:
+            try:
+                logger.info("Auto scan started...")
+                result, all_res = await asyncio.to_thread(self.scanner.scan)
+                if result:
+                    sid = result["signal_id"]
+                    now = time.time()
+                    if now - self._last_notified.get(sid, 0) >= self.config.notify_cooldown_seconds:
+                        await self.send_signal(application, result)
+                        self._last_notified[sid] = now
+                else:
+                    logger.info("No valid setup")
+            except Exception as e:
+                logger.error(f"Auto scan error: {e}")
+            await asyncio.sleep(self.config.check_interval_seconds)
+
+    @staticmethod
+    async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = """📊 *Professional SMC AI Bot V3.0*
+
+✅ Bütün SMC prinsipləri aktivdir:
+• Daily → 4H → 1H Trend Alignment
+• Unmitigated OB / FVG
+• OTE (0.618-0.786)
+• CVD (Volume Delta)
+• Session Liquidity Levels
+• Real Commission + Slippage
+
+Komandalar:
+/analiz - Canlı analiz
+/stats - Performans statistikası"""
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    @staticmethod
+    async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        stats = PerformanceTracker.calculate_stats()
+        msg = f"""📈 *PERFORMANCE STATISTICS*
+
+📊 Total Signals: `{stats['total']}`
+🏆 Win Rate: `{stats['win_rate']}%`
+⚖️ Avg RR: `1:{stats['avg_rr']}`
+📉 Sharpe Ratio: `{stats['sharpe']}`
+📉 Max Drawdown: `{stats['drawdown']}`
+
+*Note:* Bu statistikalar real bağlanmaya əsaslanmır. Simulyasiya xarakterlidir."""
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    async def analiz_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await update.message.reply_text(f"🔍 Skan edilir...", parse_mode="Markdown")
+        result, all_res = await asyncio.to_thread(self.scanner.scan)
+        if result:
+            await update.message.reply_text(self.format_signal(result, "📊 *LIVE SMC ANALYSIS*"), parse_mode="Markdown")
+        else:
+            msg = "❌ Heç bir setup keçmədi.\n\n" + self.format_diagnostics(all_res)
+            await update.message.reply_text(msg, parse_mode="Markdown")
+
+# ============================================================================
+# FLASK KEEP-ALIVE
+# ============================================================================
+
+class KeepAliveServer:
+    def __init__(self, port: int) -> None:
+        self.port = port
+        self.app = Flask(__name__)
+        @self.app.route("/")
+        def home():
+            return "PRO SMC AI BOT V3.0 RUNNING"
+    def run(self) -> None:
+        Thread(target=self._run, daemon=True).start()
+    def _run(self) -> None:
+        self.app.run(host="0.0.0.0", port=self.port)
+
+# ============================================================================
+# MAIN
+# ============================================================================
 
 async def post_init(application):
+    bot: TelegramBot = application.bot_data["bot_instance"]
+    application.create_task(bot.auto_scan_loop(application))
+    logger.info("Auto scanner started")
 
-    application.create_task(
-        auto_signal_loop(
-            application
-        )
-    )
-
-    logging.info(
-        "Automatic scanner started"
-    )
-
-# ================= MAIN =================
-
-def main():
-
-    if not TOKEN:
-
-        logging.error(
-            "BOT_TOKEN tapılmadı. "
-            "Environment Variables yoxlayın."
-        )
-
+def main() -> None:
+    try:
+        config = Config()
+    except ValueError as e:
+        logger.error(e)
         return
-
-    keep_alive()
-
-    application = (
-        ApplicationBuilder()
-        .token(TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "analiz",
-            analiz
-        )
-    )
-
-    logging.info(
-        "Professional SMC AI Bot started!"
-    )
-
-    application.run_polling(
-        drop_pending_updates=True
-    )
+    KeepAliveServer(config.flask_port).run()
+    client = BybitClient()
+    analyzer = SMCAnalyzer(config, client)
+    scanner = SignalScanner(config, client, analyzer)
+    bot = TelegramBot(config, scanner)
+    app = ApplicationBuilder().token(config.bot_token).post_init(post_init).build()
+    app.bot_data["bot_instance"] = bot
+    app.add_handler(CommandHandler("start", TelegramBot.start_command))
+    app.add_handler(CommandHandler("analiz", bot.analiz_command))
+    app.add_handler(CommandHandler("stats", TelegramBot.stats_command))
+    logger.info("PROFESSIONAL SMC BOT V3.0 STARTED!")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
- 
