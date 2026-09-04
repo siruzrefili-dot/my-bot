@@ -1,6 +1,13 @@
 """
-PROFESSIONAL SMC AI BOT - V4.1
-Tam düzəlişlər: Score 100 üzərindən, Real TP/SL izləmə, OTE düzəldi, Unmitigated OB soft filter oldu.
+PROFESSIONAL SMC AI BOT - V4.2
+✅ Per-coin TP/SL tracking
+✅ Real 100-point scoring with normalization
+✅ All scoring toggles work
+✅ Stable signal ID (timestamp based)
+✅ Real P&L with commission, slippage, leverage
+✅ BTC bias cache refresh (4 hours)
+✅ 15M confirmation with retest/rejection
+✅ Duplicate signal blocking
 """
 
 import asyncio
@@ -10,7 +17,7 @@ import math
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from threading import Thread
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -49,6 +56,7 @@ class Config:
     ote_fib_low: float = float(os.getenv("OTE_FIB_LOW", "0.618"))
     ote_fib_high: float = float(os.getenv("OTE_FIB_HIGH", "0.786"))
     flask_port: int = int(os.getenv("PORT", "10000"))
+    btc_cache_duration_hours: int = int(os.getenv("BTC_CACHE_DURATION_HOURS", "4"))
     fallback_coins: List[str] = field(default_factory=lambda: [
         "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
         "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "LINKUSDT", "SUIUSDT",
@@ -74,7 +82,7 @@ class Config:
     use_funding_scoring: bool = True
     use_fear_greed_scoring: bool = True
     use_oi_scoring: bool = True
-    use_unmitigated_ob_scoring: bool = True  # YENİ: OB soft filter oldu
+    use_unmitigated_ob_scoring: bool = True
 
     def __post_init__(self) -> None:
         if not self.bot_token:
@@ -150,6 +158,13 @@ class BybitClient:
             logger.error(f"{symbol} kline error: {e}")
         return None
 
+    def fetch_current_price(self, symbol: str) -> Optional[float]:
+        """Cari qiyməti qaytarır (1 dəqiqəlik son şam)"""
+        df = self.fetch_klines(symbol, "1", 2)
+        if df is not None and len(df) > 0:
+            return float(df["close"].iloc[-1])
+        return None
+
     def fetch_funding_rate(self, symbol: str) -> Optional[float]:
         resp = self._safe_get("market/funding/history", {"category": "linear", "symbol": symbol, "limit": 1})
         if not resp:
@@ -180,7 +195,7 @@ class BybitClient:
             pass
         return None
 # ============================================================================
-# SMC KÖMƏKÇİ ALƏTLƏR (OTE DÜZƏLDİ)
+# SMC KÖMƏKÇİ ALƏTLƏR
 # ============================================================================
 
 class SMCHelpers:
@@ -200,7 +215,6 @@ class SMCHelpers:
         else:
             level_618 = recent_low + diff * 0.618
             level_786 = recent_low + diff * 0.786
-        # Düzgün sırala (kiçik → böyük)
         zone_low = min(level_618, level_786)
         zone_high = max(level_618, level_786)
         return zone_low, zone_high
@@ -295,7 +309,29 @@ class SMCAnalyzer:
         self.client = client
         self.helpers = SMCHelpers()
         self._btc_bias_cache = None
+        self._btc_bias_cache_time = None
         self._fear_greed_cache = None
+
+    def _get_btc_bias_with_cache(self) -> Optional[str]:
+        """BTC bias cache ilə - 4 saatdan sonra təzələnir"""
+        if self._btc_bias_cache is not None and self._btc_bias_cache_time is not None:
+            if datetime.now(timezone.utc) - self._btc_bias_cache_time < timedelta(hours=self.config.btc_cache_duration_hours):
+                return self._btc_bias_cache
+        df = self.client.fetch_klines("BTCUSDT", "240", 120)
+        if df is None or len(df) < 60:
+            return None
+        close = df["close"]
+        ema20 = self.compute_ema(close, 20).iloc[-1]
+        ema50 = self.compute_ema(close, 50).iloc[-1]
+        price = close.iloc[-1]
+        if price > ema20 and ema20 > ema50:
+            self._btc_bias_cache = "bullish"
+        elif price < ema20 and ema20 < ema50:
+            self._btc_bias_cache = "bearish"
+        else:
+            self._btc_bias_cache = "neutral"
+        self._btc_bias_cache_time = datetime.now(timezone.utc)
+        return self._btc_bias_cache
 
     @staticmethod
     def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -364,13 +400,13 @@ class SMCAnalyzer:
                     kind = "CHoCH" if trend_bias == "bearish" else "BOS"
                     trend_bias = "bullish"
                     high_crossed = True
-                    events.append({"index": i, "bias": "bullish", "kind": kind, "level": active_high[1]})
+                    events.append({"index": i, "bias": "bullish", "kind": kind, "level": active_high[1], "timestamp": df["timestamp"].iloc[i]})
             if active_low and not low_crossed:
                 if close[i - 1] >= active_low[1] and close[i] < active_low[1]:
                     kind = "CHoCH" if trend_bias == "bullish" else "BOS"
                     trend_bias = "bearish"
                     low_crossed = True
-                    events.append({"index": i, "bias": "bearish", "kind": kind, "level": active_low[1]})
+                    events.append({"index": i, "bias": "bearish", "kind": kind, "level": active_low[1], "timestamp": df["timestamp"].iloc[i]})
         return events
 
     def detect_liquidity_sweep(self, df: pd.DataFrame, direction: str, break_idx: int, window: int = 20) -> bool:
@@ -490,22 +526,7 @@ class SMCAnalyzer:
         return self.determine_trend_bias(sh, sl)
 
     def get_btc_market_bias(self) -> Optional[str]:
-        if self._btc_bias_cache is not None:
-            return self._btc_bias_cache
-        df = self.client.fetch_klines("BTCUSDT", "240", 120)
-        if df is None or len(df) < 60:
-            return None
-        close = df["close"]
-        ema20 = self.compute_ema(close, 20).iloc[-1]
-        ema50 = self.compute_ema(close, 50).iloc[-1]
-        price = close.iloc[-1]
-        if price > ema20 and ema20 > ema50:
-            self._btc_bias_cache = "bullish"
-        elif price < ema20 and ema20 < ema50:
-            self._btc_bias_cache = "bearish"
-        else:
-            self._btc_bias_cache = "neutral"
-        return self._btc_bias_cache
+        return self._get_btc_bias_with_cache()
 
     @staticmethod
     def get_trading_session() -> Tuple[bool, str]:
@@ -678,7 +699,7 @@ class SMCAnalyzer:
         ote_ok, ote_zone = self.check_ote(df, last["bias"], current_price)
         cvd_ok = self.check_cvd_trend(df, last["bias"])
         session_targets = self.get_session_liquidity_targets(df)
-        return {"df": df, "direction": last["bias"], "event_kind": last["kind"], "break_idx": break_idx, "atr_value": float(atr.iloc[-1]), "volume_ratio": vol_ratio, "displacement_ok": disp_ok, "displacement_ratio": disp_ratio, "sweep": sweep, "fvg": fvg, "ob": ob, "current_price": current_price, "poi_ok": poi_ok, "in_ob": in_ob, "in_fvg": in_fvg, "target": target, "ote_ok": ote_ok, "ote_zone": ote_zone, "cvd_ok": cvd_ok, "session_targets": session_targets, "swing_highs": sh, "swing_lows": sl}, None
+        return {"df": df, "direction": last["bias"], "event_kind": last["kind"], "break_idx": break_idx, "event_timestamp": last["timestamp"], "atr_value": float(atr.iloc[-1]), "volume_ratio": vol_ratio, "displacement_ok": disp_ok, "displacement_ratio": disp_ratio, "sweep": sweep, "fvg": fvg, "ob": ob, "current_price": current_price, "poi_ok": poi_ok, "in_ob": in_ob, "in_fvg": in_fvg, "target": target, "ote_ok": ote_ok, "ote_zone": ote_zone, "cvd_ok": cvd_ok, "session_targets": session_targets, "swing_highs": sh, "swing_lows": sl}, None
 
     def find_next_liquidity(self, direction: str, price: float, sh: List, sl: List) -> Optional[float]:
         if direction == "bullish":
@@ -690,7 +711,7 @@ class SMCAnalyzer:
     def analyze_smc_pro(self, symbol: str, session_active: bool, session_name: str) -> Dict:
         conditions = {}
         scores = {}
-        total_score = 0
+        raw_score = 0
 
         # ===== HARD FILTERS =====
         daily = self.get_daily_trend_bias(symbol)
@@ -735,113 +756,163 @@ class SMCAnalyzer:
         if not rr_ok:
             return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0, "reason": f"RR {rr} çox aşağıdır"}
 
-        # ===== SOFT FILTERS (SCORING) =====
-        # Unmitigated OB indi soft filterdir (hard deyil)
+        # ===== SOFT FILTERS (SCORING) - Toggle-lar işləyir =====
+        # Unmitigated OB
         ob = smc["ob"]
-        ob_ok = ob is not None and not ob["mitigated"]
-        if ob_ok:
-            scores["unmitigated_ob"] = 15
+        if self.config.use_unmitigated_ob_scoring:
+            scores["unmitigated_ob"] = 15 if (ob is not None and not ob["mitigated"]) else 0
         else:
             scores["unmitigated_ob"] = 0
-        conditions["Unmitigated OB"] = ob_ok
+        conditions["Unmitigated OB"] = ob is not None and not ob["mitigated"]
 
-        sweep = smc["sweep"]
-        scores["sweep"] = 12 if sweep else 0
-        conditions["Sweep"] = sweep
+        # Sweep
+        if self.config.use_sweep_scoring:
+            scores["sweep"] = 12 if smc["sweep"] else 0
+        else:
+            scores["sweep"] = 0
+        conditions["Sweep"] = smc["sweep"]
 
+        # FVG
         fvg = smc["fvg"]
         fvg_ok = fvg is not None
-        if fvg_ok:
-            fvg_type = fvg.get("type", "standard")
-            scores["fvg"] = 8
-            conditions[f"FVG ({fvg_type})"] = True
+        if self.config.use_fvg_scoring:
+            scores["fvg"] = 8 if fvg_ok else 0
         else:
             scores["fvg"] = 0
+        if fvg_ok:
+            fvg_type = fvg.get("type", "standard")
+            conditions[f"FVG ({fvg_type})"] = True
+        else:
             conditions["FVG"] = False
 
+        # POI
         poi_ok = smc["poi_ok"]
-        scores["poi"] = 10 if poi_ok else 0
+        if self.config.use_poi_scoring:
+            scores["poi"] = 10 if poi_ok else 0
+        else:
+            scores["poi"] = 0
         conditions["POI"] = poi_ok
 
+        # Displacement
         disp_ratio = smc["displacement_ratio"]
-        if disp_ratio >= 1.5:
-            scores["displacement"] = 10
-        elif disp_ratio >= 0.8:
-            scores["displacement"] = 7
-        elif disp_ratio >= 0.5:
-            scores["displacement"] = 4
+        if self.config.use_displacement_scoring:
+            if disp_ratio >= 1.5:
+                scores["displacement"] = 10
+            elif disp_ratio >= 0.8:
+                scores["displacement"] = 7
+            elif disp_ratio >= 0.5:
+                scores["displacement"] = 4
+            else:
+                scores["displacement"] = 0
         else:
             scores["displacement"] = 0
         conditions["Displacement"] = disp_ratio
 
+        # Volume
         vol_ratio = smc["volume_ratio"]
-        if vol_ratio >= 1.5:
-            scores["volume"] = 8
-        elif vol_ratio >= 1.0:
-            scores["volume"] = 5
-        elif vol_ratio >= 0.7:
-            scores["volume"] = 2
+        if self.config.use_volume_scoring:
+            if vol_ratio >= 1.5:
+                scores["volume"] = 8
+            elif vol_ratio >= 1.0:
+                scores["volume"] = 5
+            elif vol_ratio >= 0.7:
+                scores["volume"] = 2
+            else:
+                scores["volume"] = 0
         else:
             scores["volume"] = 0
         conditions["Volume"] = vol_ratio
 
+        # OTE
         ote_ok = smc["ote_ok"]
-        scores["ote"] = 15 if ote_ok else 0
+        if self.config.use_ote_scoring:
+            scores["ote"] = 15 if ote_ok else 0
+        else:
+            scores["ote"] = 0
         conditions["OTE"] = ote_ok
 
+        # CVD
         cvd_ok = smc["cvd_ok"]
-        scores["cvd"] = 10 if cvd_ok else 0
+        if self.config.use_cvd_scoring:
+            scores["cvd"] = 10 if cvd_ok else 0
+        else:
+            scores["cvd"] = 0
         conditions["CVD"] = cvd_ok
 
+        # BTC
         fund_score, fund_data = self.fundamental_score(symbol, direction)
         btc_alignment = fund_data.get("btc_alignment")
-        if btc_alignment is True:
-            scores["btc"] = 10
-        elif btc_alignment is None:
-            scores["btc"] = 3
+        if self.config.use_btc_scoring:
+            if btc_alignment is True:
+                scores["btc"] = 10
+            elif btc_alignment is None:
+                scores["btc"] = 3
+            else:
+                scores["btc"] = 0
         else:
             scores["btc"] = 0
         conditions["BTC"] = btc_alignment
 
-        scores["session"] = 8 if session_active else 0
+        # Session
+        if self.config.use_session_scoring:
+            scores["session"] = 8 if session_active else 0
+        else:
+            scores["session"] = 0
         conditions["Session"] = session_active
 
+        # Fear & Greed
         fg = fund_data.get("fear_greed")
-        if fg is not None:
-            if direction == "bullish" and fg < 80:
-                scores["fear_greed"] = 5
-            elif direction == "bearish" and fg > 20:
-                scores["fear_greed"] = 5
+        if self.config.use_fear_greed_scoring:
+            if fg is not None:
+                if direction == "bullish" and fg < 80:
+                    scores["fear_greed"] = 5
+                elif direction == "bearish" and fg > 20:
+                    scores["fear_greed"] = 5
+                else:
+                    scores["fear_greed"] = 0
             else:
                 scores["fear_greed"] = 0
         else:
             scores["fear_greed"] = 0
 
+        # Funding
         funding = fund_data.get("funding")
-        if funding is not None:
-            if direction == "bullish" and funding < 0:
-                scores["funding"] = 5
-            elif direction == "bearish" and funding > 0:
-                scores["funding"] = 5
+        if self.config.use_funding_scoring:
+            if funding is not None:
+                if direction == "bullish" and funding < 0:
+                    scores["funding"] = 5
+                elif direction == "bearish" and funding > 0:
+                    scores["funding"] = 5
+                else:
+                    scores["funding"] = 0
             else:
                 scores["funding"] = 0
         else:
             scores["funding"] = 0
 
+        # OI
         oi = fund_data.get("oi_change")
-        if oi is not None:
-            scores["oi"] = 3 if oi > 0 else 0
+        if self.config.use_oi_scoring:
+            if oi is not None:
+                scores["oi"] = 3 if oi > 0 else 0
+            else:
+                scores["oi"] = 0
         else:
             scores["oi"] = 0
 
+        # Event kind
         event_kind = smc["event_kind"]
         scores["event"] = 15 if event_kind == "CHoCH" else 12
 
+        # Entry confirmation
         scores["entry_conf"] = 15 if entry_conf else 0
 
-        # TOTAL SCORE - 100 üzərindən (normalizasiya)
+        # TOTAL SCORE - Həqiqi 100 üzərindən normallaşdırma
         raw_score = sum(scores.values())
-        total_score = min(100, raw_score)  # 🔥 100-dən yuxarı çıxmasın
+        max_possible_score = 15 + 12 + 8 + 10 + 10 + 8 + 15 + 10 + 10 + 3 + 8 + 5 + 5 + 3 + 15 + 15
+        # max_possible_score ≈ 152 (təxmini)
+        total_score = min(100, round((raw_score / 152) * 100, 1))  # 🔥 Həqiqi 100-lük normallaşdırma
+
         score_ok = total_score >= self.config.min_signal_score
         conditions["Total Score"] = total_score
         conditions["Min score threshold"] = score_ok
@@ -853,7 +924,8 @@ class SMCAnalyzer:
         if pos["margin_required"] > self.config.account_balance:
             return {"symbol": symbol, "passed": False, "conditions": conditions, "score": total_score, "reason": "Margin balansdan böyükdür"}
 
-        signal_id = generate_signal_id(symbol, direction, smc["break_idx"], smc["current_price"])
+        # 🔥 Stabil Signal ID (timestamp əsaslı)
+        signal_id = generate_signal_id(symbol, direction, smc["event_timestamp"], smc["current_price"])
 
         return {
             "symbol": symbol,
@@ -872,6 +944,8 @@ class SMCAnalyzer:
             "tp_adj": round(levels["tp_adjusted"], 8),
             "rr_ratio": round(rr, 2),
             "leverage": self.config.leverage,
+            "commission": self.config.commission_percent,
+            "slippage": self.config.slippage_percent,
             "daily_bias": daily,
             "h4_bias": h4,
             "session": session_name,
@@ -879,7 +953,7 @@ class SMCAnalyzer:
             "position_size": round(pos["position_size"], 6),
             "notional_value": round(pos["notional_value"], 2),
             "margin_required": round(pos["margin_required"], 2),
-            "sweep": sweep,
+            "sweep": smc["sweep"],
             "poi_ok": poi_ok,
             "fvg_ok": fvg_ok,
             "fvg_type": fvg.get("type") if fvg else None,
@@ -896,11 +970,11 @@ class SMCAnalyzer:
 # YARDIMÇI FUNKSİYALAR
 # ============================================================================
 
-def generate_signal_id(symbol: str, direction: str, break_index: int, poi_price: float) -> str:
-    """Stabil signal ID - eyni setup üçün dəyişmir"""
-    return f"{symbol}_{direction}_{break_index}_{int(poi_price * 1000)}"
+def generate_signal_id(symbol: str, direction: str, event_timestamp: int, poi_price: float) -> str:
+    """🔥 Stabil signal ID - timestamp əsaslı, break_index dəyişmir"""
+    return f"{symbol}_{direction}_{event_timestamp}_{int(poi_price * 1000)}"
 # ============================================================================
-# PERFORMANCE TRACKER (REAL TP/SL İZLƏMƏ)
+# PERFORMANCE TRACKER (REAL PER-COIN TP/SL)
 # ============================================================================
 
 class PerformanceTracker:
@@ -918,7 +992,10 @@ class PerformanceTracker:
                 "entry": signal["entry"],
                 "sl": signal["sl"],
                 "tp": signal["tp"],
-                "rr_ratio": signal["rr_ratio"],  # 🔥 Əlavə edildi
+                "rr_ratio": signal["rr_ratio"],
+                "leverage": signal.get("leverage", 10),
+                "commission": signal.get("commission", 0.04),
+                "slippage": signal.get("slippage", 0.02),
                 "entry_time": datetime.now(timezone.utc).isoformat(),
                 "status": "active"
             })
@@ -946,6 +1023,19 @@ class PerformanceTracker:
                     sig["result"] = result
                     sig["exit_price"] = exit_price
                     sig["exit_time"] = exit_time
+                    # 🔥 Real P&L hesablanır
+                    entry = sig.get("entry", 0)
+                    leverage = sig.get("leverage", 10)
+                    commission = sig.get("commission", 0.04) / 100
+                    slippage = sig.get("slippage", 0.02) / 100
+                    if sig["direction"] == "bullish":
+                        pnl_percent = ((exit_price - entry) / entry) * 100 * leverage
+                    else:
+                        pnl_percent = ((entry - exit_price) / entry) * 100 * leverage
+                    # Komissiya və slippage çıxarılır
+                    pnl_percent = pnl_percent - commission * 2 - slippage * 2
+                    sig["pnl_percent"] = round(pnl_percent, 2)
+                    sig["pnl_dollar"] = round(pnl_percent / 100 * sig.get("risk_amount", 0) / (sig.get("risk_percent", 1) / 100), 2)
                     history.append(sig)
                     break
             active = [s for s in active if s["status"] != "closed"]
@@ -965,11 +1055,15 @@ class PerformanceTracker:
             return []
 
     @classmethod
-    def check_active_signals(cls, current_price: float) -> None:
-        """🔥 Hər skan zamanı çağırılır - TP/SL yoxlanılır"""
+    def check_active_signals_for_symbol(cls, symbol: str, current_price: float) -> None:
+        """🔥 Hər coin üçün öz qiyməti ilə TP/SL yoxlanılır"""
         active = cls.load_active()
         now = datetime.now(timezone.utc).isoformat()
         for sig in active:
+            if sig["symbol"] != symbol:
+                continue
+            if sig["status"] != "active":
+                continue
             entry = sig.get("entry", 0)
             sl = sig.get("sl", 0)
             tp = sig.get("tp", 0)
@@ -988,19 +1082,22 @@ class PerformanceTracker:
     def calculate_stats(cls) -> Dict:
         data = cls.load_history()
         if not data:
-            return {"total": 0, "win_rate": 0, "avg_rr": 0, "sharpe": 0, "drawdown": 0, "active": 0}
+            return {"total": 0, "win_rate": 0, "avg_rr": 0, "sharpe": 0, "drawdown": 0, "active": 0, "total_pnl": 0}
 
         total = len(data)
         wins = sum(1 for d in data if d.get("result") == "WIN")
         win_rate = (wins / total * 100) if total > 0 else 0
 
         rr_list = []
+        pnl_list = []
         for d in data:
             rr = d.get("rr_ratio", 0)
             if d.get("result") == "WIN":
                 rr_list.append(rr)
+                pnl_list.append(d.get("pnl_percent", 0))
             else:
-                rr_list.append(-1)  # LOSS üçün -1
+                rr_list.append(-1)
+                pnl_list.append(d.get("pnl_percent", 0))
 
         avg_rr = np.mean(rr_list) if rr_list else 0
         std_rr = np.std(rr_list) if len(rr_list) > 1 else 1
@@ -1021,17 +1118,20 @@ class PerformanceTracker:
             if dd > max_dd:
                 max_dd = dd
 
+        total_pnl = sum(pnl_list) if pnl_list else 0
+
         return {
             "total": total,
             "win_rate": round(win_rate, 2),
             "avg_rr": round(avg_rr, 2),
             "sharpe": round(sharpe, 2),
             "drawdown": round(max_dd, 2),
-            "active": len(cls.load_active())
+            "active": len(cls.load_active()),
+            "total_pnl": round(total_pnl, 2)
         }
 
 # ============================================================================
-# SKANER (Hər skan zamanı TP/SL yoxlanılır)
+# SKANER (PER-COIN TP/SL TRACKING)
 # ============================================================================
 
 class SignalScanner:
@@ -1039,6 +1139,7 @@ class SignalScanner:
         self.config = config
         self.client = client
         self.analyzer = analyzer
+        self._processed_signals: set = set()  # Duplicate signal blocking
 
     def fetch_top_liquid_coins(self, limit: int) -> List[str]:
         tickers = self.client.fetch_tickers()
@@ -1056,23 +1157,30 @@ class SignalScanner:
         session_active, session_name = self.analyzer.get_trading_session()
         coins = self.fetch_top_liquid_coins(self.config.scan_top_n_coins)
         results = []
-        
-        # 🔥 BTC cari qiyməti - TP/SL yoxlamaq üçün (nümunə)
-        # Real sistemdə hər coin üçün ayrıca yoxlanılmalıdır
-        # Burada sadələşdirilmiş: BTC-nin cari qiyməti ilə bütün aktiv siqnalları yoxlayırıq
-        btc_df = self.client.fetch_klines("BTCUSDT", "1", 2)
-        if btc_df is not None and len(btc_df) > 0:
-            current_price = float(btc_df["close"].iloc[-1])
-            PerformanceTracker.check_active_signals(current_price)
-        
+
+        # 🔥 Per-coin TP/SL tracking - hər coin üçün öz qiyməti ilə yoxlanılır
+        for symbol in coins:
+            current_price = self.client.fetch_current_price(symbol)
+            if current_price is not None:
+                PerformanceTracker.check_active_signals_for_symbol(symbol, current_price)
+
         for symbol in coins:
             try:
                 res = self.analyzer.analyze_smc_pro(symbol, session_active, session_name)
                 results.append(res)
+                # 🔥 Duplicate signal blocking
+                if res.get("passed"):
+                    signal_id = res["signal_id"]
+                    if signal_id in self._processed_signals:
+                        res["passed"] = False
+                        res["reason"] = "Duplicate signal (already processed)"
+                    else:
+                        self._processed_signals.add(signal_id)
             except Exception as e:
                 logger.error(f"{symbol} error: {e}")
                 results.append({"symbol": symbol, "passed": False, "error": str(e), "conditions": {}, "score": 0, "reason": str(e)})
             time.sleep(0.15)
+
         valid = [r for r in results if r.get("passed")]
         valid.sort(key=lambda x: (x.get("score", 0), x.get("rr_ratio", 0)), reverse=True)
         return valid[0] if valid else None, results
@@ -1184,7 +1292,7 @@ OB: `{scores.get('unmitigated_ob',0)}`
 
     @staticmethod
     async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        msg = """📊 *Professional SMC AI Bot V4.1*
+        msg = """📊 *Professional SMC AI Bot V4.2*
 
 ✅ Hard Filter (Məcburi):
 • Daily + 4H + 1H Triple Alignment
@@ -1194,11 +1302,13 @@ OB: `{scores.get('unmitigated_ob',0)}`
 ✅ Soft Filter (Skora təsir edir):
 • Sweep, FVG, POI, Displacement, Volume
 • OTE, CVD, BTC, Session, Fear&Greed, Funding, OI
-• Unmitigated OB (indi soft-dir!)
+• Unmitigated OB
 
 ✅ Real Performance Tracking:
-• TP/SL avtomatik yoxlanılır
-• WIN/LOSS real nəticələrə əsaslanır
+• Per-coin TP/SL tracking (hər coin öz qiyməti ilə)
+• Real P&L (komissiya, slippage, leverage)
+• Duplicate signal blocking
+• Score 100 üzərindən normallaşdırılıb
 
 Komandalar:
 /analiz - Canlı analiz
@@ -1216,6 +1326,7 @@ Komandalar:
 📉 Sharpe Ratio: `{stats['sharpe']}`
 📉 Max Drawdown: `{stats['drawdown']}`
 🟢 Active Signals: `{stats['active']}`
+💰 Total P&L: `{stats['total_pnl']}%`
 
 *Bu statistikalar real TP/SL bağlanmalarına əsaslanır.*"""
         await update.message.reply_text(msg, parse_mode="Markdown")
@@ -1239,7 +1350,7 @@ class KeepAliveServer:
         self.app = Flask(__name__)
         @self.app.route("/")
         def home():
-            return "PRO SMC AI BOT V4.1 RUNNING"
+            return "PRO SMC AI BOT V4.2 RUNNING"
     def run(self) -> None:
         Thread(target=self._run, daemon=True).start()
     def _run(self) -> None:
@@ -1270,7 +1381,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", TelegramBot.start_command))
     app.add_handler(CommandHandler("analiz", bot.analiz_command))
     app.add_handler(CommandHandler("stats", TelegramBot.stats_command))
-    logger.info("PROFESSIONAL SMC BOT V4.1 STARTED!")
+    logger.info("PROFESSIONAL SMC BOT V4.2 STARTED!")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
