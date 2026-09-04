@@ -1,5 +1,6 @@
 """
-PROFESSIONAL SMC AI BOT - VERSION 3.0
+PROFESSIONAL SMC AI BOT - V4.0
+Hard/Soft filter sistemi, Real Performance Tracker, Margin check, Long/Short commission
 """
 
 import asyncio
@@ -47,24 +48,33 @@ class Config:
     max_event_age_bars: int = int(os.getenv("MAX_EVENT_AGE_BARS", "20"))
     ote_fib_low: float = float(os.getenv("OTE_FIB_LOW", "0.618"))
     ote_fib_high: float = float(os.getenv("OTE_FIB_HIGH", "0.786"))
-    require_trend_align: bool = True
-    require_liquidity_sweep: bool = True
-    require_fvg: bool = True
-    require_volume: bool = True
-    require_displacement: bool = True
-    require_poi: bool = True
-    require_15m_confirmation: bool = True
-    require_btc_filter: bool = True
-    require_ote: bool = True
-    require_4h_alignment: bool = True
-    require_cvd_trend: bool = True
-    require_unmitigated: bool = True
     flask_port: int = int(os.getenv("PORT", "10000"))
     fallback_coins: List[str] = field(default_factory=lambda: [
         "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
         "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "LINKUSDT", "SUIUSDT",
         "ARBUSDT", "OPUSDT"
     ])
+
+    # ===== HARD FILTERS (Məcburi) =====
+    require_daily_trend: bool = True
+    require_4h_trend: bool = True
+    require_triple_alignment: bool = True
+    require_unmitigated_ob: bool = True
+    require_15m_confirmation: bool = True
+
+    # ===== SOFT FILTERS (Skora təsir edir, rədd etmir) =====
+    use_sweep_scoring: bool = True
+    use_fvg_scoring: bool = True
+    use_poi_scoring: bool = True
+    use_displacement_scoring: bool = True
+    use_volume_scoring: bool = True
+    use_ote_scoring: bool = True
+    use_cvd_scoring: bool = True
+    use_btc_scoring: bool = True
+    use_session_scoring: bool = True
+    use_funding_scoring: bool = True
+    use_fear_greed_scoring: bool = True
+    use_oi_scoring: bool = True
 
     def __post_init__(self) -> None:
         if not self.bot_token:
@@ -250,7 +260,8 @@ class SMCHelpers:
         sessions = {"Asia": {"high": -np.inf, "low": np.inf},
                     "London": {"high": -np.inf, "low": np.inf},
                     "NY": {"high": -np.inf, "low": np.inf}}
-        for idx, row in df.iterrows():
+        start_idx = max(0, len(df) - lookback_days * 288)
+        for idx, row in df.iloc[start_idx:].iterrows():
             ts = datetime.fromtimestamp(row["timestamp"] / 1000, tz=timezone.utc)
             hour = ts.hour
             if 0 <= hour < 8:
@@ -271,8 +282,7 @@ class SMCHelpers:
             if sessions[sess]["low"] == np.inf:
                 sessions[sess]["low"] = None
         return sessions
-
-# ============================================================================
+        # ============================================================================
 # SMC ANALİZER (HİSSƏ 1)
 # ============================================================================
 
@@ -281,6 +291,8 @@ class SMCAnalyzer:
         self.config = config
         self.client = client
         self.helpers = SMCHelpers()
+        self._btc_bias_cache = None
+        self._fear_greed_cache = None
 
     @staticmethod
     def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -423,7 +435,7 @@ class SMCAnalyzer:
             return slope < 0
 
     def get_session_liquidity_targets(self, df: pd.DataFrame) -> List[float]:
-        levels = self.helpers.get_session_levels(df)
+        levels = self.helpers.get_session_levels(df, lookback_days=5)
         targets = []
         for sess in ["Asia", "London", "NY"]:
             if levels.get(sess, {}).get("high"):
@@ -475,6 +487,8 @@ class SMCAnalyzer:
         return self.determine_trend_bias(sh, sl)
 
     def get_btc_market_bias(self) -> Optional[str]:
+        if self._btc_bias_cache is not None:
+            return self._btc_bias_cache
         df = self.client.fetch_klines("BTCUSDT", "240", 120)
         if df is None or len(df) < 60:
             return None
@@ -483,10 +497,12 @@ class SMCAnalyzer:
         ema50 = self.compute_ema(close, 50).iloc[-1]
         price = close.iloc[-1]
         if price > ema20 and ema20 > ema50:
-            return "bullish"
-        if price < ema20 and ema20 < ema50:
-            return "bearish"
-        return "neutral"
+            self._btc_bias_cache = "bullish"
+        elif price < ema20 and ema20 < ema50:
+            self._btc_bias_cache = "bearish"
+        else:
+            self._btc_bias_cache = "neutral"
+        return self._btc_bias_cache
 
     @staticmethod
     def get_trading_session() -> Tuple[bool, str]:
@@ -502,15 +518,19 @@ class SMCAnalyzer:
         return active, " + ".join(sessions) if sessions else "Asia"
 
     def get_fear_greed(self) -> Tuple[Optional[int], str]:
+        if self._fear_greed_cache is not None:
+            return self._fear_greed_cache
         try:
             resp = requests.get("https://api.alternative.me/fng/", params={"limit": 1}, timeout=6)
             if resp:
                 data = resp.json().get("data", [])
                 if data:
-                    return int(data[0].get("value", 50)), data[0].get("value_classification", "Unknown")
+                    self._fear_greed_cache = (int(data[0].get("value", 50)), data[0].get("value_classification", "Unknown"))
+                    return self._fear_greed_cache
         except Exception:
             pass
-        return None, "Unknown"
+        self._fear_greed_cache = (None, "Unknown")
+        return self._fear_greed_cache
 
     def fundamental_score(self, symbol: str, direction: str) -> Tuple[int, Dict]:
         score = 0
@@ -572,8 +592,7 @@ class SMCAnalyzer:
         vol_ratio = float(vol_series.iloc[-1]) if not pd.isna(vol_series.iloc[-1]) else 0.0
         confirmed = (last["bias"] == direction and age <= 12 and disp_ratio >= 0.5 and vol_ratio >= 0.7)
         return confirmed, {"event": last["kind"], "direction_ok": last["bias"] == direction, "age": age, "fresh": age <= 12, "displacement": round(disp_ratio, 2), "volume_ratio": round(vol_ratio, 2)}
-
-    def calculate_trade_levels(self, direction: str, df: pd.DataFrame, entry: float, ob: Optional[Dict], liquidity_target: Optional[float], atr_value: float) -> Optional[Dict]:
+            def calculate_trade_levels(self, direction: str, df: pd.DataFrame, entry: float, ob: Optional[Dict], liquidity_target: Optional[float], atr_value: float) -> Optional[Dict]:
         if ob is None or liquidity_target is None:
             return None
         sh, sl = self.find_swing_points(df, self.config.swing_lookback)
@@ -589,10 +608,19 @@ class SMCAnalyzer:
             else:
                 sl_price = ob["high"] + atr_value * 0.5
             tp = liquidity_target
-        cost_multiplier = 1 + (self.config.commission_percent / 100) + (self.config.slippage_percent / 100)
-        entry_adj = entry * cost_multiplier
-        sl_adj = sl_price * cost_multiplier
-        tp_adj = tp / cost_multiplier
+
+        commission = self.config.commission_percent / 100
+        slippage = self.config.slippage_percent / 100
+
+        if direction == "bullish":
+            entry_adj = entry * (1 + commission + slippage)
+            sl_adj = sl_price * (1 - commission)
+            tp_adj = tp * (1 - commission - slippage)
+        else:
+            entry_adj = entry * (1 - commission - slippage)
+            sl_adj = sl_price * (1 + commission)
+            tp_adj = tp * (1 + commission + slippage)
+
         risk = abs(entry_adj - sl_adj)
         reward = abs(tp_adj - entry_adj)
         if risk <= 0:
@@ -606,8 +634,15 @@ class SMCAnalyzer:
             return {"risk_amount": risk_amount, "position_size": 0, "notional_value": 0, "margin_required": 0}
         pos_size = risk_amount / stop_distance
         notional = pos_size * entry
-        margin = notional / self.config.leverage if self.config.leverage > 0 else notional
-        return {"risk_amount": risk_amount, "position_size": pos_size, "notional_value": notional, "margin_required": margin}
+        margin_required = notional / self.config.leverage if self.config.leverage > 0 else notional
+
+        if margin_required > self.config.account_balance:
+            max_notional = self.config.account_balance * self.config.leverage
+            pos_size = max_notional / entry
+            margin_required = max_notional / self.config.leverage
+            notional = max_notional
+
+        return {"risk_amount": risk_amount, "position_size": pos_size, "notional_value": notional, "margin_required": margin_required}
 
     def analyze_1h_smc(self, symbol: str) -> Tuple[Optional[Dict], Optional[str]]:
         df = self.client.fetch_klines(symbol, "60", self.config.klines_limit)
@@ -644,139 +679,268 @@ class SMCAnalyzer:
             return min(targets) if targets else None
         targets = [p for _, p in sl if p < price]
         return max(targets) if targets else None
-        # ============================================================================
-# SMC ANALİZER (HİSSƏ 3)
-# ============================================================================
 
     def analyze_smc_pro(self, symbol: str, session_active: bool, session_name: str) -> Dict:
         conditions = {}
+        scores = {}
+        total_score = 0
+
         daily = self.get_daily_trend_bias(symbol)
-        conditions["Daily trend"] = daily in ("bullish", "bearish")
-        if not conditions["Daily trend"]:
-            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
+        daily_ok = daily in ("bullish", "bearish")
+        conditions["Daily trend"] = daily_ok
+        if self.config.require_daily_trend and not daily_ok:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0, "reason": "Daily trend yoxdur"}
+
         h4 = self.get_4h_trend_bias(symbol)
-        conditions["4H trend"] = h4 in ("bullish", "bearish")
-        if self.config.require_4h_alignment and not conditions["4H trend"]:
-            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
+        h4_ok = h4 in ("bullish", "bearish")
+        conditions["4H trend"] = h4_ok
+        if self.config.require_4h_trend and not h4_ok:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0, "reason": "4H trend yoxdur"}
+
         smc, err = self.analyze_1h_smc(symbol)
         if smc is None:
-            return {"symbol": symbol, "passed": False, "error": err, "conditions": conditions, "score": 0}
+            return {"symbol": symbol, "passed": False, "error": err, "conditions": conditions, "score": 0, "reason": err}
+
         direction = smc["direction"]
-        align = direction == daily and direction == h4
-        conditions["Triple trend alignment (D/4H/1H)"] = align
-        if self.config.require_trend_align and not align:
-            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
-        sweep = smc["sweep"]
-        conditions["Liquidity sweep"] = sweep
-        if self.config.require_liquidity_sweep and not sweep:
-            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
-        disp_ok = smc["displacement_ok"]
-        conditions["Displacement"] = disp_ok
-        if self.config.require_displacement and not disp_ok:
-            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
-        vol_ok = smc["volume_ratio"] >= 0.7
-        conditions["Volume"] = vol_ok
-        if self.config.require_volume and not vol_ok:
-            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
+        triple_ok = direction == daily and direction == h4
+        conditions["Triple alignment"] = triple_ok
+        if self.config.require_triple_alignment and not triple_ok:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0, "reason": "Triple alignment yoxdur"}
+
         ob = smc["ob"]
         ob_ok = ob is not None and not ob["mitigated"]
-        conditions["Unmitigated Order Block"] = ob_ok
-        if self.config.require_unmitigated and not ob_ok:
-            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
+        conditions["Unmitigated OB"] = ob_ok
+        if self.config.require_unmitigated_ob and not ob_ok:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0, "reason": "Unmitigated OB yoxdur"}
+
+        entry_conf, entry_data = self.check_15m_confirmation(symbol, direction)
+        conditions["15M confirmation"] = entry_conf
+        if self.config.require_15m_confirmation and not entry_conf:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0, "reason": "15M confirmation yoxdur"}
+
+        target = smc["target"]
+        if target is None:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0, "reason": "Liquidity target yoxdur"}
+
+        entry = smc["current_price"]
+        levels = self.calculate_trade_levels(direction, smc["df"], entry, ob, target, smc["atr_value"])
+        if levels is None:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0, "reason": "Trade levels hesablanmadı"}
+
+        rr = levels["rr_ratio"]
+        rr_ok = rr >= self.config.min_rr_ratio
+        conditions[f"RR >= 1:{self.config.min_rr_ratio}"] = rr_ok
+        if not rr_ok:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0, "reason": f"RR {rr} çox aşağıdır"}
+
+        # SOFT FILTERS (SCORING)
+        sweep = smc["sweep"]
+        scores["sweep"] = 12 if sweep else 0
+        conditions["Sweep"] = sweep
+
         fvg = smc["fvg"]
         fvg_ok = fvg is not None
         if fvg_ok:
             fvg_type = fvg.get("type", "standard")
+            scores["fvg"] = 8
             conditions[f"FVG ({fvg_type})"] = True
         else:
+            scores["fvg"] = 0
             conditions["FVG"] = False
-        if self.config.require_fvg and not fvg_ok:
-            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
-        poi_ok = smc["poi_ok"]
-        conditions["POI"] = poi_ok
-        if self.config.require_poi and not poi_ok:
-            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
-        ote_ok = smc["ote_ok"]
-        conditions["OTE (0.618-0.786)"] = ote_ok
-        if self.config.require_ote and not ote_ok:
-            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
-        cvd_ok = smc["cvd_ok"]
-        conditions["CVD trend"] = cvd_ok
-        if self.config.require_cvd_trend and not cvd_ok:
-            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
-        target = smc["target"]
-        conditions["Liquidity target"] = target is not None
-        if target is None:
-            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
-        entry = smc["current_price"]
-        levels = self.calculate_trade_levels(direction, smc["df"], entry, ob, target, smc["atr_value"])
-        if levels is None:
-            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
-        rr = levels["rr_ratio"]
-        conditions[f"RR >= 1:{self.config.min_rr_ratio}"] = rr >= self.config.min_rr_ratio
-        if rr < self.config.min_rr_ratio:
-            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
-        conditions["Active session"] = session_active
-        entry_conf, entry_data = self.check_15m_confirmation(symbol, direction)
-        conditions["15M confirmation"] = entry_conf
-        if self.config.require_15m_confirmation and not entry_conf:
-            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
-        fund_score, fund_data = self.fundamental_score(symbol, direction)
-        btc_ok = fund_data.get("btc_alignment") is not False
-        conditions["BTC alignment"] = btc_ok
-        if self.config.require_btc_filter and not btc_ok:
-            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0}
-        score = self.calculate_signal_score(smc["event_kind"], rr, sweep, fvg_ok, poi_ok, smc["displacement_ratio"], smc["volume_ratio"], entry_conf, fund_score)
-        conditions["Min score"] = score >= self.config.min_signal_score
-        if score < self.config.min_signal_score:
-            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": score}
-        pos = self.calculate_position_size(levels["entry_adjusted"], levels["sl_adjusted"])
-        signal_id = f"{symbol}_{direction}_{smc['event_kind']}_{int(time.time() // 900)}"
-        return {"symbol": symbol, "passed": True, "conditions": conditions, "score": score, "bias": "🟢 LONG" if direction == "bullish" else "🔴 SHORT", "direction": direction, "event_kind": smc["event_kind"], "entry": round(levels["entry"], 8), "entry_adj": round(levels["entry_adjusted"], 8), "sl": round(levels["sl"], 8), "sl_adj": round(levels["sl_adjusted"], 8), "tp": round(levels["tp"], 8), "tp_adj": round(levels["tp_adjusted"], 8), "rr_ratio": round(rr, 2), "leverage": self.config.leverage, "daily_bias": daily, "h4_bias": h4, "session": session_name, "risk_amount": round(pos["risk_amount"], 2), "position_size": round(pos["position_size"], 6), "notional_value": round(pos["notional_value"], 2), "margin_required": round(pos["margin_required"], 2), "sweep": sweep, "poi_ok": poi_ok, "fvg_ok": fvg_ok, "fvg_type": fvg.get("type") if fvg else None, "ote_ok": ote_ok, "cvd_ok": cvd_ok, "displacement_ratio": round(smc["displacement_ratio"], 2), "volume_ratio": round(smc["volume_ratio"], 2), "entry_confirmation": entry_data, "fundamental": fund_data, "signal_id": signal_id}
 
-    def calculate_signal_score(self, event_kind, rr, sweep, fvg_ok, poi_ok, disp_ratio, vol_ratio, entry_conf, fund_score) -> float:
-        score = 15 if event_kind == "CHoCH" else 12
-        score += 12 if sweep else 0
-        score += 8 if fvg_ok else 0
-        score += 10 if poi_ok else 0
-        if rr >= 4:
-            score += 18
-        elif rr >= 3:
-            score += 14
-        elif rr >= 2:
-            score += 10
+        poi_ok = smc["poi_ok"]
+        scores["poi"] = 10 if poi_ok else 0
+        conditions["POI"] = poi_ok
+
+        disp_ratio = smc["displacement_ratio"]
         if disp_ratio >= 1.5:
-            score += 10
+            scores["displacement"] = 10
         elif disp_ratio >= 0.8:
-            score += 7
+            scores["displacement"] = 7
         elif disp_ratio >= 0.5:
-            score += 4
+            scores["displacement"] = 4
+        else:
+            scores["displacement"] = 0
+        conditions["Displacement"] = disp_ratio
+
+        vol_ratio = smc["volume_ratio"]
         if vol_ratio >= 1.5:
-            score += 8
+            scores["volume"] = 8
         elif vol_ratio >= 1.0:
-            score += 5
+            scores["volume"] = 5
         elif vol_ratio >= 0.7:
-            score += 2
-        score += 15 if entry_conf else 0
-        score += fund_score
-        return round(max(0, min(score, 100)), 1)
+            scores["volume"] = 2
+        else:
+            scores["volume"] = 0
+        conditions["Volume"] = vol_ratio
+
+        ote_ok = smc["ote_ok"]
+        scores["ote"] = 15 if ote_ok else 0
+        conditions["OTE"] = ote_ok
+
+        cvd_ok = smc["cvd_ok"]
+        scores["cvd"] = 10 if cvd_ok else 0
+        conditions["CVD"] = cvd_ok
+
+        fund_score, fund_data = self.fundamental_score(symbol, direction)
+        btc_alignment = fund_data.get("btc_alignment")
+        if btc_alignment is True:
+            scores["btc"] = 10
+        elif btc_alignment is None:
+            scores["btc"] = 3
+        else:
+            scores["btc"] = 0
+        conditions["BTC"] = btc_alignment
+
+        scores["session"] = 8 if session_active else 0
+        conditions["Session"] = session_active
+
+        fg = fund_data.get("fear_greed")
+        if fg is not None:
+            if direction == "bullish" and fg < 80:
+                scores["fear_greed"] = 5
+            elif direction == "bearish" and fg > 20:
+                scores["fear_greed"] = 5
+            else:
+                scores["fear_greed"] = 0
+        else:
+            scores["fear_greed"] = 0
+
+        funding = fund_data.get("funding")
+        if funding is not None:
+            if direction == "bullish" and funding < 0:
+                scores["funding"] = 5
+            elif direction == "bearish" and funding > 0:
+                scores["funding"] = 5
+            else:
+                scores["funding"] = 0
+        else:
+            scores["funding"] = 0
+
+        oi = fund_data.get("oi_change")
+        if oi is not None:
+            scores["oi"] = 3 if oi > 0 else 0
+        else:
+            scores["oi"] = 0
+
+        event_kind = smc["event_kind"]
+        scores["event"] = 15 if event_kind == "CHoCH" else 12
+
+        scores["entry_conf"] = 15 if entry_conf else 0
+
+        total_score = sum(scores.values())
+        score_ok = total_score >= self.config.min_signal_score
+        conditions["Total Score"] = total_score
+        conditions["Min score threshold"] = score_ok
+
+        if not score_ok:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": total_score, "reason": f"Score {total_score} aşağıdır"}
+
+        pos = self.calculate_position_size(levels["entry_adjusted"], levels["sl_adjusted"])
+        if pos["margin_required"] > self.config.account_balance:
+            return {"symbol": symbol, "passed": False, "conditions": conditions, "score": total_score, "reason": "Margin balansdan böyükdür"}
+
+        signal_id = generate_signal_id(symbol, direction, smc["break_idx"], smc["current_price"])
+
+        return {
+            "symbol": symbol,
+            "passed": True,
+            "conditions": conditions,
+            "scores": scores,
+            "score": total_score,
+            "bias": "🟢 LONG" if direction == "bullish" else "🔴 SHORT",
+            "direction": direction,
+            "event_kind": event_kind,
+            "entry": round(levels["entry"], 8),
+            "entry_adj": round(levels["entry_adjusted"], 8),
+            "sl": round(levels["sl"], 8),
+            "sl_adj": round(levels["sl_adjusted"], 8),
+            "tp": round(levels["tp"], 8),
+            "tp_adj": round(levels["tp_adjusted"], 8),
+            "rr_ratio": round(rr, 2),
+            "leverage": self.config.leverage,
+            "daily_bias": daily,
+            "h4_bias": h4,
+            "session": session_name,
+            "risk_amount": round(pos["risk_amount"], 2),
+            "position_size": round(pos["position_size"], 6),
+            "notional_value": round(pos["notional_value"], 2),
+            "margin_required": round(pos["margin_required"], 2),
+            "sweep": sweep,
+            "poi_ok": poi_ok,
+            "fvg_ok": fvg_ok,
+            "fvg_type": fvg.get("type") if fvg else None,
+            "ote_ok": ote_ok,
+            "cvd_ok": cvd_ok,
+            "displacement_ratio": round(disp_ratio, 2),
+            "volume_ratio": round(vol_ratio, 2),
+            "entry_confirmation": entry_data,
+            "fundamental": fund_data,
+            "signal_id": signal_id
+        }
 
 # ============================================================================
-# PERFORMANS MONİTORU
+# YARDIMÇI FUNKSİYALAR
+# ============================================================================
+
+def generate_signal_id(symbol: str, direction: str, break_index: int, poi_price: float) -> str:
+    """Stabil signal ID - eyni setup üçün dəyişmir"""
+    return f"{symbol}_{direction}_{break_index}_{int(poi_price * 1000)}"
+    # ============================================================================
+# PERFORMANCE TRACKER (REAL TP/SL)
 # ============================================================================
 
 class PerformanceTracker:
     HISTORY_FILE = "signals_history.json"
+    ACTIVE_SIGNALS_FILE = "active_signals.json"
 
     @classmethod
     def save_signal(cls, signal: Dict) -> None:
         try:
-            data = cls.load_history()
-            data.append({"timestamp": datetime.now(timezone.utc).isoformat(), "symbol": signal["symbol"], "direction": signal["direction"], "entry": signal["entry"], "sl": signal["sl"], "tp": signal["tp"], "rr": signal["rr_ratio"], "score": signal["score"]})
-            with open(cls.HISTORY_FILE, "w") as f:
-                json.dump(data, f, indent=2)
+            active = cls.load_active()
+            active.append({
+                "signal_id": signal["signal_id"],
+                "symbol": signal["symbol"],
+                "direction": signal["direction"],
+                "entry": signal["entry"],
+                "sl": signal["sl"],
+                "tp": signal["tp"],
+                "entry_time": datetime.now(timezone.utc).isoformat(),
+                "status": "active"
+            })
+            with open(cls.ACTIVE_SIGNALS_FILE, "w") as f:
+                json.dump(active, f, indent=2)
         except Exception as e:
-            logger.warning(f"Could not save signal: {e}")
+            logger.warning(f"Could not save active signal: {e}")
+
+    @classmethod
+    def load_active(cls) -> List[Dict]:
+        try:
+            with open(cls.ACTIVE_SIGNALS_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return []
+
+    @classmethod
+    def update_signal(cls, signal_id: str, result: str, exit_price: float, exit_time: str) -> None:
+        try:
+            active = cls.load_active()
+            history = cls.load_history()
+            for sig in active:
+                if sig["signal_id"] == signal_id:
+                    sig["status"] = "closed"
+                    sig["result"] = result
+                    sig["exit_price"] = exit_price
+                    sig["exit_time"] = exit_time
+                    history.append(sig)
+                    break
+            active = [s for s in active if s["status"] != "closed"]
+            with open(cls.ACTIVE_SIGNALS_FILE, "w") as f:
+                json.dump(active, f, indent=2)
+            with open(cls.HISTORY_FILE, "w") as f:
+                json.dump(history, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not update signal: {e}")
 
     @classmethod
     def load_history(cls) -> List[Dict]:
@@ -790,24 +954,51 @@ class PerformanceTracker:
     def calculate_stats(cls) -> Dict:
         data = cls.load_history()
         if not data:
-            return {"total": 0, "win_rate": 0, "avg_rr": 0, "sharpe": 0, "drawdown": 0}
+            return {"total": 0, "win_rate": 0, "avg_rr": 0, "sharpe": 0, "drawdown": 0, "active": 0}
+
         total = len(data)
-        wins = sum(1 for d in data if d.get("rr", 0) > 0)
+        wins = sum(1 for d in data if d.get("result") == "WIN")
         win_rate = (wins / total * 100) if total > 0 else 0
-        avg_rr = np.mean([d["rr"] for d in data]) if data else 0
-        std_rr = np.std([d["rr"] for d in data]) if len(data) > 1 else 1
+
+        rr_list = []
+        for d in data:
+            entry = d.get("entry", 0)
+            exit_price = d.get("exit_price", 0)
+            sl = d.get("sl", 0)
+            if sl and entry and exit_price:
+                if d["direction"] == "bullish":
+                    rr = (exit_price - entry) / (entry - sl)
+                else:
+                    rr = (entry - exit_price) / (sl - entry)
+                rr_list.append(rr)
+
+        avg_rr = np.mean(rr_list) if rr_list else 0
+        std_rr = np.std(rr_list) if len(rr_list) > 1 else 1
         sharpe = (avg_rr / std_rr) if std_rr > 0 else 0
+
         max_dd = 0
         peak = 0
         cumulative = 0
         for d in data:
-            cumulative += d["rr"]
+            rr = d.get("rr_ratio", 0)
+            if d.get("result") == "WIN":
+                cumulative += rr
+            else:
+                cumulative -= 1
             if cumulative > peak:
                 peak = cumulative
             dd = peak - cumulative
             if dd > max_dd:
                 max_dd = dd
-        return {"total": total, "win_rate": round(win_rate, 2), "avg_rr": round(avg_rr, 2), "sharpe": round(sharpe, 2), "drawdown": round(max_dd, 2)}
+
+        return {
+            "total": total,
+            "win_rate": round(win_rate, 2),
+            "avg_rr": round(avg_rr, 2),
+            "sharpe": round(sharpe, 2),
+            "drawdown": round(max_dd, 2),
+            "active": len(cls.load_active())
+        }
 
 # ============================================================================
 # SKANER
@@ -841,7 +1032,7 @@ class SignalScanner:
                 results.append(res)
             except Exception as e:
                 logger.error(f"{symbol} error: {e}")
-                results.append({"symbol": symbol, "passed": False, "error": str(e), "conditions": {}, "score": 0})
+                results.append({"symbol": symbol, "passed": False, "error": str(e), "conditions": {}, "score": 0, "reason": str(e)})
             time.sleep(0.15)
         valid = [r for r in results if r.get("passed")]
         valid.sort(key=lambda x: (x.get("score", 0), x.get("rr_ratio", 0)), reverse=True)
@@ -859,8 +1050,9 @@ class TelegramBot:
     def format_signal(self, res: Dict, title: str = "🚨 *PRO SMC SIGNAL* 🚨") -> str:
         f = res.get("fundamental", {})
         ec = res.get("entry_confirmation", {})
-        strength = "🔥 VERY STRONG" if res["score"] >= 90 else "🟢 STRONG"
+        strength = "🔥 VERY STRONG" if res["score"] >= 90 else "🟢 STRONG" if res["score"] >= 75 else "🔵 GOOD"
         fvg_info = f"{res.get('fvg_type', 'N/A')}" if res.get('fvg_ok') else "❌"
+        scores = res.get("scores", {})
         return f"""{title}
 
 {strength} | Score: `{res['score']}/100`
@@ -883,6 +1075,12 @@ class TelegramBot:
 🎯 OTE: `{res['ote_ok']}` | 📈 CVD: `{res['cvd_ok']}`
 ⚡ Displacement: `{res['displacement_ratio']}` | Vol: `{res['volume_ratio']}`
 
+📊 *Score Breakdown*
+Sweep: `{scores.get('sweep',0)}` | FVG: `{scores.get('fvg',0)}` | POI: `{scores.get('poi',0)}`
+Disp: `{scores.get('displacement',0)}` | Vol: `{scores.get('volume',0)}` | OTE: `{scores.get('ote',0)}`
+CVD: `{scores.get('cvd',0)}` | BTC: `{scores.get('btc',0)}` | Sess: `{scores.get('session',0)}`
+Event: `{scores.get('event',0)}` | EntryConf: `{scores.get('entry_conf',0)}`
+
 ⏱ 15M: `{ec.get('event')}` (Age: `{ec.get('age')}`)
 🌍 BTC: `{f.get('btc_bias')}` | FG: `{f.get('fear_greed')}`
 🆔 `{res['signal_id']}`"""
@@ -891,10 +1089,15 @@ class TelegramBot:
         total = len(all_results)
         reasons = {}
         for r in all_results:
-            failed = [name for name, ok in r.get("conditions", {}).items() if not ok]
-            if failed:
-                reason = failed[0]
+            reason = r.get("reason")
+            if reason:
                 reasons[reason] = reasons.get(reason, 0) + 1
+            else:
+                failed = [name for name, ok in r.get("conditions", {}).items() if not ok]
+                if failed:
+                    reason = failed[0]
+                    reasons[reason] = reasons.get(reason, 0) + 1
+
         lines = [f"📋 *Xülasə:* `{total}` coin.", "", "*Ən çox dayanan:*"]
         for reason, count in sorted(reasons.items(), key=lambda x: x[1], reverse=True)[:10]:
             lines.append(f"• {reason}: `{count}`")
@@ -904,17 +1107,18 @@ class TelegramBot:
             sc = r.get("score", 0)
             if r.get("passed"):
                 lines.append(f"• `{sym}` ✅ PASS | Score `{sc}`")
-            elif r.get("error"):
-                lines.append(f"• `{sym}` ❌ {str(r['error'])[:50]}")
             else:
-                failed = [n for n, ok in r.get("conditions", {}).items() if not ok]
-                reason = failed[0] if failed else "No setup"
+                reason = r.get("reason") or "Unknown"
                 lines.append(f"• `{sym}` ❌ {reason} | Score `{sc}`")
         return "\n".join(lines)
 
     async def send_signal(self, application, result: Dict) -> None:
         try:
-            await application.bot.send_message(chat_id=self.config.chat_id, text=self.format_signal(result), parse_mode="Markdown")
+            await application.bot.send_message(
+                chat_id=self.config.chat_id,
+                text=self.format_signal(result),
+                parse_mode="Markdown"
+            )
             PerformanceTracker.save_signal(result)
             logger.info(f"Signal sent: {result['signal_id']}")
         except Exception as e:
@@ -940,15 +1144,17 @@ class TelegramBot:
 
     @staticmethod
     async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        msg = """📊 *Professional SMC AI Bot V3.0*
+        msg = """📊 *Professional SMC AI Bot V4.0*
 
-✅ Bütün SMC prinsipləri aktivdir:
-• Daily → 4H → 1H Trend Alignment
-• Unmitigated OB / FVG
-• OTE (0.618-0.786)
-• CVD (Volume Delta)
-• Session Liquidity Levels
-• Real Commission + Slippage
+✅ Hard Filter (Məcburi):
+• Daily + 4H + 1H Triple Alignment
+• Unmitigated Order Block
+• 15M Confirmation
+• RR >= 1:2
+
+✅ Soft Filter (Skora təsir edir):
+• Sweep, FVG, POI, Displacement, Volume
+• OTE, CVD, BTC, Session, Fear&Greed, Funding, OI
 
 Komandalar:
 /analiz - Canlı analiz
@@ -965,8 +1171,9 @@ Komandalar:
 ⚖️ Avg RR: `1:{stats['avg_rr']}`
 📉 Sharpe Ratio: `{stats['sharpe']}`
 📉 Max Drawdown: `{stats['drawdown']}`
+🟢 Active Signals: `{stats['active']}`
 
-*Note:* Bu statistikalar real bağlanmaya əsaslanmır. Simulyasiya xarakterlidir."""
+*Bu statistikalar real TP/SL bağlanmalarına əsaslanır.*"""
         await update.message.reply_text(msg, parse_mode="Markdown")
 
     async def analiz_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -988,7 +1195,7 @@ class KeepAliveServer:
         self.app = Flask(__name__)
         @self.app.route("/")
         def home():
-            return "PRO SMC AI BOT V3.0 RUNNING"
+            return "PRO SMC AI BOT V4.0 RUNNING"
     def run(self) -> None:
         Thread(target=self._run, daemon=True).start()
     def _run(self) -> None:
@@ -1019,7 +1226,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", TelegramBot.start_command))
     app.add_handler(CommandHandler("analiz", bot.analiz_command))
     app.add_handler(CommandHandler("stats", TelegramBot.stats_command))
-    logger.info("PROFESSIONAL SMC BOT V3.0 STARTED!")
+    logger.info("PROFESSIONAL SMC BOT V4.0 STARTED!")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
