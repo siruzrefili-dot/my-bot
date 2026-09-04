@@ -413,7 +413,7 @@ class SMCAnalyzer:
                 mitigated = True
                 break
         return {"index": ob_idx, "high": ob_high, "low": ob_low, "mid": (ob_high + ob_low) / 2, "mitigated": mitigated, "direction": direction}
-        # ============================================================================
+# ============================================================================
 # SMC ANALİZER (HİSSƏ 2)
 # ============================================================================
 
@@ -592,7 +592,11 @@ class SMCAnalyzer:
         vol_ratio = float(vol_series.iloc[-1]) if not pd.isna(vol_series.iloc[-1]) else 0.0
         confirmed = (last["bias"] == direction and age <= 12 and disp_ratio >= 0.5 and vol_ratio >= 0.7)
         return confirmed, {"event": last["kind"], "direction_ok": last["bias"] == direction, "age": age, "fresh": age <= 12, "displacement": round(disp_ratio, 2), "volume_ratio": round(vol_ratio, 2)}
-            def calculate_trade_levels(self, direction: str, df: pd.DataFrame, entry: float, ob: Optional[Dict], liquidity_target: Optional[float], atr_value: float) -> Optional[Dict]:
+# ============================================================================
+# SMC ANALİZER (HİSSƏ 3 - QALAN METODLAR)
+# ============================================================================
+
+    def calculate_trade_levels(self, direction: str, df: pd.DataFrame, entry: float, ob: Optional[Dict], liquidity_target: Optional[float], atr_value: float) -> Optional[Dict]:
         if ob is None or liquidity_target is None:
             return None
         sh, sl = self.find_swing_points(df, self.config.swing_lookback)
@@ -886,7 +890,7 @@ class SMCAnalyzer:
 def generate_signal_id(symbol: str, direction: str, break_index: int, poi_price: float) -> str:
     """Stabil signal ID - eyni setup üçün dəyişmir"""
     return f"{symbol}_{direction}_{break_index}_{int(poi_price * 1000)}"
-    # ============================================================================
+# ============================================================================
 # PERFORMANCE TRACKER (REAL TP/SL)
 # ============================================================================
 
@@ -1037,7 +1041,7 @@ class SignalScanner:
         valid = [r for r in results if r.get("passed")]
         valid.sort(key=lambda x: (x.get("score", 0), x.get("rr_ratio", 0)), reverse=True)
         return valid[0] if valid else None, results
-        # ============================================================================
+# ============================================================================
 # TELEGRAM BOT
 # ============================================================================
 
