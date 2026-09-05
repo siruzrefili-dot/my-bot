@@ -1,11 +1,3 @@
-"""
-PROFESSIONAL SMC AI BOT - V5.5 FINAL
-Bütün problemlər düzəldi:
-- Bütün liquidity-lər içindən ilk untouched target seçilir
-- Yalnız son tamamlanmış session liquidity istifadə olunur
-- 100 ballıq score məntiqli bölünüb (entry_conf çıxarıldı)
-"""
-
 import asyncio
 import json
 import logging
@@ -53,11 +45,14 @@ class Config:
     volume_period: int = int(os.getenv("VOLUME_PERIOD", "20"))
     min_rr_ratio: float = float(os.getenv("MIN_RR_RATIO", "2.0"))
     min_signal_score: float = float(os.getenv("MIN_SIGNAL_SCORE", "70"))
-    max_event_age_bars: int = int(os.getenv("MAX_EVENT_AGE_BARS", "20"))
+    max_event_age_bars: int = int(os.getenv("MAX_EVENT_AGE_BARS", "6"))
     ote_fib_low: float = float(os.getenv("OTE_FIB_LOW", "0.618"))
     ote_fib_high: float = float(os.getenv("OTE_FIB_HIGH", "0.786"))
     flask_port: int = int(os.getenv("PORT", "10000"))
     parallel_workers: int = int(os.getenv("PARALLEL_WORKERS", "6"))
+    max_active_signals: int = int(os.getenv("MAX_ACTIVE_SIGNALS", "3"))
+    max_daily_signals: int = int(os.getenv("MAX_DAILY_SIGNALS", "5"))
+    max_correlation_signals: int = int(os.getenv("MAX_CORRELATION_SIGNALS", "2"))
     fallback_coins: List[str] = field(default_factory=lambda: [
         "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
         "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "LINKUSDT", "SUIUSDT",
@@ -96,6 +91,12 @@ class Config:
             raise ValueError("MIN_RR_RATIO >= 0")
         if self.min_signal_score < 0 or self.min_signal_score > 100:
             raise ValueError("MIN_SIGNAL_SCORE 0-100")
+        if self.max_active_signals < 1:
+            raise ValueError("MAX_ACTIVE_SIGNALS >= 1")
+        if self.max_daily_signals < 1:
+            raise ValueError("MAX_DAILY_SIGNALS >= 1")
+        if self.parallel_workers < 1:
+            raise ValueError("PARALLEL_WORKERS >= 1")
 
 # ============================================================================
 # LOGGING
@@ -206,6 +207,36 @@ class BybitClient:
             pass
         return []
 
+    def fetch_instruments_info(self, symbol: str, category: str = "linear") -> Optional[Dict]:
+        cache_key = f"instr_{symbol}"
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+        resp = self._safe_get("market/instruments-info", {"category": category, "symbol": symbol}, use_cache=True, cache_ttl=3600)
+        if not resp:
+            return None
+        try:
+            data = resp.json()
+            if data.get("retCode") == 0:
+                rows = data.get("result", {}).get("list", [])
+                if rows:
+                    info = rows[0]
+                    lot_size = info.get("lotSizeFilter", {})
+                    price_filter = info.get("priceFilter", {})
+                    result = {
+                        "symbol": info.get("symbol"),
+                        "status": info.get("status"),
+                        "tickSize": float(price_filter.get("tickSize", 0.01)),
+                        "qtyStep": float(lot_size.get("qtyStep", 0.001)),
+                        "minOrderQty": float(lot_size.get("minOrderQty", 0.001)),
+                        "maxOrderQty": float(lot_size.get("maxOrderQty", 1000000)),
+                    }
+                    self._cache.set(cache_key, result, 3600)
+                    return result
+        except Exception as e:
+            logger.warning(f"Instrument info error {symbol}: {e}")
+        return None
+
     def fetch_klines(self, symbol: str, interval: str = "60", limit: int = 200) -> Optional[pd.DataFrame]:
         cache_key = f"{symbol}_{interval}_{limit}"
         ttl = self._klines_cache_ttl.get(interval, 120)
@@ -240,24 +271,55 @@ class BybitClient:
 
     def fetch_1m_high_low_since(self, symbol: str, since_timestamp: int) -> List[Tuple[float, float, float, int]]:
         current_time = int(time.time() * 1000)
-        params = {"category": "linear", "symbol": symbol, "interval": "1", "limit": 200}
-        resp = self._safe_get("market/kline", params, use_cache=False)
-        if not resp:
-            return []
-        try:
-            data = resp.json()
-            if data.get("retCode") != 0:
-                return []
-            rows = data.get("result", {}).get("list", [])
-            result = []
-            for row in rows:
-                ts = int(row[0])
-                if ts + 60000 <= current_time and ts > since_timestamp:
-                    result.append((float(row[2]), float(row[3]), float(row[4]), ts))
-            return sorted(result, key=lambda x: x[3])
-        except Exception as e:
-            logger.warning(f"1M since error {symbol}: {e}")
-        return []
+        max_since = current_time - (1000 * 60 * 1000)
+        effective_since = max(since_timestamp, max_since)
+        if effective_since > since_timestamp:
+            logger.warning(f"{symbol} üçün 1M məlumat yalnız son 1000 dəqiqədən gətirilir.")
+
+        all_candles = []
+        cursor = None
+        while True:
+            params = {
+                "category": "linear",
+                "symbol": symbol,
+                "interval": "1",
+                "limit": 200
+            }
+            if cursor:
+                params["cursor"] = cursor
+            resp = self._safe_get("market/kline", params, use_cache=False)
+            if not resp:
+                break
+            try:
+                data = resp.json()
+                if data.get("retCode") != 0:
+                    break
+                result = data.get("result", {})
+                rows = result.get("list", [])
+                if not rows:
+                    break
+                filtered = []
+                for row in rows:
+                    ts = int(row[0])
+                    if ts + 60000 <= current_time and ts > effective_since:
+                        filtered.append((float(row[2]), float(row[3]), float(row[4]), ts))
+                all_candles.extend(filtered)
+                oldest_ts = int(rows[-1][0])
+                if oldest_ts <= effective_since:
+                    break
+                cursor = result.get("nextPageCursor")
+                if not cursor:
+                    break
+                if len(all_candles) > 1000:
+                    break
+            except Exception as e:
+                logger.warning(f"1M pagination error {symbol}: {e}")
+                break
+        all_candles = sorted(all_candles, key=lambda x: x[3])
+        unique = {}
+        for h, l, c, ts in all_candles:
+            unique[ts] = (h, l, c, ts)
+        return list(unique.values())
 
     def fetch_current_price(self, symbol: str) -> Optional[float]:
         resp = self._safe_get("market/tickers", {"category": "linear", "symbol": symbol}, use_cache=False)
@@ -352,7 +414,7 @@ class SMCHelpers:
             valid_lows = [(i, p) for i, p in swing_lows if swing_high_idx < i < break_idx]
             if not valid_lows:
                 return None
-            _, swing_low = max(valid_lows, key=lambda x: (x[0] - x[1], x[0]))
+            _, swing_low = min(valid_lows, key=lambda x: x[1])
 
             diff = swing_high - swing_low
             if diff <= 0:
@@ -382,78 +444,64 @@ class SMCHelpers:
             return True
         sub_df = df.iloc[from_index + 1:]
         if direction == "bullish":
-            return any(float(row["low"]) <= level for _, row in sub_df.iterrows())
-        else:
             return any(float(row["high"]) >= level for _, row in sub_df.iterrows())
+        else:
+            return any(float(row["low"]) <= level for _, row in sub_df.iterrows())
 
     @staticmethod
     def get_completed_session_levels(df: pd.DataFrame, lookback_days: int = 5, interval: str = "60") -> List[Dict]:
-        """
-        Yalnız son tamamlanmış sessiyaların high/low səviyyələrini qaytarır.
-        Asia: 0-8 UTC (tamamlanma 8:00)
-        London: 8-16 UTC (tamamlanma 16:00)
-        NY: 16-24 UTC (tamamlanma 24:00)
-        """
         if len(df) < 1:
             return []
 
-        # Cari vaxt
         now = datetime.now(timezone.utc)
         current_hour = now.hour
 
-        # Hansı sessiyalar tamamlanıb?
         completed_sessions = []
         if current_hour >= 8:
             completed_sessions.append("Asia")
         if current_hour >= 16:
             completed_sessions.append("London")
-        if current_hour >= 24 or current_hour < 16:
+        if current_hour < 16:
             completed_sessions.append("NY")
 
-        # Heç biri tamamlanmayıbsa (0-8 arası) - Asia hələ davam edir
         if not completed_sessions:
-            completed_sessions = []  # Boş qaytar
+            return []
 
         interval_seconds = {
             "1": 60, "3": 180, "5": 300, "15": 900, "30": 1800,
             "60": 3600, "120": 7200, "240": 14400, "D": 86400, "W": 604800
         }
         secs = interval_seconds.get(interval, 3600)
-        bars_per_day = int(86400 / secs) if secs > 0 else 24
-        start_idx = max(0, len(df) - lookback_days * bars_per_day)
-
-        # Son 5 gün ərzində tamamlanmış sessiyaların high/low-ları
-        sessions = {
-            "Asia": {"high": -np.inf, "low": np.inf, "high_idx": -1, "low_idx": -1},
-            "London": {"high": -np.inf, "low": np.inf, "high_idx": -1, "low_idx": -1},
-            "NY": {"high": -np.inf, "low": np.inf, "high_idx": -1, "low_idx": -1}
-        }
-
-        for idx, row in df.iloc[start_idx:].iterrows():
-            ts = datetime.fromtimestamp(row["timestamp"] / 1000, tz=timezone.utc)
-            hour = ts.hour
-            if 0 <= hour < 8:
-                sess = "Asia"
-            elif 8 <= hour < 16:
-                sess = "London"
-            else:
-                sess = "NY"
-            high = float(row["high"])
-            low = float(row["low"])
-            if high > sessions[sess]["high"]:
-                sessions[sess]["high"] = high
-                sessions[sess]["high_idx"] = idx
-            if low < sessions[sess]["low"]:
-                sessions[sess]["low"] = low
-                sessions[sess]["low_idx"] = idx
 
         result = []
         for sess in completed_sessions:
-            data = sessions.get(sess, {})
-            if data.get("high") != -np.inf:
-                result.append({"level": data["high"], "type": f"{sess}_high", "idx": data["high_idx"]})
-            if data.get("low") != np.inf:
-                result.append({"level": data["low"], "type": f"{sess}_low", "idx": data["low_idx"]})
+            if sess == "Asia":
+                start_hour, end_hour = 0, 8
+            elif sess == "London":
+                start_hour, end_hour = 8, 16
+            elif sess == "NY":
+                start_hour, end_hour = 16, 24
+
+            if sess == "NY":
+                day = now - timedelta(days=1)
+            else:
+                day = now
+
+            start_dt = datetime(day.year, day.month, day.day, start_hour, 0, 0, tzinfo=timezone.utc)
+            end_dt = datetime(day.year, day.month, day.day, end_hour, 0, 0, tzinfo=timezone.utc)
+            start_ms = start_dt.timestamp() * 1000
+            end_ms = end_dt.timestamp() * 1000
+
+            mask = (df["timestamp"] >= start_ms) & (df["timestamp"] < end_ms)
+            segment = df.loc[mask]
+
+            if not segment.empty:
+                high = float(segment["high"].max())
+                low = float(segment["low"].min())
+                last_idx = segment.index[-1]
+                result.append({"level": high, "type": f"{sess}_high", "idx": int(last_idx)})
+                result.append({"level": low, "type": f"{sess}_low", "idx": int(last_idx)})
+
         return result
 
     @staticmethod
@@ -580,7 +628,8 @@ class SMCAnalyzer:
         tr2 = (df["high"] - prev_close).abs()
         tr3 = (df["low"] - prev_close).abs()
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        return tr.rolling(period, min_periods=1).mean()
+        atr = tr.ewm(alpha=1/period, adjust=False).mean()
+        return atr
 
     @staticmethod
     def compute_volume_ratio(df: pd.DataFrame, period: int = 20) -> pd.Series:
@@ -676,54 +725,62 @@ class SMCAnalyzer:
     def find_order_block(self, df: pd.DataFrame, direction: str, break_idx: int, lookback: int = 30) -> Optional[Dict]:
         return self.helpers.detect_latest_ob(df, direction, break_idx, lookback)
 
-    # 🔥 YENİ: Bütün liquidity-lər içindən ilk untouched target seçimi
-    def find_untouched_liquidity(self, direction: str, entry: float, df: pd.DataFrame, swing_highs: List, swing_lows: List, session_levels_with_time: List[Dict]) -> Optional[float]:
+    def find_untouched_liquidity(self, direction: str, entry: float, df: pd.DataFrame, swing_highs: List, swing_lows: List, session_levels_with_time: List[Dict]) -> Optional[Dict]:
         try:
             candidates = []
 
-            # Swing high/lows
             if direction == "bullish":
                 for idx, level in swing_highs:
                     if level > entry:
                         if not self.helpers.is_level_touched(df, level, idx, "bullish"):
-                            candidates.append(("swing", level, idx))
+                            candidates.append({"level": level, "idx": idx, "type": "swing_high"})
             else:
                 for idx, level in swing_lows:
                     if level < entry:
                         if not self.helpers.is_level_touched(df, level, idx, "bearish"):
-                            candidates.append(("swing", level, idx))
+                            candidates.append({"level": level, "idx": idx, "type": "swing_low"})
 
-            # Session levels
             for lvl_data in session_levels_with_time:
                 level = lvl_data["level"]
                 if direction == "bullish" and level > entry:
                     if not self.helpers.is_level_touched(df, level, lvl_data["idx"], "bullish"):
-                        candidates.append(("session", level, lvl_data["idx"]))
+                        candidates.append({"level": level, "idx": lvl_data["idx"], "type": lvl_data["type"]})
                 elif direction == "bearish" and level < entry:
                     if not self.helpers.is_level_touched(df, level, lvl_data["idx"], "bearish"):
-                        candidates.append(("session", level, lvl_data["idx"]))
+                        candidates.append({"level": level, "idx": lvl_data["idx"], "type": lvl_data["type"]})
 
             if not candidates:
                 return None
 
-            # Qiymətə ən yaxın seç
-            candidates.sort(key=lambda x: abs(x[1] - entry))
-            return candidates[0][1]
+            dedup_candidates = []
+            for c in candidates:
+                is_dup = False
+                for existing in dedup_candidates:
+                    if abs(existing["level"] - c["level"]) / max(existing["level"], 1e-9) < 0.001:
+                        if c["idx"] < existing["idx"]:
+                            existing.update(c)
+                        is_dup = True
+                        break
+                if not is_dup:
+                    dedup_candidates.append(c)
+
+            dedup_candidates.sort(key=lambda x: abs(x["level"] - entry))
+            return dedup_candidates[0]
 
         except Exception as e:
             logger.warning(f"Untouched liquidity search error: {e}")
             return None
 # ============================================================================
-# SMC ANALİZER (HİSSƏ 2)
+# SMC ANALİZER (HİSSƏ 2 - Qalan metodlar)
 # ============================================================================
 
-    def check_ote(self, df: pd.DataFrame, direction: str, break_idx: int, current_price: float, swing_highs: List, swing_lows: List) -> Tuple[bool, Optional[Tuple[float, float]]]:
+    def check_ote(self, df: pd.DataFrame, direction: str, break_idx: int, price: float, swing_highs: List, swing_lows: List) -> Tuple[bool, Optional[Tuple[float, float]]]:
         try:
             ote = self.helpers.calculate_ote_structural(df, direction, break_idx, swing_highs, swing_lows)
             if not ote:
                 return False, None
             low, high = ote
-            return low <= current_price <= high, ote
+            return low <= price <= high, ote
         except Exception:
             return False, None
 
@@ -775,10 +832,8 @@ class SMCAnalyzer:
         except Exception:
             return False
 
-    def get_poi_status(self, price: float, ob: Optional[Dict], fvg: Optional[Dict]) -> Tuple[bool, bool, bool]:
-        in_ob = self.price_in_zone(price, ob)
-        in_fvg = self.price_in_zone(price, fvg)
-        return in_ob or in_fvg, in_ob, in_fvg
+    def get_poi_status(self, price: float, poi_zone: Optional[Dict]) -> bool:
+        return self.price_in_zone(price, poi_zone)
 
     def get_daily_trend_bias(self, symbol: str) -> Optional[str]:
         try:
@@ -856,109 +911,132 @@ class SMCAnalyzer:
             logger.warning(f"Fundamental data error {symbol}: {e}")
         return data
 
-    def check_15m_confirmation(self, symbol: str, direction: str, poi_zone: Optional[Dict]) -> Tuple[bool, Dict]:
+    def check_15m_confirmation(self, symbol: str, direction: str, ob: Optional[Dict], fvg: Optional[Dict]) -> Tuple[bool, Dict, Optional[Dict], Optional[float], Optional[int]]:
         try:
             df = self.client.fetch_klines(symbol, "15", self.config.entry_klines_limit)
             if df is None or len(df) < 50:
-                return False, {"reason": "15M data yoxdur"}
+                return False, {"reason": "15M data yoxdur"}, None, None, None
 
             sh, sl = self.find_swing_points(df, self.config.swing_lookback)
             events = self.compute_structure_events(df, sh, sl)
             if not events:
-                return False, {"reason": "15M structure yoxdur"}
+                return False, {"reason": "15M structure yoxdur"}, None, None, None
 
             last = events[-1]
             break_idx = last["index"]
             age = len(df) - 1 - break_idx
+            if age > self.config.max_event_age_bars:
+                return False, {"reason": f"15M BOS köhnədir (age={age})"}, None, None, None
+
             atr = self.compute_atr(df, self.config.atr_period)
             vol_series = self.compute_volume_ratio(df, self.config.volume_period)
             _, disp_ratio = self.detect_displacement(df, break_idx, atr)
-            vol_ratio = float(vol_series.iloc[-1]) if not pd.isna(vol_series.iloc[-1]) else 0.0
+            vol_ratio = float(vol_series.iloc[break_idx]) if not pd.isna(vol_series.iloc[break_idx]) else 0.0
 
-            confirmed = (last["bias"] == direction and age <= 12 and disp_ratio >= 0.5 and vol_ratio >= 0.7)
-            poi_retest = False
+            if not (last["bias"] == direction and disp_ratio >= 0.5 and vol_ratio >= 0.7):
+                return False, {"event": last["kind"], "age": age, "displacement": disp_ratio, "volume_ratio": vol_ratio}, None, None, None
 
-            if confirmed and poi_zone:
+            candidates = []
+            if ob is not None:
+                candidates.append(("OB", ob))
+            if fvg is not None:
+                candidates.append(("FVG", fvg))
+
+            if not candidates:
+                return False, {"reason": "POI namizədi yoxdur"}, None, None, None
+
+            post_bos = df.iloc[break_idx + 1:break_idx + 14]
+            if len(post_bos) < 1:
+                return False, {"reason": "Retest üçün şam yoxdur"}, None, None, None
+
+            selected_poi = None
+            selected_type = None
+            trigger_price = None
+            trigger_timestamp = None
+            trigger_found = False
+            retest_found = False
+
+            for poi_type, poi_zone in candidates:
                 poi_low = poi_zone["low"]
                 poi_high = poi_zone["high"]
                 poi_mid = (poi_low + poi_high) / 2
 
-                post_bos = df.iloc[break_idx + 1:break_idx + 13]
-                if len(post_bos) < 3:
-                    confirmed = False
-                else:
-                    retest_found = False
-                    trigger_found = False
+                for _, row in post_bos.iterrows():
+                    candle_low = float(row["low"])
+                    candle_high = float(row["high"])
+                    candle_close = float(row["close"])
+                    candle_open = float(row["open"])
+                    body = abs(candle_close - candle_open)
 
-                    for _, row in post_bos.iterrows():
-                        candle_low = float(row["low"])
-                        candle_high = float(row["high"])
-                        candle_close = float(row["close"])
-                        candle_open = float(row["open"])
-                        body = abs(candle_close - candle_open)
+                    if candle_low <= poi_high and candle_high >= poi_low:
+                        retest_found = True
+                        if direction == "bullish":
+                            wick_bottom = min(candle_open, candle_close) - candle_low
+                            if body > 0 and wick_bottom >= body * 0.5 and candle_close > poi_mid and candle_close > candle_open:
+                                trigger_found = True
+                        else:
+                            wick_top = candle_high - max(candle_open, candle_close)
+                            if body > 0 and wick_top >= body * 0.5 and candle_close < poi_mid and candle_close < candle_open:
+                                trigger_found = True
+                        if trigger_found:
+                            selected_poi = poi_zone
+                            selected_type = poi_type
+                            trigger_price = candle_close
+                            trigger_timestamp = int(row["timestamp"])
+                            if row.name != post_bos.index[-1]:
+                                trigger_found = False
+                            break
+                if trigger_found:
+                    break
 
-                        if candle_low <= poi_high and candle_high >= poi_low:
-                            retest_found = True
-                            poi_retest = True
-                            if direction == "bullish":
-                                wick_bottom = min(candle_open, candle_close) - candle_low
-                                if wick_bottom >= body * 0.5 and candle_close > poi_mid and candle_close > candle_open:
-                                    trigger_found = True
-                            else:
-                                wick_top = candle_high - max(candle_open, candle_close)
-                                if wick_top >= body * 0.5 and candle_close < poi_mid and candle_close < candle_open:
-                                    trigger_found = True
-                            if trigger_found:
-                                break
+            if not retest_found:
+                return False, {"reason": "POI retest yoxdur"}, None, None, None
+            if not trigger_found:
+                return False, {"reason": "Wick rejection yoxdur və ya trigger köhnədir"}, None, None, None
 
-                    if not retest_found:
-                        confirmed = False
-                    if retest_found and not trigger_found:
-                        confirmed = False
-
-            return confirmed, {
+            confirmed = True
+            info = {
                 "event": last["kind"],
                 "direction_ok": last["bias"] == direction,
                 "age": age,
-                "fresh": age <= 12,
+                "fresh": True,
                 "displacement": round(disp_ratio, 2),
                 "volume_ratio": round(vol_ratio, 2),
                 "trigger": confirmed,
-                "poi_retest": poi_retest
+                "poi_retest": retest_found,
+                "poi_type": selected_type,
+                "trigger_timestamp": trigger_timestamp
             }
+            return confirmed, info, selected_poi, trigger_price, trigger_timestamp
+
         except Exception as e:
             logger.warning(f"15M confirmation error {symbol}: {e}")
-        return False, {"reason": "Exception"}
+        return False, {"reason": "Exception"}, None, None, None
 
-    def calculate_trade_levels(self, direction: str, df: pd.DataFrame, entry: float, ob: Optional[Dict], liquidity_target: Optional[float], atr_value: float, session_targets_with_time: List[Dict], sh: List, sl: List) -> Optional[Dict]:
-        """
-        🔥 YENİ: liquidity_target artıq untouched funksiyasından gəlir
-        """
+    def calculate_trade_levels(self, direction: str, df: pd.DataFrame, entry: float, poi_zone: Optional[Dict], liquidity_target: Optional[Dict], atr_value: float) -> Optional[Dict]:
         try:
-            if ob is None or liquidity_target is None:
+            if poi_zone is None or liquidity_target is None:
+                return None
+
+            target_level = float(liquidity_target["level"])
+            target_idx = int(liquidity_target["idx"])
+
+            if self.helpers.is_level_touched(df, target_level, target_idx, direction):
+                logger.info(f"Target {target_level} artıq toxunulub, keçmir")
                 return None
 
             if direction == "bullish":
-                if sl and sl[-1][1] < entry:
-                    sl_price = sl[-1][1] * 0.999
-                else:
-                    sl_price = ob["low"] - atr_value * 0.5
-
-                rr_target = (liquidity_target - entry) / (entry - sl_price) if (entry - sl_price) > 0 else 0
+                sl_price = poi_zone["low"] - atr_value * 0.5
+                rr_target = (target_level - entry) / (entry - sl_price) if (entry - sl_price) > 0 else 0
                 if rr_target >= self.config.min_rr_ratio:
-                    tp = liquidity_target
+                    tp = target_level
                 else:
                     return None
-
             else:
-                if sh and sh[-1][1] > entry:
-                    sl_price = sh[-1][1] * 1.001
-                else:
-                    sl_price = ob["high"] + atr_value * 0.5
-
-                rr_target = (entry - liquidity_target) / (sl_price - entry) if (sl_price - entry) > 0 else 0
+                sl_price = poi_zone["high"] + atr_value * 0.5
+                rr_target = (entry - target_level) / (sl_price - entry) if (sl_price - entry) > 0 else 0
                 if rr_target >= self.config.min_rr_ratio:
-                    tp = liquidity_target
+                    tp = target_level
                 else:
                     return None
 
@@ -967,50 +1045,61 @@ class SMCAnalyzer:
             if direction == "bearish" and (sl_price <= entry or tp >= entry):
                 return None
 
-            commission = self.config.commission_percent / 100
             slippage = self.config.slippage_percent / 100
+            commission = self.config.commission_percent / 100
 
             if direction == "bullish":
-                entry_adj = entry * (1 + commission + slippage)
-                sl_adj = sl_price * (1 - commission)
-                tp_adj = tp * (1 - commission - slippage)
+                entry_adj = entry * (1 + slippage + commission)
+                sl_adj = sl_price * (1 - slippage - commission)
+                tp_adj = tp * (1 - slippage - commission)
             else:
-                entry_adj = entry * (1 - commission - slippage)
-                sl_adj = sl_price * (1 + commission)
-                tp_adj = tp * (1 + commission + slippage)
+                entry_adj = entry * (1 - slippage - commission)
+                sl_adj = sl_price * (1 + slippage + commission)
+                tp_adj = tp * (1 + slippage + commission)
 
             risk = abs(entry_adj - sl_adj)
             reward = abs(tp_adj - entry_adj)
             if risk <= 0:
                 return None
-            return {"entry": entry, "entry_adjusted": entry_adj, "sl": sl_price, "sl_adjusted": sl_adj, "tp": tp, "tp_adjusted": tp_adj, "risk": risk, "reward": reward, "rr_ratio": reward / risk}
+
+            return {
+                "entry": entry,
+                "sl": sl_price,
+                "tp": tp,
+                "entry_adjusted": entry_adj,
+                "sl_adjusted": sl_adj,
+                "tp_adjusted": tp_adj,
+                "risk": risk,
+                "reward": reward,
+                "rr_ratio": reward / risk
+            }
         except Exception as e:
             logger.warning(f"Trade levels error: {e}")
         return None
-# ============================================================================
-# SMC ANALİZER (HİSSƏ 3 - QALAN METODLAR)
-# ============================================================================
 
-    def calculate_position_size(self, entry: float, sl: float, direction: str) -> Dict:
+    def calculate_position_size(self, entry_adjusted: float, sl_adjusted: float, direction: str) -> Dict:
         try:
             risk_amount = self.config.account_balance * self.config.risk_percent / 100
-            stop_distance = abs(entry - sl)
+            stop_distance = abs(entry_adjusted - sl_adjusted)
             if stop_distance <= 0:
-                return {"risk_amount": risk_amount, "position_size": 0, "notional_value": 0, "margin_required": 0, "liquidation_price": 0}
+                return {"risk_amount": risk_amount, "position_size": 0, "notional_value": 0, "margin_required": 0, "liquidation_price": 0, "risk_actual": 0}
             pos_size = risk_amount / stop_distance
-            notional = pos_size * entry
+            notional = pos_size * entry_adjusted
             margin_required = notional / self.config.leverage if self.config.leverage > 0 else notional
+            actual_risk = risk_amount
             if margin_required > self.config.account_balance:
                 max_notional = self.config.account_balance * self.config.leverage
-                pos_size = max_notional / entry
+                pos_size = max_notional / entry_adjusted
                 margin_required = max_notional / self.config.leverage
                 notional = max_notional
+                actual_risk = pos_size * stop_distance
             if direction == "bullish":
-                liq_price = entry - (entry / self.config.leverage)
+                liq_price = entry_adjusted - (entry_adjusted / self.config.leverage)
             else:
-                liq_price = entry + (entry / self.config.leverage)
+                liq_price = entry_adjusted + (entry_adjusted / self.config.leverage)
             return {
                 "risk_amount": risk_amount,
+                "risk_actual": actual_risk,
                 "position_size": pos_size,
                 "notional_value": notional,
                 "margin_required": margin_required,
@@ -1018,7 +1107,10 @@ class SMCAnalyzer:
             }
         except Exception as e:
             logger.warning(f"Position size error: {e}")
-        return {"risk_amount": 0, "position_size": 0, "notional_value": 0, "margin_required": 0, "liquidation_price": 0}
+        return {"risk_amount": 0, "risk_actual": 0, "position_size": 0, "notional_value": 0, "margin_required": 0, "liquidation_price": 0}
+# ============================================================================
+# SMC ANALİZER (HİSSƏ 3 - analyze_1h_smc, analyze_smc_pro)
+# ============================================================================
 
     def analyze_1h_smc(self, symbol: str) -> Tuple[Optional[Dict], Optional[str]]:
         try:
@@ -1033,7 +1125,7 @@ class SMCAnalyzer:
                 return None, "BOS/CHoCH yoxdur"
             last = events[-1]
             break_idx = last["index"]
-            if len(df) - 1 - break_idx > self.config.max_event_age_bars:
+            if len(df) - 1 - break_idx > 20:
                 return None, "Structure event köhnədir"
             atr = self.compute_atr(df, self.config.atr_period)
             vol_series = self.compute_volume_ratio(df, self.config.volume_period)
@@ -1045,22 +1137,10 @@ class SMCAnalyzer:
             current_price = self.client.fetch_current_price(symbol)
             if current_price is None:
                 current_price = float(df["close"].iloc[-1])
-            poi_ok, in_ob, in_fvg = self.get_poi_status(current_price, ob, fvg)
 
-            # Session target-lar (yalnız tamamlanmış)
             session_targets_with_time = self.get_session_liquidity_targets_with_time(df, interval="60")
             session_targets = [l["level"] for l in session_targets_with_time]
 
-            # 🔥 YENİ: untouched liquidity seçimi
-            target = self.find_untouched_liquidity(
-                last["bias"], current_price, df, sh, sl, session_targets_with_time
-            )
-
-            ote_ok, ote_zone = self.check_ote(df, last["bias"], break_idx, current_price, sh, sl)
-            cvd_ok = self.check_cvd_trend(df, last["bias"])
-            poi_zone = ob if ob else fvg
-            now_ms = int(time.time() * 1000)
-            last_1m_ts = (now_ms // 60000) * 60000 - 60000
             return {
                 "df": df,
                 "direction": last["bias"],
@@ -1075,19 +1155,19 @@ class SMCAnalyzer:
                 "fvg": fvg,
                 "ob": ob,
                 "current_price": current_price,
-                "poi_ok": poi_ok,
-                "in_ob": in_ob,
-                "in_fvg": in_fvg,
-                "target": target,
-                "ote_ok": ote_ok,
-                "ote_zone": ote_zone,
-                "cvd_ok": cvd_ok,
+                "poi_ok": False,
+                "in_ob": bool(ob and self.price_in_zone(current_price, ob)),
+                "in_fvg": bool(fvg and self.price_in_zone(current_price, fvg)),
+                "target": None,
+                "ote_ok": False,
+                "ote_zone": None,
+                "cvd_ok": self.check_cvd_trend(df, last["bias"]),
                 "session_targets": session_targets,
                 "session_targets_with_time": session_targets_with_time,
                 "swing_highs": sh,
                 "swing_lows": sl,
-                "poi_zone": poi_zone,
-                "last_1m_ts": last_1m_ts
+                "poi_zone": None,
+                "last_1m_ts": int((time.time() * 1000) // 60000) * 60000 - 60000
             }, None
         except Exception as e:
             error_msg = str(e)
@@ -1101,6 +1181,10 @@ class SMCAnalyzer:
         fund_data = {}
 
         try:
+            instrument_info = self.client.fetch_instruments_info(symbol)
+            if instrument_info is None or instrument_info.get("status") != "Trading":
+                return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0, "reason": "Instrument Trading deyil"}
+
             daily = self.get_daily_trend_bias(symbol)
             daily_ok = daily in ("bullish", "bearish")
             conditions["Daily trend"] = daily_ok
@@ -1123,23 +1207,34 @@ class SMCAnalyzer:
             if self.config.require_triple_alignment and not triple_ok:
                 return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0, "reason": "Triple alignment yoxdur"}
 
-            entry_conf, entry_data = self.check_15m_confirmation(symbol, direction, smc.get("poi_zone"))
-            conditions["15M confirmation"] = entry_conf
-            if self.config.require_15m_confirmation and not entry_conf:
+            entry_conf, entry_data, selected_poi, trigger_price, trigger_timestamp = self.check_15m_confirmation(symbol, direction, smc["ob"], smc["fvg"])
+            if not entry_conf:
                 return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0, "reason": "15M confirmation yoxdur"}
+            if selected_poi is None or trigger_price is None:
+                return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0, "reason": "POI seçilmədi"}
 
-            target = smc["target"]
+            smc["poi_zone"] = selected_poi
+            smc["poi_ok"] = True
+            smc["poi_type"] = entry_data.get("poi_type", "Unknown")
+            entry = trigger_price
+
+            smc["ote_ok"], smc["ote_zone"] = self.check_ote(
+                smc["df"], direction, smc["break_idx"], entry,
+                smc["swing_highs"], smc["swing_lows"]
+            )
+
+            target = self.find_untouched_liquidity(
+                direction, entry, smc["df"], smc["swing_highs"], smc["swing_lows"], smc["session_targets_with_time"]
+            )
             if target is None:
                 return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0, "reason": "Liquidity target yoxdur"}
 
-            entry = smc["current_price"]
             levels = self.calculate_trade_levels(
-                direction, smc["df"], entry, smc["ob"], target,
-                smc["atr_value"], smc["session_targets_with_time"],
-                smc["swing_highs"], smc["swing_lows"]
+                direction, smc["df"], entry, smc["poi_zone"], target,
+                smc["atr_value"]
             )
             if levels is None:
-                return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0, "reason": "Liquidity target RR keçmədi"}
+                return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0, "reason": "Liquidity target RR keçmədi və ya toxunuldu"}
 
             rr = levels["rr_ratio"]
             rr_ok = rr >= self.config.min_rr_ratio
@@ -1149,8 +1244,19 @@ class SMCAnalyzer:
 
             fund_data = self.fundamental_data(symbol)
 
-            # 🔥 YENİ SCORE: 100-lük, entry_conf çıxarıldı
-            # OB(11) + Sweep(10) + FVG(7) + POI(8) + Disp(8) + Vol(6) + OTE(10) + CVD(7) + BTC(8) + Sess(6) + FG(5) + Funding(5) + OI(3) + Event(6) = 100
+            active_signals = PerformanceTracker.load_active()
+            active_count = len([s for s in active_signals if s.get("status") == "active"])
+            if active_count >= self.config.max_active_signals:
+                return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0, "reason": "Maksimum aktiv siqnal limiti"}
+
+            daily_count = PerformanceTracker.get_daily_signal_count()
+            if daily_count >= self.config.max_daily_signals:
+                return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0, "reason": "Günlük siqnal limiti"}
+
+            same_direction_count = sum(1 for s in active_signals if s.get("direction") == direction and s.get("status") == "active")
+            if same_direction_count >= self.config.max_correlation_signals:
+                return {"symbol": symbol, "passed": False, "conditions": conditions, "score": 0, "reason": "Korrelyasiya limiti"}
+
             if self.config.use_unmitigated_ob_scoring:
                 ob = smc["ob"]
                 scores["unmitigated_ob"] = 11 if (ob is not None and not ob["mitigated"]) else 0
@@ -1171,9 +1277,8 @@ class SMCAnalyzer:
                     conditions["FVG"] = False
 
             if self.config.use_poi_scoring:
-                poi_ok = smc["poi_ok"]
-                scores["poi"] = 8 if poi_ok else 0
-                conditions["POI"] = poi_ok
+                scores["poi"] = 8 if smc["poi_ok"] else 0
+                conditions["POI"] = smc["poi_ok"]
 
             if self.config.use_displacement_scoring:
                 disp_ratio = smc["displacement_ratio"]
@@ -1200,9 +1305,8 @@ class SMCAnalyzer:
                 conditions["Volume"] = vol_ratio
 
             if self.config.use_ote_scoring:
-                ote_ok = smc["ote_ok"]
-                scores["ote"] = 10 if ote_ok else 0
-                conditions["OTE"] = ote_ok
+                scores["ote"] = 10 if smc["ote_ok"] else 0
+                conditions["OTE"] = smc["ote_ok"]
 
             if self.config.use_cvd_scoring:
                 cvd_ok = smc["cvd_ok"] if smc["cvd_ok"] is not None else False
@@ -1257,9 +1361,7 @@ class SMCAnalyzer:
             event_kind = smc["event_kind"]
             scores["event"] = 6 if event_kind == "CHoCH" else 4
 
-            max_possible = 100  # Sabit
-            raw_score = sum(scores.values())
-            total_score = raw_score
+            total_score = sum(scores.values())
             score_ok = total_score >= self.config.min_signal_score
             conditions["Total Score"] = round(total_score, 1)
             conditions["Min score threshold"] = score_ok
@@ -1273,10 +1375,10 @@ class SMCAnalyzer:
 
             poi_zone = smc.get("poi_zone")
             if poi_zone:
-                poi_price = int(poi_zone.get("mid", smc["current_price"]) * 1000)
+                poi_price = int(poi_zone.get("mid", entry) * 1000)
             else:
-                poi_price = int(smc["current_price"] * 1000)
-            signal_id = generate_signal_id(symbol, direction, smc["event_time"], poi_price)
+                poi_price = int(entry * 1000)
+            signal_id = f"{symbol}_{direction}_{trigger_timestamp}_{smc.get('poi_type','Unknown')}_{poi_price}"
 
             return {
                 "symbol": symbol,
@@ -1299,12 +1401,14 @@ class SMCAnalyzer:
                 "h4_bias": h4,
                 "session": session_name,
                 "risk_amount": round(pos["risk_amount"], 2),
+                "risk_actual": round(pos.get("risk_actual", 0), 2),
                 "position_size": round(pos["position_size"], 6),
                 "notional_value": round(pos["notional_value"], 2),
                 "margin_required": round(pos["margin_required"], 2),
                 "liquidation_price": round(pos.get("liquidation_price", 0), 8),
                 "sweep": smc["sweep"],
                 "poi_ok": smc["poi_ok"],
+                "poi_type": smc.get("poi_type", "Unknown"),
                 "fvg_ok": smc["fvg"] is not None and not smc["fvg"].get("mitigated", False),
                 "fvg_type": "latest" if smc["fvg"] else None,
                 "ote_ok": smc["ote_ok"],
@@ -1314,20 +1418,14 @@ class SMCAnalyzer:
                 "entry_confirmation": entry_data,
                 "fundamental": fund_data,
                 "signal_id": signal_id,
-                "last_1m_ts": smc["last_1m_ts"]
+                "last_1m_ts": smc["last_1m_ts"],
+                "instrument_info": instrument_info
             }
         except Exception as e:
             logger.error(f"analyze_smc_pro error {symbol}: {e}")
             return {"symbol": symbol, "passed": False, "error": str(e), "conditions": conditions, "score": 0, "reason": f"Exception: {e}"}
-
 # ============================================================================
-# YARDIMÇI FUNKSİYALAR
-# ============================================================================
-
-def generate_signal_id(symbol: str, direction: str, event_time: int, poi_price: int) -> str:
-    return f"{symbol}_{direction}_{event_time}_{poi_price}"
-# ============================================================================
-# PERFORMANCE TRACKER
+# PERFORMANCE TRACKER (1/2)
 # ============================================================================
 
 class PerformanceTracker:
@@ -1361,6 +1459,11 @@ class PerformanceTracker:
             return []
 
     @classmethod
+    def load_active(cls) -> List[Dict]:
+        with cls._file_lock:
+            return cls._load_active()
+
+    @classmethod
     def _load_history(cls) -> List[Dict]:
         try:
             with open(cls.HISTORY_FILE, "r") as f:
@@ -1369,17 +1472,60 @@ class PerformanceTracker:
             return []
 
     @classmethod
-    def save_signal(cls, signal: Dict) -> bool:
+    def get_daily_signal_count(cls) -> int:
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        try:
+            with cls._file_lock:
+                history = cls._load_history()
+                count = 0
+                for sig in history:
+                    if sig.get("entry_time", "").startswith(today_str):
+                        count += 1
+                active = cls._load_active()
+                for sig in active:
+                    if sig.get("entry_time", "").startswith(today_str):
+                        count += 1
+                return count
+        except Exception as e:
+            logger.warning(f"Daily count error: {e}")
+        return 0
+
+    @classmethod
+    def save_signal(cls, signal: Dict, config: Config) -> bool:
         with cls._file_lock:
             try:
                 active = cls._load_active()
+                active_count = len([s for s in active if s.get("status") == "active"])
+                if active_count >= config.max_active_signals:
+                    logger.info(f"Save signal rejected: max active signals ({active_count}/{config.max_active_signals})")
+                    return False
+
+                today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                history = cls._load_history()
+                daily_count = 0
+                for sig in history:
+                    if sig.get("entry_time", "").startswith(today_str):
+                        daily_count += 1
+                for sig in active:
+                    if sig.get("entry_time", "").startswith(today_str):
+                        daily_count += 1
+                if daily_count >= config.max_daily_signals:
+                    logger.info(f"Save signal rejected: max daily signals ({daily_count}/{config.max_daily_signals})")
+                    return False
+
+                direction = signal.get("direction")
+                same_dir_active = sum(1 for s in active if s.get("direction") == direction and s.get("status") == "active")
+                if same_dir_active >= config.max_correlation_signals:
+                    logger.info(f"Save signal rejected: correlation limit ({same_dir_active}/{config.max_correlation_signals})")
+                    return False
+
                 for sig in active:
                     if sig["signal_id"] == signal["signal_id"]:
                         return False
-                history = cls._load_history()
                 for sig in history:
                     if sig["signal_id"] == signal["signal_id"]:
                         return False
+
                 active.append({
                     "signal_id": signal["signal_id"],
                     "symbol": signal["symbol"],
@@ -1395,13 +1541,23 @@ class PerformanceTracker:
                     "notional_value": signal.get("notional_value", 0),
                     "margin_required": signal.get("margin_required", 0),
                     "notified": False,
-                    "last_1m_ts": signal.get("last_1m_ts", int(time.time() * 1000) - 60000)
+                    "last_1m_ts": signal.get("last_1m_ts", int(time.time() * 1000) - 60000),
+                    "poi_type": signal.get("poi_type", "Unknown"),
+                    "risk_actual": signal.get("risk_actual", 0),
+                    "planned_rr": signal.get("rr_ratio", 0),
+                    "entry_adjusted": signal.get("entry_adj", signal.get("entry", 0)),
+                    "sl_adjusted": signal.get("sl_adj", signal.get("sl", 0)),
+                    "tp_adjusted": signal.get("tp_adj", signal.get("tp", 0)),
+                    "score": signal.get("score", 0)
                 })
                 cls._atomic_write(cls.ACTIVE_SIGNALS_FILE, active)
                 return True
             except Exception as e:
                 logger.warning(f"Could not save active signal: {e}")
                 return False
+# ============================================================================
+# PERFORMANCE TRACKER (2/2)
+# ============================================================================
 
     @classmethod
     def update_signal(cls, signal_id: str, result: str, exit_price: float, exit_time: str, config: Config) -> None:
@@ -1416,7 +1572,7 @@ class PerformanceTracker:
                         sig["exit_price"] = exit_price
                         sig["exit_time"] = exit_time
 
-                        entry = sig["entry"]
+                        entry = sig.get("entry_adjusted", 0)
                         size = sig.get("position_size", 0)
                         lev = sig.get("leverage", 1)
                         taker_fee = config.commission_percent / 100
@@ -1427,22 +1583,23 @@ class PerformanceTracker:
                             sig["pnl_percent"] = 0
                         else:
                             if sig["direction"] == "bullish":
-                                fill_entry = entry * (1 + slippage)
-                                fill_exit = exit_price * (1 - slippage)
-                                raw_pnl = (fill_exit - fill_entry) * size
-                                fee = (fill_entry * size * taker_fee) + (fill_exit * size * taker_fee)
-                                pnl_usd = raw_pnl - fee
-                                pnl_pct = (pnl_usd / (fill_entry * size / lev)) * 100 if entry > 0 else 0
+                                fill_exit = exit_price * (1 - slippage - taker_fee)
+                                raw_pnl = (fill_exit - entry) * size
+                                pnl_usd = raw_pnl
+                                pnl_pct = (pnl_usd / (entry * size / lev)) * 100 if entry > 0 else 0
                             else:
-                                fill_entry = entry * (1 - slippage)
-                                fill_exit = exit_price * (1 + slippage)
-                                raw_pnl = (fill_entry - fill_exit) * size
-                                fee = (fill_entry * size * taker_fee) + (fill_exit * size * taker_fee)
-                                pnl_usd = raw_pnl - fee
-                                pnl_pct = (pnl_usd / (fill_entry * size / lev)) * 100 if entry > 0 else 0
+                                fill_exit = exit_price * (1 + slippage + taker_fee)
+                                raw_pnl = (entry - fill_exit) * size
+                                pnl_usd = raw_pnl
+                                pnl_pct = (pnl_usd / (entry * size / lev)) * 100 if entry > 0 else 0
 
                             sig["pnl_usd"] = round(pnl_usd, 2)
                             sig["pnl_percent"] = round(pnl_pct, 2)
+                            risk_actual = sig.get("risk_actual", 0)
+                            if risk_actual > 0:
+                                sig["realized_rr"] = round(pnl_usd / risk_actual, 2)
+                            else:
+                                sig["realized_rr"] = 0
 
                         history.append(sig)
                         break
@@ -1486,9 +1643,8 @@ class PerformanceTracker:
                     if ts <= sig.get("last_1m_ts", 0):
                         continue
 
-                    entry = sig.get("entry", 0)
-                    sl = sig.get("sl", 0)
                     tp = sig.get("tp", 0)
+                    sl = sig.get("sl", 0)
                     result = None
                     exit_price = None
 
@@ -1519,6 +1675,7 @@ class PerformanceTracker:
                         sig["exit_price"] = exit_price
                         sig["exit_time"] = now
 
+                        entry = sig.get("entry_adjusted", 0)
                         size = sig.get("position_size", 0)
                         lev = sig.get("leverage", 1)
                         taker_fee = config.commission_percent / 100
@@ -1529,22 +1686,23 @@ class PerformanceTracker:
                             sig["pnl_percent"] = 0
                         else:
                             if sig["direction"] == "bullish":
-                                fill_entry = entry * (1 + slippage)
-                                fill_exit = exit_price * (1 - slippage)
-                                raw_pnl = (fill_exit - fill_entry) * size
-                                fee = (fill_entry * size * taker_fee) + (fill_exit * size * taker_fee)
-                                pnl_usd = raw_pnl - fee
-                                pnl_pct = (pnl_usd / (fill_entry * size / lev)) * 100 if entry > 0 else 0
+                                fill_exit = exit_price * (1 - slippage - taker_fee)
+                                raw_pnl = (fill_exit - entry) * size
+                                pnl_usd = raw_pnl
+                                pnl_pct = (pnl_usd / (entry * size / lev)) * 100 if entry > 0 else 0
                             else:
-                                fill_entry = entry * (1 - slippage)
-                                fill_exit = exit_price * (1 + slippage)
-                                raw_pnl = (fill_entry - fill_exit) * size
-                                fee = (fill_entry * size * taker_fee) + (fill_exit * size * taker_fee)
-                                pnl_usd = raw_pnl - fee
-                                pnl_pct = (pnl_usd / (fill_entry * size / lev)) * 100 if entry > 0 else 0
+                                fill_exit = exit_price * (1 + slippage + taker_fee)
+                                raw_pnl = (entry - fill_exit) * size
+                                pnl_usd = raw_pnl
+                                pnl_pct = (pnl_usd / (entry * size / lev)) * 100 if entry > 0 else 0
 
                             sig["pnl_usd"] = round(pnl_usd, 2)
                             sig["pnl_percent"] = round(pnl_pct, 2)
+                            risk_actual = sig.get("risk_actual", 0)
+                            if risk_actual > 0:
+                                sig["realized_rr"] = round(pnl_usd / risk_actual, 2)
+                            else:
+                                sig["realized_rr"] = 0
 
                         history.append(sig)
                         updated = True
@@ -1566,11 +1724,64 @@ class PerformanceTracker:
             try:
                 history = cls._load_history()
                 if not history:
-                    return {"total": 0, "win_rate": 0, "avg_rr": 0, "sharpe": 0, "drawdown": 0, "active": 0, "total_pnl": 0}
+                    return {
+                        "total": 0, "win_rate": 0, "avg_rr": 0, "avg_planned_rr": 0,
+                        "sharpe": 0, "drawdown": 0, "active": 0, "total_pnl": 0,
+                        "profit_factor": 0, "expectancy": 0,
+                        "max_consecutive_losses": 0,
+                        "score_groups": {}, "direction_stats": {}
+                    }
 
                 total = len(history)
                 wins = sum(1 for d in history if d.get("result") == "WIN")
+                losses = total - wins
                 win_rate = (wins / total * 100) if total > 0 else 0
+
+                pnl_values = [d.get("pnl_usd", 0) for d in history]
+                gross_profit = sum(p for p in pnl_values if p > 0)
+                gross_loss = abs(sum(p for p in pnl_values if p < 0))
+                profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float('inf')
+                expectancy = sum(pnl_values) / total if total > 0 else 0
+
+                max_consecutive_losses = 0
+                current_streak = 0
+                for d in history:
+                    if d.get("result") == "LOSS":
+                        current_streak += 1
+                        max_consecutive_losses = max(max_consecutive_losses, current_streak)
+                    else:
+                        current_streak = 0
+
+                score_groups = {
+                    "70-80": {"total": 0, "wins": 0, "pnl": 0},
+                    "80-90": {"total": 0, "wins": 0, "pnl": 0},
+                    "90+": {"total": 0, "wins": 0, "pnl": 0}
+                }
+                for d in history:
+                    sc = d.get("score", 0)
+                    result = d.get("result")
+                    pnl = d.get("pnl_usd", 0)
+                    if 70 <= sc < 80:
+                        key = "70-80"
+                    elif 80 <= sc < 90:
+                        key = "80-90"
+                    elif sc >= 90:
+                        key = "90+"
+                    else:
+                        continue
+                    score_groups[key]["total"] += 1
+                    if result == "WIN":
+                        score_groups[key]["wins"] += 1
+                    score_groups[key]["pnl"] += pnl
+
+                direction_stats = {"LONG": {"total": 0, "wins": 0, "pnl": 0}, "SHORT": {"total": 0, "wins": 0, "pnl": 0}}
+                for d in history:
+                    direction = d.get("direction", "bullish")
+                    key = "LONG" if direction == "bullish" else "SHORT"
+                    direction_stats[key]["total"] += 1
+                    if d.get("result") == "WIN":
+                        direction_stats[key]["wins"] += 1
+                    direction_stats[key]["pnl"] += d.get("pnl_usd", 0)
 
                 returns = []
                 for d in history:
@@ -1605,22 +1816,30 @@ class PerformanceTracker:
                 except:
                     drawdown = 0
 
-                rr_list = [d.get("rr_ratio", 0) for d in history if d.get("rr_ratio", 0) > 0]
-                avg_rr = np.mean(rr_list) if rr_list else 0
-                total_pnl = sum(d.get("pnl_usd", 0) for d in history)
+                realized_rr_list = [d.get("realized_rr", 0) for d in history if d.get("realized_rr") is not None]
+                avg_realized_rr = np.mean(realized_rr_list) if realized_rr_list else 0
+                planned_rr_list = [d.get("planned_rr", 0) for d in history if d.get("planned_rr", 0) > 0]
+                avg_planned_rr = np.mean(planned_rr_list) if planned_rr_list else 0
+                total_pnl = sum(pnl_values)
 
                 return {
                     "total": total,
                     "win_rate": round(win_rate, 2),
-                    "avg_rr": round(avg_rr, 2),
+                    "avg_rr": round(avg_realized_rr, 2),
+                    "avg_planned_rr": round(avg_planned_rr, 2),
                     "sharpe": round(sharpe, 2),
                     "drawdown": drawdown,
                     "active": len([s for s in cls._load_active() if s.get("status") == "active"]),
-                    "total_pnl": round(total_pnl, 2)
+                    "total_pnl": round(total_pnl, 2),
+                    "profit_factor": round(profit_factor, 2) if profit_factor != float('inf') else "∞",
+                    "expectancy": round(expectancy, 2),
+                    "max_consecutive_losses": max_consecutive_losses,
+                    "score_groups": score_groups,
+                    "direction_stats": direction_stats
                 }
             except Exception as e:
                 logger.warning(f"Stats calculation error: {e}")
-                return {"total": 0, "win_rate": 0, "avg_rr": 0, "sharpe": 0, "drawdown": 0, "active": 0, "total_pnl": 0}
+                return {"total": 0, "win_rate": 0, "avg_rr": 0, "avg_planned_rr": 0, "sharpe": 0, "drawdown": 0, "active": 0, "total_pnl": 0, "profit_factor": 0, "expectancy": 0, "max_consecutive_losses": 0, "score_groups": {}, "direction_stats": {}}
 
     @classmethod
     def get_last_notified(cls, signal_id: str) -> float:
@@ -1654,7 +1873,6 @@ class PerformanceTracker:
     def set_pending_retry(cls, retry_dict: Dict[str, int]) -> None:
         with cls._file_lock:
             cls._atomic_write(cls.RETRY_FILE, retry_dict)
-
 # ============================================================================
 # SKANER + MONITOR LOOP
 # ============================================================================
@@ -1670,10 +1888,18 @@ class SignalScanner:
             tickers = self.client.fetch_tickers()
             if not tickers:
                 return self.config.fallback_coins
-            tickers.sort(key=lambda x: float(x.get("turnover24h", 0) or 0), reverse=True)
-            symbols = [r["symbol"] for r in tickers[:limit]]
+            active_symbols = []
+            for ticker in tickers:
+                symbol = ticker.get("symbol", "")
+                if not symbol:
+                    continue
+                info = self.client.fetch_instruments_info(symbol)
+                if info and info.get("status") == "Trading":
+                    active_symbols.append((symbol, float(ticker.get("turnover24h", 0) or 0)))
+            active_symbols.sort(key=lambda x: x[1], reverse=True)
+            symbols = [s for s, _ in active_symbols[:limit]]
             if symbols:
-                logger.info(f"{len(symbols)} likvid coin taranır")
+                logger.info(f"{len(symbols)} aktiv likvid coin taranır")
                 return symbols
             return self.config.fallback_coins
         except Exception as e:
@@ -1695,7 +1921,7 @@ class SignalScanner:
                 for future in concurrent.futures.as_completed(future_to_symbol):
                     symbol = future_to_symbol[future]
                     try:
-                        res = future.result(timeout=30)
+                        res = future.result()
                         results.append(res)
                     except Exception as e:
                         logger.error(f"{symbol} error: {e}")
@@ -1759,6 +1985,8 @@ class TelegramBot:
         trigger_text = "✅" if trigger else "❌"
         liq = res.get('liquidation_price', 0)
         fvg_info = "Latest" if res.get('fvg_ok') else "❌"
+        poi_type = res.get('poi_type', 'Unknown')
+        instrument_info = res.get('instrument_info', {})
         return f"""{title}
 
 {strength} | Score: `{res['score']}/100`
@@ -1775,7 +2003,7 @@ class TelegramBot:
 💀 Est.Liq: `{liq}`
 
 ⚙️ Lev: `{res['leverage']}x` | 💰 Margin: `${res['margin_required']}`
-📦 Size: `{res['position_size']}` | Risk: `${res['risk_amount']}`
+📦 Size: `{res['position_size']}` | Risk: `${res['risk_amount']}` (Actual: `${res.get('risk_actual', '?')}`)
 
 🔎 *SMC Filters*
 💧 Sweep: `{res['sweep']}` | 📦 POI: `{res['poi_ok']}`
@@ -1793,10 +2021,12 @@ FG: `{scores.get('fear_greed',0)}` | Funding: `{scores.get('funding',0)}`
 OI: `{scores.get('oi',0)}` | Event: `{scores.get('event',0)}`
 
 ⏱ 15M: `{ec.get('event')}` (Age: `{ec.get('age')}`) | Trigger: {trigger_text}
+📌 POI Type: `{poi_type}`
 🌍 BTC: `{f.get('btc_bias')}` | FG: `{f.get('fear_greed')}`
+🔖 Instrument: `{instrument_info.get('status', 'N/A')}` | Tick: `{instrument_info.get('tickSize', 'N/A')}`
 🆔 `{res['signal_id']}`
 
-*Score 0-100 arası SMC uyğunluq göstəricisidir, qazanma ehtimalı deyil."""
+*Score 0-100 arası SMC uyğunluq göstəricisidir, qazanma ehtimalı deyil.*"""
 
     def format_diagnostics(self, all_results: List[Dict], max_detail: int = 10) -> str:
         total = len(all_results)
@@ -1826,13 +2056,13 @@ OI: `{scores.get('oi',0)}` | Event: `{scores.get('event',0)}`
 
     async def send_signal(self, application, result: Dict) -> None:
         try:
-            if not PerformanceTracker.save_signal(result):
-                logger.info(f"Signal {result['signal_id']} already exists, skipping send")
-                return
-
             last_notified = PerformanceTracker.get_last_notified(result["signal_id"])
             if time.time() - last_notified < self.config.notify_cooldown_seconds:
-                logger.info(f"Cooldown active for {result['signal_id']}")
+                logger.info(f"Cooldown active for {result['signal_id']}, signal not saved")
+                return
+
+            if not PerformanceTracker.save_signal(result, self.config):
+                logger.info(f"Signal {result['signal_id']} rejected or duplicate")
                 return
 
             try:
@@ -1921,29 +2151,34 @@ OI: `{scores.get('oi',0)}` | Event: `{scores.get('event',0)}`
 
     @staticmethod
     async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        msg = """📊 *Professional SMC AI Bot V5.5 FINAL*
+        msg = """📊 *Professional SMC AI Bot V6.7 FINAL*
 
 ✅ Hard Filter:
 • Daily + 4H + 1H Triple Alignment
 • 15M Confirmation (BOS → POI retest → wick rejection)
-• RR >= 1:2
-• Liquidity target untouched + RR (REJECT əgər keçmirsə)
+• Trigger yalnız son bağlanmış 15M şamda
+• RR >= 1:2 (komissiya + slippage daxil)
+• Liquidity target untouched + RR
+
+✅ Vahid POI sistemi:
+• 1H OB + FVG namizədləri → 15M real retest → seçilmiş POI
+• SL seçilmiş POI-yə uyğun hesablanır
+
+✅ Risk Limitləri:
+• Maksimum aktiv siqnal: 3
+• Günlük siqnal: 5
+• Korrelyasiya limiti: eyni istiqamətdə 2
 
 ✅ Soft Filter (100-lük çəkilərlə):
 • OB(11), Sweep(10), FVG(7), POI(8), Displacement(8), Volume(6)
 • OTE(10), CVD(7), BTC(8), Session(6), Fear&Greed(5)
 • Funding(5), OI(3), Event(6)
 
-✅ Real Performance:
-• Atomic 1M candle processor (lock altında)
-• Hər signal üçün persistent last_1m_ts
-• Dəqiq 100-lük scoring (double-counting yoxdur)
-• Real POI intersection + wick rejection
-• Yalnız son tamamlanmış session liquidity
-• Bütün liquidity-lər içindən ilk untouched target
-• Persistent retry + notification (restart-safe)
-• Atomic JSON + RLock
-• P&L, Equity, Drawdown, Sharpe
+✅ Real Performance (paper):
+• Atomic 1M candle processor
+• Persistent last_1m_ts
+• Dəqiq 100-lük scoring
+• P&L, Equity, Drawdown, Sharpe, Profit Factor, Expectancy
 
 Komandalar:
 /analiz - Canlı analiz
@@ -1954,17 +2189,30 @@ Komandalar:
     async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         config = context.bot_data.get("config")
         stats = PerformanceTracker.calculate_stats(config)
-        msg = f"""📈 *PERFORMANCE STATISTICS*
+        msg = f"""📈 *PAPER TP/SL PERFORMANCE*
 
 📊 Total Signals: `{stats['total']}`
 🏆 Win Rate: `{stats['win_rate']}%`
-⚖️ Avg RR: `1:{stats['avg_rr']}`
+⚖️ Avg Realized RR: `1:{stats['avg_rr']}`
+🎯 Avg Planned RR: `1:{stats['avg_planned_rr']}`
+💰 Total P&L: `${stats['total_pnl']}`
+📈 Profit Factor: `{stats['profit_factor']}`
+🎯 Expectancy: `${stats['expectancy']}`
+📉 Max Consecutive Losses: `{stats['max_consecutive_losses']}`
 📉 Sharpe Ratio: `{stats['sharpe']}`
 📉 Max Drawdown: `{stats['drawdown']}%`
 🟢 Active Signals: `{stats['active']}`
-💰 Total P&L: `${stats['total_pnl']}`
 
-*Statistikalar real TP/SL bağlanmalarına əsaslanır.*"""
+📊 *Score Qrupları:*
+• 70-80: `{stats['score_groups']['70-80']['wins']}/{stats['score_groups']['70-80']['total']}` (P&L: `${stats['score_groups']['70-80']['pnl']}`)
+• 80-90: `{stats['score_groups']['80-90']['wins']}/{stats['score_groups']['80-90']['total']}` (P&L: `${stats['score_groups']['80-90']['pnl']}`)
+• 90+: `{stats['score_groups']['90+']['wins']}/{stats['score_groups']['90+']['total']}` (P&L: `${stats['score_groups']['90+']['pnl']}`)
+
+📈 *LONG/SHORT:*
+• LONG: `{stats['direction_stats']['LONG']['wins']}/{stats['direction_stats']['LONG']['total']}` (P&L: `${stats['direction_stats']['LONG']['pnl']}`)
+• SHORT: `{stats['direction_stats']['SHORT']['wins']}/{stats['direction_stats']['SHORT']['total']}` (P&L: `${stats['direction_stats']['SHORT']['pnl']}`)
+
+*Statistikalar 1M candle simulasiyasına əsaslanır, real exchange execution deyil.*"""
         await update.message.reply_text(msg, parse_mode="Markdown")
 
     async def analiz_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1975,7 +2223,6 @@ Komandalar:
         else:
             msg = "❌ Heç bir setup keçmədi.\n\n" + self.format_diagnostics(all_res)
             await update.message.reply_text(msg, parse_mode="Markdown")
-
 # ============================================================================
 # FLASK KEEP-ALIVE
 # ============================================================================
@@ -1986,7 +2233,7 @@ class KeepAliveServer:
         self.app = Flask(__name__)
         @self.app.route("/")
         def home():
-            return "PRO SMC AI BOT V5.5 FINAL RUNNING"
+            return "PRO SMC AI BOT V6.7 FINAL RUNNING"
     def run(self) -> None:
         Thread(target=self._run, daemon=True).start()
     def _run(self) -> None:
@@ -2032,7 +2279,7 @@ def main() -> None:
     app.add_handler(CommandHandler("analiz", bot.analiz_command))
     app.add_handler(CommandHandler("stats", TelegramBot.stats_command))
 
-    logger.info("PROFESSIONAL SMC BOT V5.5 FINAL STARTED!")
+    logger.info("PROFESSIONAL SMC BOT V6.7 FINAL STARTED!")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
