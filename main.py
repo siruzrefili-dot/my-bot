@@ -1,5 +1,5 @@
 # ============================================
-# SIMPLE TRADING BOT V1.0
+# SIMPLE TRADING BOT V1.1
 # PART 1/8 - IMPORT + CONFIG
 # ============================================
 
@@ -17,11 +17,7 @@ import numpy as np
 from flask import Flask, jsonify
 
 
-# ============================================
-# CONFIG
-# ============================================
-
-BOT_VERSION = "SIMPLE V1.0"
+BOT_VERSION = "SIMPLE V1.1"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "1121794078")
@@ -86,10 +82,6 @@ FLASK_PORT = 10000
 os.makedirs(DATA_DIR, exist_ok=True)
 
 
-# ============================================
-# LOGGING
-# ============================================
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
@@ -98,13 +90,14 @@ logging.basicConfig(
 logger = logging.getLogger("SimpleBot")
 
 print("=" * 55)
-print(" SIMPLE TRADING BOT V1.0")
+print(" SIMPLE TRADING BOT V1.1")
 print("=" * 55)
 print("4H Trend")
 print("1H Pullback")
 print("15M RSI + Strong Candle")
 print("Volume + ATR")
 print("SL + TP 1:2")
+print("Telegram Commands Enabled")
 print("=" * 55)
 # ============================================
 # PART 2/8 - STORAGE + BYBIT API
@@ -160,7 +153,7 @@ class BybitClient:
             self.local.session = requests.Session()
 
             self.local.session.headers.update({
-                "User-Agent": "SimpleTradingBot/1.0"
+                "User-Agent": "SimpleTradingBot/1.1"
             })
 
         return self.local.session
@@ -200,6 +193,7 @@ class BybitClient:
         raise last_error
 
     def klines(self, symbol, interval, limit=300):
+
         data = self.get(
             "/v5/market/kline",
             {
@@ -240,7 +234,6 @@ class BybitClient:
             utc=True
         )
 
-        # Remove currently forming candle
         now_ms = int(time.time() * 1000)
 
         interval_ms = (
@@ -267,6 +260,7 @@ def calculate_ema(series, period):
 
 
 def calculate_rsi(series, period=14):
+
     delta = series.diff()
 
     gain = delta.clip(lower=0)
@@ -295,6 +289,7 @@ def calculate_rsi(series, period=14):
 
 
 def calculate_atr(df, period=14):
+
     previous_close = df["close"].shift(1)
 
     tr1 = (
@@ -324,6 +319,7 @@ def calculate_atr(df, period=14):
 
 
 def add_indicators(df):
+
     df = df.copy()
 
     df["ema50"] = calculate_ema(
@@ -361,6 +357,7 @@ def add_indicators(df):
 
 
 def has_enough_data(df, minimum):
+
     if df is None:
         return False
 
@@ -369,10 +366,11 @@ def has_enough_data(df, minimum):
 
     return len(df) >= minimum
 # ============================================
-# PART 4/8 - SIMPLE STRATEGY
+# PART 4/8 - STRATEGY
 # ============================================
 
 def get_4h_trend(df):
+
     if not has_enough_data(df, 220):
         return "NONE"
 
@@ -398,6 +396,7 @@ def get_4h_trend(df):
 
 
 def check_1h_pullback(df, direction):
+
     if len(df) < 10:
         return False
 
@@ -405,13 +404,8 @@ def check_1h_pullback(df, direction):
 
     for _, candle in recent.iterrows():
 
-        ema50 = float(
-            candle["ema50"]
-        )
-
-        atr_value = float(
-            candle["atr"]
-        )
+        ema50 = float(candle["ema50"])
+        atr_value = float(candle["atr"])
 
         if atr_value <= 0:
             continue
@@ -419,8 +413,8 @@ def check_1h_pullback(df, direction):
         if direction == "LONG":
 
             distance = abs(
-                float(candle["low"])
-                - ema50
+                float(candle["low"]) -
+                ema50
             )
 
             if distance <= (
@@ -432,8 +426,8 @@ def check_1h_pullback(df, direction):
         elif direction == "SHORT":
 
             distance = abs(
-                float(candle["high"])
-                - ema50
+                float(candle["high"]) -
+                ema50
             )
 
             if distance <= (
@@ -446,19 +440,15 @@ def check_1h_pullback(df, direction):
 
 
 def check_15m_rsi(df, direction):
+
     if len(df) < 3:
         return False
 
     previous = df.iloc[-2]
     current = df.iloc[-1]
 
-    previous_rsi = float(
-        previous["rsi"]
-    )
-
-    current_rsi = float(
-        current["rsi"]
-    )
+    previous_rsi = float(previous["rsi"])
+    current_rsi = float(current["rsi"])
 
     if direction == "LONG":
 
@@ -484,19 +474,15 @@ def check_15m_rsi(df, direction):
 
 
 def check_strong_candle(df, direction):
+
     if len(df) < 2:
         return False
 
     current = df.iloc[-1]
     previous = df.iloc[-2]
 
-    body = float(
-        current["body"]
-    )
-
-    atr_value = float(
-        current["atr"]
-    )
+    body = float(current["body"])
+    atr_value = float(current["atr"])
 
     if atr_value <= 0:
         return False
@@ -531,6 +517,7 @@ def check_strong_candle(df, direction):
 
 
 def check_volume(df):
+
     if len(df) < VOLUME_PERIOD + 2:
         return False, 0.0
 
@@ -555,18 +542,14 @@ def check_volume(df):
 
 
 def check_atr(df):
+
     if df.empty:
         return False, 0.0
 
     current = df.iloc[-1]
 
-    price = float(
-        current["close"]
-    )
-
-    atr_value = float(
-        current["atr"]
-    )
+    price = float(current["close"])
+    atr_value = float(current["atr"])
 
     if price <= 0 or atr_value <= 0:
         return False, 0.0
@@ -584,10 +567,11 @@ def check_atr(df):
 
     return valid, atr_percent
 # ============================================
-# PART 5/8 - SL TP + RISK
+# PART 5/8 - TRADE + SIGNAL
 # ============================================
 
 def get_swing_low(df, lookback=20):
+
     if df.empty:
         return None
 
@@ -599,6 +583,7 @@ def get_swing_low(df, lookback=20):
 
 
 def get_swing_high(df, lookback=20):
+
     if df.empty:
         return None
 
@@ -618,19 +603,10 @@ def calculate_trade(
     atr_value
 ):
 
-    if entry <= 0:
+    if entry <= 0 or atr_value <= 0:
         return None
 
-    if atr_value <= 0:
-        return None
-
-    buffer_value = (
-        atr_value * 0.20
-    )
-
-    # ==================================
-    # LONG
-    # ==================================
+    buffer_value = atr_value * 0.20
 
     if direction == "LONG":
 
@@ -640,14 +616,9 @@ def calculate_trade(
         if swing_low >= entry:
             return None
 
-        stop = (
-            swing_low -
-            buffer_value
-        )
+        stop = swing_low - buffer_value
 
-        risk_distance = (
-            entry - stop
-        )
+        risk_distance = entry - stop
 
         if risk_distance <= 0:
             return None
@@ -657,10 +628,6 @@ def calculate_trade(
             risk_distance * MIN_RR
         )
 
-    # ==================================
-    # SHORT
-    # ==================================
-
     elif direction == "SHORT":
 
         if swing_high is None:
@@ -669,14 +636,9 @@ def calculate_trade(
         if swing_high <= entry:
             return None
 
-        stop = (
-            swing_high +
-            buffer_value
-        )
+        stop = swing_high + buffer_value
 
-        risk_distance = (
-            stop - entry
-        )
+        risk_distance = stop - entry
 
         if risk_distance <= 0:
             return None
@@ -708,10 +670,7 @@ def calculate_trade(
         risk_distance
     )
 
-    notional = (
-        quantity *
-        entry
-    )
+    notional = quantity * entry
 
     return {
         "symbol": symbol,
@@ -765,22 +724,10 @@ def create_signal(
         "target": trade["target"],
 
         "rr": trade["rr"],
-
-        "risk_distance": trade[
-            "risk_distance"
-        ],
-
-        "risk_amount": trade[
-            "risk_amount"
-        ],
-
-        "quantity": trade[
-            "quantity"
-        ],
-
-        "notional": trade[
-            "notional"
-        ],
+        "risk_distance": trade["risk_distance"],
+        "risk_amount": trade["risk_amount"],
+        "quantity": trade["quantity"],
+        "notional": trade["notional"],
 
         "rsi": round(
             float(current["rsi"]),
@@ -805,9 +752,8 @@ def create_signal(
         "created_at": utc_now(),
 
         "status": "ACTIVE",
-
         "last_checked_candle": 0
-
+        
     }
 # ============================================
 # PART 6/8 - TRACKER + ANALYSIS
@@ -850,13 +796,8 @@ class SignalTracker:
                 "daily_date"
             ) != today:
 
-                self.stats[
-                    "daily_date"
-                ] = today
-
-                self.stats[
-                    "daily_count"
-                ] = 0
+                self.stats["daily_date"] = today
+                self.stats["daily_count"] = 0
 
                 self.save()
 
@@ -879,23 +820,16 @@ class SignalTracker:
             return [
                 signal
                 for signal in self.signals
-                if signal.get(
-                    "status"
-                ) == "ACTIVE"
+                if signal.get("status") == "ACTIVE"
             ]
 
-    def can_create(
-        self,
-        symbol
-    ):
+    def can_create(self, symbol):
 
         with self.lock:
 
             self.reset_daily()
 
-            if len(
-                self.active()
-            ) >= MAX_ACTIVE_SIGNALS:
+            if len(self.active()) >= MAX_ACTIVE_SIGNALS:
                 return False
 
             if self.stats.get(
@@ -907,15 +841,12 @@ class SignalTracker:
             now = time.time()
 
             cooldown = (
-                SYMBOL_COOLDOWN_MINUTES
-                * 60
+                SYMBOL_COOLDOWN_MINUTES * 60
             )
 
             for signal in self.signals:
 
-                if signal.get(
-                    "symbol"
-                ) != symbol:
+                if signal.get("symbol") != symbol:
                     continue
 
                 created = signal.get(
@@ -923,10 +854,7 @@ class SignalTracker:
                     0
                 )
 
-                if (
-                    now - created
-                    < cooldown
-                ):
+                if now - created < cooldown:
                     return False
 
             return True
@@ -940,20 +868,16 @@ class SignalTracker:
             ):
                 return False
 
-            self.signals.append(
-                signal
+            self.signals.append(signal)
+
+            self.stats["daily_count"] = (
+                self.stats.get(
+                    "daily_count",
+                    0
+                ) + 1
             )
 
-            self.stats[
-                "daily_count"
-            ] = self.stats.get(
-                "daily_count",
-                0
-            ) + 1
-
-            self.signals = (
-                self.signals[-300:]
-            )
+            self.signals = self.signals[-300:]
 
             self.save()
 
@@ -967,10 +891,7 @@ class SignalTracker:
                 self.signals
             ):
 
-                if item.get(
-                    "id"
-                ) == signal["id"]:
-
+                if item.get("id") == signal["id"]:
                     self.signals[index] = signal
                     break
 
@@ -986,18 +907,14 @@ class SignalTracker:
         with self.lock:
 
             signal["status"] = "CLOSED"
-
             signal["result_r"] = round(
                 result_r,
                 3
             )
-
             signal["result"] = result
-
             signal["closed_at"] = utc_now()
 
             self.stats["total"] += 1
-
             self.stats["profit_r"] += result_r
 
             if result == "WIN":
@@ -1063,36 +980,21 @@ def analyze_symbol(symbol):
 
     try:
 
-        # ==================================
-        # 4H TREND
-        # ==================================
-
         df4h = BYBIT.klines(
             symbol,
             TREND_TF,
             300
         )
 
-        if not has_enough_data(
-            df4h,
-            220
-        ):
+        if not has_enough_data(df4h, 220):
             return None
 
-        df4h = add_indicators(
-            df4h
-        )
+        df4h = add_indicators(df4h)
 
-        trend = get_4h_trend(
-            df4h
-        )
+        trend = get_4h_trend(df4h)
 
         if trend == "NONE":
             return None
-
-        # ==================================
-        # 1H PULLBACK
-        # ==================================
 
         df1h = BYBIT.klines(
             symbol,
@@ -1100,27 +1002,16 @@ def analyze_symbol(symbol):
             250
         )
 
-        if not has_enough_data(
-            df1h,
-            50
-        ):
+        if not has_enough_data(df1h, 50):
             return None
 
-        df1h = add_indicators(
-            df1h
-        )
+        df1h = add_indicators(df1h)
 
-        pullback = check_1h_pullback(
+        if not check_1h_pullback(
             df1h,
             trend
-        )
-
-        if not pullback:
+        ):
             return None
-
-        # ==================================
-        # 15M ENTRY
-        # ==================================
 
         df15 = BYBIT.klines(
             symbol,
@@ -1128,59 +1019,37 @@ def analyze_symbol(symbol):
             200
         )
 
-        if not has_enough_data(
+        if not has_enough_data(df15, 50):
+            return None
+
+        df15 = add_indicators(df15)
+
+        if not check_15m_rsi(
             df15,
-            50
+            trend
         ):
             return None
 
-        df15 = add_indicators(
-            df15
-        )
-
-        rsi_ok = check_15m_rsi(
+        if not check_strong_candle(
             df15,
             trend
-        )
-
-        if not rsi_ok:
+        ):
             return None
 
-        candle_ok = check_strong_candle(
-            df15,
-            trend
-        )
-
-        if not candle_ok:
-            return None
-
-        volume_ok, volume_ratio = check_volume(
-            df15
-        )
+        volume_ok, volume_ratio = check_volume(df15)
 
         if not volume_ok:
             return None
 
-        atr_ok, atr_percent = check_atr(
-            df15
-        )
+        atr_ok, atr_percent = check_atr(df15)
 
         if not atr_ok:
             return None
 
-        # ==================================
-        # TRADE
-        # ==================================
-
         current = df15.iloc[-1]
 
-        entry = float(
-            current["close"]
-        )
-
-        atr_value = float(
-            current["atr"]
-        )
+        entry = float(current["close"])
+        atr_value = float(current["atr"])
 
         swing_low = get_swing_low(
             df1h,
@@ -1204,14 +1073,12 @@ def analyze_symbol(symbol):
         if trade is None:
             return None
 
-        signal = create_signal(
+        return create_signal(
             trade,
             df15,
             volume_ratio,
             atr_percent
         )
-
-        return signal
 
     except Exception as e:
 
@@ -1223,8 +1090,313 @@ def analyze_symbol(symbol):
 
         return None
 # ============================================
-# PART 7/8 - SCANNER + TELEGRAM
+# PART 7/8 - SCANNER + TELEGRAM COMMANDS
 # ============================================
+
+class TelegramBot:
+
+    def __init__(self):
+
+        self.offset = 0
+        self.command_running = False
+        self.lock = threading.Lock()
+
+    def send(self, text):
+
+        if not BOT_TOKEN:
+            logger.warning(
+                "BOT_TOKEN is empty"
+            )
+            return False
+
+        url = (
+            "https://api.telegram.org/bot"
+            + BOT_TOKEN
+            + "/sendMessage"
+        )
+
+        try:
+
+            response = requests.post(
+                url,
+                json={
+                    "chat_id": CHAT_ID,
+                    "text": text
+                },
+                timeout=REQUEST_TIMEOUT
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+            return bool(data.get("ok"))
+
+        except Exception as e:
+
+            logger.error(
+                "Telegram send error: %s",
+                e
+            )
+
+            return False
+
+    def send_signal(self, signal):
+
+        if signal["direction"] == "LONG":
+            icon = "🟢"
+        else:
+            icon = "🔴"
+
+        text = (
+            f"{icon} SIMPLE SIGNAL\n\n"
+            f"Coin: {signal['symbol']}\n"
+            f"Direction: {signal['direction']}\n\n"
+            f"Entry: {signal['entry']}\n"
+            f"SL: {signal['stop']}\n"
+            f"TP: {signal['target']}\n"
+            f"RR: 1:{signal['rr']}\n\n"
+            f"RSI: {signal['rsi']}\n"
+            f"Volume: {signal['volume_ratio']}x\n"
+            f"ATR: {signal['atr_percent']}%\n\n"
+            f"Risk: {RISK_PERCENT}%"
+        )
+
+        return self.send(text)
+
+    def process_updates(self):
+
+        if not BOT_TOKEN:
+            return
+
+        url = (
+            "https://api.telegram.org/bot"
+            + BOT_TOKEN
+            + "/getUpdates"
+        )
+
+        try:
+
+            response = requests.get(
+                url,
+                params={
+                    "offset": self.offset,
+                    "timeout": 20
+                },
+                timeout=25
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+            if not data.get("ok"):
+                return
+
+            updates = data.get("result", [])
+
+            for update in updates:
+
+                self.offset = (
+                    int(update["update_id"]) + 1
+                )
+
+                message = update.get("message")
+
+                if not message:
+                    continue
+
+                chat = message.get("chat", {})
+                chat_id = str(
+                    chat.get("id", "")
+                )
+
+                if chat_id != str(CHAT_ID):
+                    continue
+
+                text = str(
+                    message.get("text", "")
+                ).strip()
+
+                if not text:
+                    continue
+
+                self.handle_command(text)
+
+        except Exception as e:
+
+            logger.error(
+                "Telegram update error: %s",
+                e
+            )
+
+    def handle_command(self, text):
+
+        command = text.split()[0].lower()
+
+        if "@" in command:
+            command = command.split("@")[0]
+
+        if command == "/start":
+
+            self.send(
+                "🟢 SIMPLE BOT AKTİVDİR\n\n"
+                "Telegram əmrləri:\n"
+                "/help - əmrlər\n"
+                "/status - bot vəziyyəti\n"
+                "/stats - statistika\n"
+                "/active - aktiv siqnallar\n"
+                "/scan - dərhal analiz"
+            )
+
+        elif command == "/help":
+
+            self.send(
+                "📋 TELEGRAM ƏMRLƏRİ\n\n"
+                "/start\n"
+                "Bot haqqında məlumat.\n\n"
+                "/status\n"
+                "Botun cari vəziyyəti.\n\n"
+                "/stats\n"
+                "WIN, LOSS, win rate və R statistikası.\n\n"
+                "/active\n"
+                "Hazırda aktiv siqnallar.\n\n"
+                "/scan\n"
+                "10 coin-i dərhal analiz edir."
+            )
+
+        elif command == "/status":
+
+            summary = TRACKER.summary()
+
+            self.send(
+                "🟢 BOT STATUS\n\n"
+                f"Version: {BOT_VERSION}\n"
+                f"Coins: {len(SYMBOLS)}\n"
+                f"Risk: {RISK_PERCENT}%\n"
+                f"RR: 1:{MIN_RR}\n"
+                f"Active: {summary['active']}/"
+                f"{MAX_ACTIVE_SIGNALS}\n"
+                f"Today: {summary['daily_signals']}/"
+                f"{MAX_DAILY_SIGNALS}"
+            )
+
+        elif command == "/stats":
+
+            summary = TRACKER.summary()
+
+            self.send(
+                "📊 STATISTICS\n\n"
+                f"Total: {summary['total']}\n"
+                f"Wins: {summary['wins']}\n"
+                f"Losses: {summary['losses']}\n"
+                f"Win rate: {summary['win_rate']}%\n"
+                f"Profit: {summary['profit_r']}R\n"
+                f"Today signals: "
+                f"{summary['daily_signals']}\n"
+                f"Active: {summary['active']}"
+            )
+
+        elif command == "/active":
+
+            active = TRACKER.active()
+
+            if not active:
+
+                self.send(
+                    "ℹ️ Hazırda aktiv siqnal yoxdur."
+                )
+
+                return
+
+            lines = [
+                "📌 AKTİV SİQNALLAR\n"
+            ]
+
+            for signal in active:
+
+                lines.append(
+                    f"{signal['symbol']} "
+                    f"{signal['direction']}\n"
+                    f"Entry: {signal['entry']}\n"
+                    f"SL: {signal['stop']}\n"
+                    f"TP: {signal['target']}\n"
+                    f"RR: 1:{signal['rr']}\n"
+                )
+
+            self.send("\n".join(lines))
+
+        elif command == "/scan":
+
+            with self.lock:
+
+                if self.command_running:
+
+                    self.send(
+                        "⏳ Hazırda scan gedir."
+                    )
+
+                    return
+
+                self.command_running = True
+
+            self.send(
+                "🔎 10 coin analiz edilir..."
+            )
+
+            threading.Thread(
+                target=self.manual_scan,
+                daemon=True
+            ).start()
+
+    def manual_scan(self):
+
+        try:
+
+            signals = scan()
+
+            count = 0
+
+            for signal in signals:
+
+                if TRACKER.add(signal):
+
+                    count += 1
+
+                    self.send_signal(signal)
+
+            if count == 0:
+
+                self.send(
+                    "ℹ️ Hazırda uyğun setup tapılmadı."
+                )
+
+            else:
+
+                self.send(
+                    f"✅ Scan tamamlandı.\n"
+                    f"Yeni siqnal: {count}"
+                )
+
+        except Exception as e:
+
+            logger.error(
+                "Manual scan error: %s",
+                e
+            )
+
+            self.send(
+                "❌ Scan zamanı xəta baş verdi."
+            )
+
+        finally:
+
+            with self.lock:
+                self.command_running = False
+
+
+TELEGRAM = TelegramBot()
+
 
 def scan():
 
@@ -1247,9 +1419,7 @@ def scan():
             for symbol in SYMBOLS
         }
 
-        for future in as_completed(
-            futures
-        ):
+        for future in as_completed(futures):
 
             symbol = futures[future]
 
@@ -1258,9 +1428,7 @@ def scan():
                 signal = future.result()
 
                 if signal:
-                    candidates.append(
-                        signal
-                    )
+                    candidates.append(signal)
 
             except Exception as e:
 
@@ -1285,9 +1453,7 @@ def scan():
         if TRACKER.can_create(
             signal["symbol"]
         ):
-            selected.append(
-                signal
-            )
+            selected.append(signal)
 
     logger.info(
         "Valid setups: %d",
@@ -1295,89 +1461,6 @@ def scan():
     )
 
     return selected
-
-
-class TelegramBot:
-
-    def send(self, text):
-
-        if not BOT_TOKEN:
-
-            logger.warning(
-                "BOT_TOKEN is empty"
-            )
-
-            return False
-
-        url = (
-            "https://api.telegram.org/bot"
-            + BOT_TOKEN
-            + "/sendMessage"
-        )
-
-        try:
-
-            response = requests.post(
-                url,
-                json={
-                    "chat_id": CHAT_ID,
-                    "text": text
-                },
-                timeout=REQUEST_TIMEOUT
-            )
-
-            if not response.ok:
-
-                logger.error(
-                    "Telegram HTTP error: %s",
-                    response.status_code
-                )
-
-                return False
-
-            data = response.json()
-
-            return bool(
-                data.get("ok")
-            )
-
-        except Exception as e:
-
-            logger.error(
-                "Telegram error: %s",
-                e
-            )
-
-            return False
-
-    def send_signal(
-        self,
-        signal
-    ):
-
-        if signal["direction"] == "LONG":
-            icon = "🟢"
-        else:
-            icon = "🔴"
-
-        text = (
-            f"{icon} SIMPLE SIGNAL\n\n"
-            f"Coin: {signal['symbol']}\n"
-            f"Direction: {signal['direction']}\n\n"
-            f"Entry: {signal['entry']}\n"
-            f"SL: {signal['stop']}\n"
-            f"TP: {signal['target']}\n"
-            f"RR: 1:{signal['rr']}\n\n"
-            f"RSI: {signal['rsi']}\n"
-            f"Volume: {signal['volume_ratio']}x\n"
-            f"ATR: {signal['atr_percent']}%\n\n"
-            f"Risk: {RISK_PERCENT}%"
-        )
-
-        return self.send(text)
-
-
-TELEGRAM = TelegramBot()
 
 
 def scanner_loop():
@@ -1396,9 +1479,7 @@ def scanner_loop():
 
             for signal in signals:
 
-                if not TRACKER.add(
-                    signal
-                ):
+                if not TRACKER.add(signal):
                     continue
 
                 logger.info(
@@ -1410,16 +1491,7 @@ def scanner_loop():
                     signal["target"]
                 )
 
-                sent = TELEGRAM.send_signal(
-                    signal
-                )
-
-                if not sent:
-
-                    logger.warning(
-                        "Telegram failed for %s",
-                        signal["id"]
-                    )
+                TELEGRAM.send_signal(signal)
 
         except Exception as e:
 
@@ -1428,20 +1500,35 @@ def scanner_loop():
                 e
             )
 
-        elapsed = (
-            time.time() -
-            start_time
-        )
+        elapsed = time.time() - start_time
 
         sleep_time = max(
             10,
             SCAN_INTERVAL - elapsed
         )
 
-        time.sleep(
-            sleep_time
-            
-        )
+        time.sleep(sleep_time)
+
+
+def telegram_loop():
+
+    logger.info(
+        "Telegram command loop started"
+    )
+
+    while True:
+
+        try:
+            TELEGRAM.process_updates()
+
+        except Exception as e:
+
+            logger.error(
+                "Telegram loop error: %s",
+                e
+            )
+
+        time.sleep(1)
 # ============================================
 # PART 8/8 - MONITOR + FLASK + MAIN
 # ============================================
@@ -1461,17 +1548,9 @@ def monitor_signal(signal):
         if df.empty:
             return
 
-        entry = float(
-            signal["entry"]
-        )
-
-        stop = float(
-            signal["stop"]
-        )
-
-        target = float(
-            signal["target"]
-        )
+        entry = float(signal["entry"])
+        stop = float(signal["stop"])
+        target = float(signal["target"])
 
         risk_distance = abs(
             entry - stop
@@ -1511,23 +1590,11 @@ def monitor_signal(signal):
             if candle_time <= last_checked:
                 continue
 
-            high = float(
-                candle["high"]
-            )
-
-            low = float(
-                candle["low"]
-            )
-
-            # ==================================
-            # LONG
-            # ==================================
+            high = float(candle["high"])
+            low = float(candle["low"])
 
             if signal["direction"] == "LONG":
 
-                # If both TP and SL are touched
-                # in the same 1M candle,
-                # count SL first conservatively.
                 if low <= stop:
 
                     result_r = (
@@ -1567,10 +1634,6 @@ def monitor_signal(signal):
                     )
 
                     return
-
-            # ==================================
-            # SHORT
-            # ==================================
 
             elif signal["direction"] == "SHORT":
 
@@ -1614,15 +1677,11 @@ def monitor_signal(signal):
 
                     return
 
-            signal[
-                "last_checked_candle"
-            ] = candle_time
+            signal["last_checked_candle"] = candle_time
 
         signal["last_checked"] = utc_now()
 
-        TRACKER.update(
-            signal
-        )
+        TRACKER.update(signal)
 
     except Exception as e:
 
@@ -1646,10 +1705,7 @@ def monitor_loop():
             active = TRACKER.active()
 
             for signal in active:
-
-                monitor_signal(
-                    signal
-                )
+                monitor_signal(signal)
 
         except Exception as e:
 
@@ -1658,14 +1714,8 @@ def monitor_loop():
                 e
             )
 
-        time.sleep(
-            MONITOR_INTERVAL
-        )
+        time.sleep(MONITOR_INTERVAL)
 
-
-# ============================================
-# FLASK
-# ============================================
 
 app = Flask(__name__)
 
@@ -1677,6 +1727,14 @@ def home():
         "bot": "Simple Trading Bot",
         "version": BOT_VERSION,
         "status": "running",
+        "telegram_commands": [
+            "/start",
+            "/help",
+            "/status",
+            "/stats",
+            "/active",
+            "/scan"
+        ],
         "strategy": (
             "4H Trend + 1H Pullback + "
             "15M RSI + Strong Candle + "
@@ -1729,10 +1787,6 @@ def flask_loop():
         )
 
 
-# ============================================
-# MAIN
-# ============================================
-
 def main():
 
     logger.info(
@@ -1740,12 +1794,7 @@ def main():
     )
 
     logger.info(
-        "SIMPLE BOT STARTED"
-    )
-
-    logger.info(
-        "Version: %s",
-        BOT_VERSION
+        "SIMPLE BOT V1.1 STARTED"
     )
 
     logger.info(
@@ -1764,6 +1813,10 @@ def main():
     )
 
     logger.info(
+        "Telegram commands enabled"
+    )
+
+    logger.info(
         "=========================================="
     )
 
@@ -1771,7 +1824,7 @@ def main():
 
         logger.warning(
             "BOT_TOKEN not set. "
-            "Telegram notifications are disabled."
+            "Telegram disabled."
         )
 
     threading.Thread(
@@ -1789,11 +1842,14 @@ def main():
         daemon=True
     ).start()
 
-    while True:
+    threading.Thread(
+        target=telegram_loop,
+        daemon=True
+    ).start()
 
+    while True:
         time.sleep(60)
 
 
 if __name__ == "__main__":
     main()
-        
