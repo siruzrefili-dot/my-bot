@@ -29,7 +29,6 @@ CHAT_ID = os.getenv("CHAT_ID", "1121794078")
 BYBIT_URL = "https://api.bybit.com"
 CATEGORY = "linear"
 
-# Coins
 SYMBOLS = [
     "BTCUSDT",
     "ETHUSDT",
@@ -43,64 +42,45 @@ SYMBOLS = [
     "SUIUSDT"
 ]
 
-# Timeframes
 TREND_TF = "240"
 SETUP_TF = "60"
 ENTRY_TF = "15"
 MONITOR_TF = "1"
 
-# Indicators
 EMA_FAST = 50
 EMA_SLOW = 200
 RSI_PERIOD = 14
 ATR_PERIOD = 14
 VOLUME_PERIOD = 20
 
-# Strategy
 RSI_LEVEL = 50.0
 
-# 1H pullback distance from EMA50
 PULLBACK_ATR = 0.80
-
-# Strong 15M candle minimum body
 STRONG_CANDLE_ATR = 0.50
-
-# Volume must be at least 1.10x average
 MIN_VOLUME_RATIO = 1.10
 
-# ATR percentage limits
 MIN_ATR_PERCENT = 0.10
 MAX_ATR_PERCENT = 6.00
 
-# Risk
 ACCOUNT_BALANCE = 1000.0
 RISK_PERCENT = 1.0
 
-# Reward / Risk
 MIN_RR = 2.0
 
-# Signal limits
 MAX_ACTIVE_SIGNALS = 3
 MAX_DAILY_SIGNALS = 5
 
-# Same symbol cooldown
 SYMBOL_COOLDOWN_MINUTES = 120
 
-# Scanner
 SCAN_INTERVAL = 300
-
-# Monitor
 MONITOR_INTERVAL = 30
 
-# HTTP
 REQUEST_TIMEOUT = 15
 
-# Data
 DATA_DIR = "simple_bot_data"
 SIGNALS_FILE = os.path.join(DATA_DIR, "signals.json")
 STATS_FILE = os.path.join(DATA_DIR, "stats.json")
 
-# Flask
 FLASK_PORT = 10000
 
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -176,7 +156,6 @@ class BybitClient:
         self.local = threading.local()
 
     def get_session(self):
-
         if not hasattr(self.local, "session"):
             self.local.session = requests.Session()
 
@@ -187,15 +166,11 @@ class BybitClient:
         return self.local.session
 
     def get(self, endpoint, params=None):
-
         url = BYBIT_URL + endpoint
-
         last_error = None
 
         for attempt in range(3):
-
             try:
-
                 response = self.get_session().get(
                     url,
                     params=params or {},
@@ -217,7 +192,6 @@ class BybitClient:
                 return data
 
             except Exception as e:
-
                 last_error = e
 
                 if attempt < 2:
@@ -225,13 +199,7 @@ class BybitClient:
 
         raise last_error
 
-    def klines(
-        self,
-        symbol,
-        interval,
-        limit=300
-    ):
-
+    def klines(self, symbol, interval, limit=300):
         data = self.get(
             "/v5/market/kline",
             {
@@ -252,7 +220,6 @@ class BybitClient:
         result = []
 
         for row in rows:
-
             result.append({
                 "timestamp": int(row[0]),
                 "open": float(row[1]),
@@ -293,18 +260,13 @@ class BybitClient:
 # ============================================
 
 def calculate_ema(series, period):
-
     return series.ewm(
         span=period,
         adjust=False
     ).mean()
 
 
-def calculate_rsi(
-    series,
-    period=14
-):
-
+def calculate_rsi(series, period=14):
     delta = series.diff()
 
     gain = delta.clip(lower=0)
@@ -332,11 +294,7 @@ def calculate_rsi(
     return result.fillna(50)
 
 
-def calculate_atr(
-    df,
-    period=14
-):
-
+def calculate_atr(df, period=14):
     previous_close = df["close"].shift(1)
 
     tr1 = (
@@ -366,7 +324,6 @@ def calculate_atr(
 
 
 def add_indicators(df):
-
     df = df.copy()
 
     df["ema50"] = calculate_ema(
@@ -403,11 +360,7 @@ def add_indicators(df):
     return df
 
 
-def has_enough_data(
-    df,
-    minimum
-):
-
+def has_enough_data(df, minimum):
     if df is None:
         return False
 
@@ -420,7 +373,6 @@ def has_enough_data(
 # ============================================
 
 def get_4h_trend(df):
-
     if not has_enough_data(df, 220):
         return "NONE"
 
@@ -430,14 +382,12 @@ def get_4h_trend(df):
     ema50 = float(last["ema50"])
     ema200 = float(last["ema200"])
 
-    # LONG trend
     if (
         price > ema200
         and ema50 > ema200
     ):
         return "LONG"
 
-    # SHORT trend
     if (
         price < ema200
         and ema50 < ema200
@@ -447,11 +397,7 @@ def get_4h_trend(df):
     return "NONE"
 
 
-def check_1h_pullback(
-    df,
-    direction
-):
-
+def check_1h_pullback(df, direction):
     if len(df) < 10:
         return False
 
@@ -499,11 +445,7 @@ def check_1h_pullback(
     return False
 
 
-def check_15m_rsi(
-    df,
-    direction
-):
-
+def check_15m_rsi(df, direction):
     if len(df) < 3:
         return False
 
@@ -541,11 +483,7 @@ def check_15m_rsi(
     return False
 
 
-def check_strong_candle(
-    df,
-    direction
-):
-
+def check_strong_candle(df, direction):
     if len(df) < 2:
         return False
 
@@ -593,7 +531,6 @@ def check_strong_candle(
 
 
 def check_volume(df):
-
     if len(df) < VOLUME_PERIOD + 2:
         return False, 0.0
 
@@ -603,7 +540,7 @@ def check_volume(df):
         current["volume_ma"]
     )
 
-    if volume_ma <= 0:
+    if volume_ma <= 0 or np.isnan(volume_ma):
         return False, 0.0
 
     ratio = (
@@ -618,7 +555,6 @@ def check_volume(df):
 
 
 def check_atr(df):
-
     if df.empty:
         return False, 0.0
 
@@ -632,7 +568,7 @@ def check_atr(df):
         current["atr"]
     )
 
-    if price <= 0:
+    if price <= 0 or atr_value <= 0:
         return False, 0.0
 
     atr_percent = (
@@ -651,11 +587,7 @@ def check_atr(df):
 # PART 5/8 - SL TP + RISK
 # ============================================
 
-def get_swing_low(
-    df,
-    lookback=20
-):
-
+def get_swing_low(df, lookback=20):
     if df.empty:
         return None
 
@@ -666,11 +598,7 @@ def get_swing_low(
     )
 
 
-def get_swing_high(
-    df,
-    lookback=20
-):
-
+def get_swing_high(df, lookback=20):
     if df.empty:
         return None
 
@@ -700,9 +628,9 @@ def calculate_trade(
         atr_value * 0.20
     )
 
-    # --------------------------
+    # ==================================
     # LONG
-    # --------------------------
+    # ==================================
 
     if direction == "LONG":
 
@@ -729,9 +657,9 @@ def calculate_trade(
             risk_distance * MIN_RR
         )
 
-    # --------------------------
+    # ==================================
     # SHORT
-    # --------------------------
+    # ==================================
 
     elif direction == "SHORT":
 
@@ -869,7 +797,6 @@ def create_signal(
             3
         ),
 
-        # Timestamp of the completed 15M candle
         "entry_candle_timestamp": int(
             current["timestamp"]
         ),
@@ -880,6 +807,8 @@ def create_signal(
         "status": "ACTIVE",
 
         "last_checked_candle": 0
+
+    }
 # ============================================
 # PART 6/8 - TRACKER + ANALYSIS
 # ============================================
@@ -1038,7 +967,9 @@ class SignalTracker:
                 self.signals
             ):
 
-                if item.get("id") == signal["id"]:
+                if item.get(
+                    "id"
+                ) == signal["id"]:
 
                     self.signals[index] = signal
                     break
@@ -1071,7 +1002,6 @@ class SignalTracker:
 
             if result == "WIN":
                 self.stats["wins"] += 1
-
             else:
                 self.stats["losses"] += 1
 
@@ -1292,7 +1222,6 @@ def analyze_symbol(symbol):
         )
 
         return None
-
 # ============================================
 # PART 7/8 - SCANNER + TELEGRAM
 # ============================================
@@ -1341,9 +1270,8 @@ def scan():
                     e
                 )
 
-    # Best RR first
     candidates.sort(
-        key=lambda x: x["rr"],
+        key=lambda x: x["volume_ratio"],
         reverse=True
     )
 
@@ -1351,7 +1279,7 @@ def scan():
 
     for signal in candidates:
 
-        if len(selected) >= 3:
+        if len(selected) >= MAX_ACTIVE_SIGNALS:
             break
 
         if TRACKER.can_create(
@@ -1395,10 +1323,16 @@ class TelegramBot:
                     "chat_id": CHAT_ID,
                     "text": text
                 },
-                timeout=15
+                timeout=REQUEST_TIMEOUT
             )
 
             if not response.ok:
+
+                logger.error(
+                    "Telegram HTTP error: %s",
+                    response.status_code
+                )
+
                 return False
 
             data = response.json()
@@ -1506,8 +1440,9 @@ def scanner_loop():
 
         time.sleep(
             sleep_time
-                )    }
-        # ============================================
+            
+        )
+# ============================================
 # PART 8/8 - MONITOR + FLASK + MAIN
 # ============================================
 
@@ -1545,7 +1480,6 @@ def monitor_signal(signal):
         if risk_distance <= 0:
             return
 
-        # 15M signal candle OPEN time
         entry_candle_time = int(
             signal.get(
                 "entry_candle_timestamp",
@@ -1553,7 +1487,6 @@ def monitor_signal(signal):
             )
         )
 
-        # 15M candle CLOSE time
         entry_close_time = (
             entry_candle_time
             + 15 * 60 * 1000
@@ -1572,12 +1505,9 @@ def monitor_signal(signal):
                 candle["timestamp"]
             )
 
-            # Never check candles before
-            # the 15M entry candle closed.
             if candle_time < entry_close_time:
                 continue
 
-            # Do not process same candle twice.
             if candle_time <= last_checked:
                 continue
 
@@ -1595,8 +1525,9 @@ def monitor_signal(signal):
 
             if signal["direction"] == "LONG":
 
-                # Conservative:
-                # SL checked before TP
+                # If both TP and SL are touched
+                # in the same 1M candle,
+                # count SL first conservatively.
                 if low <= stop:
 
                     result_r = (
@@ -1865,3 +1796,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+        
