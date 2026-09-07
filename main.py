@@ -1,1788 +1,586 @@
-import os
-import json
-import time
-import math
-import logging
-import threading
-from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List
+import os,sys,time,json,math,signal,logging,threading,tempfile
+from datetime import datetime,timezone
+from typing import Dict,List
+from concurrent.futures import ThreadPoolExecutor,as_completed
+import requests,numpy as np,pandas as pd
 
-import numpy as np
-import pandas as pd
-import requests
-from flask import Flask, jsonify
-
-
-# ============================================================
-# SWING AI BOT V9.3 PROFESSIONAL (TAM DÜZƏLDİLMİŞ)
-# ============================================================
-
-BOT_VERSION = "9.3 PROFESSIONAL"
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-logger = logging.getLogger("SWING_AI")
-
-
+BOT_VERSION="9.6 PROFESSIONAL"
 class Config:
-    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
-    CHAT_ID: str = os.getenv("CHAT_ID", "1121794078")
+    BOT_TOKEN=os.getenv("BOT_TOKEN","")
+    CHAT_ID=os.getenv("CHAT_ID","1121794078")
+    BASE_URL="https://api.bybit.com"
+    CATEGORY="linear"
+    SCAN_TOP_N=40
+    MAX_SIGNALS_TO_SEND=3
+    CHECK_INTERVAL=300
+    MONITOR_INTERVAL=5
+    MONITOR_TF="1"
+    PARALLEL_WORKERS=6
+    TREND_TF="240"
+    SETUP_TF="60"
+    ENTRY_TF="15"
+    EMA_FAST=50
+    EMA_SLOW=200
+    RSI_PERIOD=14
+    ATR_PERIOD=14
+    SWING_LOOKBACK=5
+    MIN_SCORE=65
+    MIN_RR=2.0
+    MAX_RR=3.0
+    ACCOUNT_BALANCE=1000.0
+    RISK_PERCENT=1.0
+    MAX_ACTIVE_SIGNALS=3
+    MAX_DAILY_SIGNALS=5
+    COMMISSION_PERCENT=0.04
+    SLIPPAGE_PERCENT=0.02
+    MIN_ATR_PCT=0.15
+    MAX_ATR_PCT=8.0
+    VOLUME_LOOKBACK=20
+    MIN_VOLUME_RATIO=1.10
+    MIN_EMA_DISTANCE_PCT=0.15
+    FUNDING_FILTER_ENABLED=True
+    MAX_ABS_FUNDING=0.0015
+    OI_FILTER_ENABLED=True
+    OI_LOOKBACK=5
+    MIN_OI_CHANGE_PCT=-5.0
+    BTC_FILTER_ENABLED=True
+    CORRELATION_FILTER_ENABLED=True
+    MAX_CORRELATED_ACTIVE=2
+    CORRELATION_THRESHOLD=0.80
+    REQUIRE_RETEST=True
+    RETEST_MAX_BARS=4
+    RETEST_ATR_DISTANCE=0.60
+    CONFIRMATION_MAX_BARS_AFTER_RETEST=2
+    PARTIAL_TP_PERCENT=50.0
+    BREAKEVEN_AFTER_R=1.0
+    TRAILING_AFTER_R=1.5
+    TRAILING_ATR_MULT=1.2
+    DEFAULT_LEVERAGE=10
+    DATA_DIR="swing_bot_data"
+    SIGNAL_FILE=os.path.join(DATA_DIR,"signals.json")
+    STATS_FILE=os.path.join(DATA_DIR,"stats.json")
+    STATE_FILE=os.path.join(DATA_DIR,"state.json")
+    FLASK_PORT=int(os.getenv("PORT","10000"))
+    REQUEST_TIMEOUT=15
+    CACHE_TTL=10
+    INSTRUMENT_CACHE_TTL=3600
+    MAX_CLOSED_SIGNALS_KEPT=200
+    MAX_SIGNAL_LOG_KEPT=1000
+    TELEGRAM_MAX_RETRY_ATTEMPTS=5
+    PENDING_SIGNAL_MAX_AGE_SEC=900
+    FALLBACK_COINS=["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT","AVAXUSDT","DOGEUSDT","LINKUSDT","SUIUSDT","ARBUSDT","OPUSDT"]
 
-    BASE_URL = "https://api.bybit.com"
-    CATEGORY = "linear"
+os.makedirs(Config.DATA_DIR,exist_ok=True)
+logging.basicConfig(level=logging.INFO,format="%(asctime)s | %(levelname)s | %(message)s")
+log=logging.getLogger("SWING_AI")
+STOP_EVENT=threading.Event()
 
-    SCAN_TOP_N = 40
-    MAX_SIGNALS_TO_SEND = 3
-    CHECK_INTERVAL = 300
-    MONITOR_INTERVAL = 30
-    PARALLEL_WORKERS = 6
-
-    TREND_TF = "240"
-    SETUP_TF = "60"
-    ENTRY_TF = "15"
-
-    EMA_FAST = 50
-    EMA_SLOW = 200
-    RSI_PERIOD = 14
-    ATR_PERIOD = 14
-
-    SWING_LOOKBACK = 5
-
-    MIN_SCORE = 65
-    MIN_RR = 2.0
-    MAX_RR = 3.0
-
-    ACCOUNT_BALANCE = 1000.0
-    RISK_PERCENT = 1.0
-    MAX_ACTIVE_SIGNALS = 3
-    MAX_DAILY_SIGNALS = 5
-
-    COMMISSION_PERCENT = 0.04
-    SLIPPAGE_PERCENT = 0.02
-
-    MIN_ATR_PCT = 0.15
-    MAX_ATR_PCT = 8.0
-
-    VOLUME_LOOKBACK = 20
-    MIN_VOLUME_RATIO = 1.10
-
-    MIN_EMA_DISTANCE_PCT = 0.15
-
-    FUNDING_FILTER_ENABLED = True
-    MAX_ABS_FUNDING = 0.0015
-
-    OI_FILTER_ENABLED = True
-    OI_LOOKBACK = 5
-    MIN_OI_CHANGE_PCT = -5.0
-
-    BTC_FILTER_ENABLED = True
-
-    CORRELATION_FILTER_ENABLED = True
-    MAX_CORRELATED_ACTIVE = 2
-    CORRELATION_THRESHOLD = 0.80
-
-    NEWS_FILTER_ENABLED = False
-
-    REQUIRE_RETEST = True
-    RETEST_MAX_BARS = 4
-    RETEST_ATR_DISTANCE = 0.60
-
-    PARTIAL_TP_PERCENT = 50.0   # entry->target məsafəsinin neçə %-də "qismən" işarələnsin
-    BREAKEVEN_AFTER_R = 1.0
-    TRAILING_AFTER_R = 1.5
-    TRAILING_ATR_MULT = 1.2
-
-    DEFAULT_LEVERAGE = 10
-
-    DATA_DIR = "swing_bot_data"
-    SIGNAL_FILE = os.path.join(DATA_DIR, "signals.json")
-    STATS_FILE = os.path.join(DATA_DIR, "stats.json")
-    STATE_FILE = os.path.join(DATA_DIR, "state.json")
-
-    FLASK_PORT = int(os.getenv("PORT", "10000"))
-
-    REQUEST_TIMEOUT = 15
-    CACHE_TTL = 25
-    INSTRUMENT_CACHE_TTL = 3600
-
-    MAX_CLOSED_SIGNALS_KEPT = 200
-    MAX_SIGNAL_LOG_KEPT = 1000
-
-    FALLBACK_COINS: List[str] = [
-        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-        "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "LINKUSDT", "SUIUSDT",
-        "ARBUSDT", "OPUSDT"
-    ]
-
-    @classmethod
-    def validate(cls):
-        errors = []
-        if not cls.BOT_TOKEN:
-            errors.append("BOT_TOKEN boş ola bilməz")
-        if cls.MIN_RR < 0:
-            errors.append("MIN_RR mənfi ola bilməz")
-        if cls.MAX_RR <= cls.MIN_RR:
-            errors.append("MAX_RR > MIN_RR olmalıdır")
-        if cls.MAX_ACTIVE_SIGNALS < 1:
-            errors.append("MAX_ACTIVE_SIGNALS >= 1 olmalıdır")
-        if cls.MAX_DAILY_SIGNALS < 1:
-            errors.append("MAX_DAILY_SIGNALS >= 1 olmalıdır")
-        if cls.PARALLEL_WORKERS < 1:
-            errors.append("PARALLEL_WORKERS >= 1 olmalıdır")
-        if not (0 <= cls.MIN_SCORE <= 100):
-            errors.append("MIN_SCORE 0-100 aralığında olmalıdır")
-        if cls.EMA_FAST <= 0 or cls.EMA_SLOW <= 0:
-            errors.append("EMA periodları müsbət olmalıdır")
-        if cls.RSI_PERIOD <= 0:
-            errors.append("RSI_PERIOD müsbət olmalıdır")
-        if cls.ATR_PERIOD <= 0:
-            errors.append("ATR_PERIOD müsbət olmalıdır")
-        if not (0 < cls.RISK_PERCENT <= 100):
-            errors.append("RISK_PERCENT 0-100 aralığında olmalıdır")
-        if cls.COMMISSION_PERCENT < 0:
-            errors.append("COMMISSION_PERCENT mənfi ola bilməz")
-        if cls.SLIPPAGE_PERCENT < 0:
-            errors.append("SLIPPAGE_PERCENT mənfi ola bilməz")
-        if cls.ACCOUNT_BALANCE <= 0:
-            errors.append("ACCOUNT_BALANCE müsbət olmalıdır")
-        if not (0 <= cls.CORRELATION_THRESHOLD <= 1):
-            errors.append("CORRELATION_THRESHOLD 0-1 aralığında olmalıdır")
-        if cls.MAX_CORRELATED_ACTIVE < 1:
-            errors.append("MAX_CORRELATED_ACTIVE >= 1 olmalıdır")
-        if errors:
-            raise ValueError("Config xətaları: " + "; ".join(errors))
-
-
-os.makedirs(Config.DATA_DIR, exist_ok=True)
-
-
-def load_json(path: str, default):
+def safe_float(v,d=0.0):
     try:
-        if not os.path.exists(path):
-            return default
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        logger.error("JSON load error (%s): %s", path, e)
-        return default
+        x=float(v)
+        return d if not math.isfinite(x) else x
+    except:return d
 
-
-def save_json(path: str, data):
-    tmp = path + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, path)
-    except Exception as e:
-        logger.error("JSON save error (%s): %s", path, e)
-
+def utc_now():return datetime.now(timezone.utc)
+def utc_iso():return utc_now().isoformat()
+def utc_timestamp():return int(utc_now().timestamp())
 
 class APICache:
-    def __init__(self):
-        self.data = {}
-        self.lock = threading.RLock()
-
-    def get(self, key):
+    def __init__(self,ttl):
+        self.ttl=ttl;self.data={};self.lock=threading.RLock()
+    def get(self,k):
         with self.lock:
-            item = self.data.get(key)
-            if not item:
-                return None
-            value, timestamp = item
-            if time.time() - timestamp > Config.CACHE_TTL:
-                del self.data[key]
-                return None
-            return value
+            x=self.data.get(k)
+            if not x:return None
+            if time.time()-x[1]>self.ttl:
+                self.data.pop(k,None);return None
+            return x[0]
+    def set(self,k,v):
+        with self.lock:self.data[k]=(v,time.time())
 
-    def set(self, key, value):
-        with self.lock:
-            self.data[key] = (value, time.time())
+class InstrumentCache(APICache):pass
 
-
-class InstrumentCache:
-    def __init__(self):
-        self.data = {}
-        self.lock = threading.RLock()
-
-    def get(self, symbol):
-        with self.lock:
-            item = self.data.get(symbol)
-            if not item:
-                return None
-            value, timestamp = item
-            if time.time() - timestamp > Config.INSTRUMENT_CACHE_TTL:
-                del self.data[symbol]
-                return None
-            return value
-
-    def set(self, symbol, value):
-        with self.lock:
-            self.data[symbol] = (value, time.time())
-
-
-CACHE = APICache()
-INSTRUMENT_CACHE = InstrumentCache()
 class BybitClient:
-
     def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": f"SwingAIProfessional/{BOT_VERSION}"
-        })
+        self.base=Config.BASE_URL
+        self.cache=APICache(Config.CACHE_TTL)
+        self.instrument_cache=InstrumentCache(Config.INSTRUMENT_CACHE_TTL)
+        self.session=requests.Session()
 
-    def get(self, endpoint, params=None, use_cache=True, retries=2):
-        key = endpoint + "|" + json.dumps(params or {}, sort_keys=True)
+    def _get(self,path,params=None,key=None):
+        if key:
+            x=self.cache.get(key)
+            if x is not None:return x
+        try:
+            r=self.session.get(self.base+path,params=params or {},timeout=Config.REQUEST_TIMEOUT)
+            r.raise_for_status()
+            x=r.json()
+            if x.get("retCode")!=0:raise RuntimeError(x.get("retMsg","API error"))
+            if key:self.cache.set(key,x)
+            return x
+        except Exception as e:
+            log.warning("API %s: %s",path,e);return None
 
-        if use_cache:
-            cached = CACHE.get(key)
-            if cached is not None:
-                return cached
-
-        url = Config.BASE_URL + endpoint
-        last_err = None
-
-        for attempt in range(retries + 1):
-            try:
-                r = self.session.get(url, params=params, timeout=Config.REQUEST_TIMEOUT)
-                r.raise_for_status()
-                data = r.json()
-                if data.get("retCode", 0) != 0:
-                    raise RuntimeError(str(data.get("retMsg", "Bybit error")))
-                if use_cache:
-                    CACHE.set(key, data)
-                return data
-            except Exception as e:
-                last_err = e
-                if attempt < retries:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-
-        logger.warning("Bybit request failed %s: %s", endpoint, last_err)
-        raise last_err
-
-    def fetch_klines(self, symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
-        data = self.get("/v5/market/kline", {
-            "category": Config.CATEGORY,
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit
-        })
-        rows = data["result"]["list"]
-        rows = list(reversed(rows))
-        df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"])
-        for c in ["open", "high", "low", "close", "volume", "turnover"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["timestamp"] = pd.to_datetime(pd.to_numeric(df["timestamp"]), unit="ms", utc=True)
-        df = df.dropna().reset_index(drop=True)
-
-        if len(df) > 2:
-            now = pd.Timestamp.now(tz="UTC")
-            last_time = df.iloc[-1]["timestamp"]
-            if interval == "D":
-                candle_seconds = 86400
-            else:
-                candle_seconds = int(interval) * 60
-            age = (now.to_pydatetime() - last_time.to_pydatetime()).total_seconds()
-            if age < candle_seconds:
-                df = df.iloc[:-1].copy()
-
+    def fetch_klines(self,symbol,interval,limit=300):
+        x=self._get("/v5/market/kline",{"category":Config.CATEGORY,"symbol":symbol,"interval":interval,"limit":limit},f"k:{symbol}:{interval}:{limit}")
+        if not x:return pd.DataFrame()
+        rows=x.get("result",{}).get("list",[])
+        if not rows:return pd.DataFrame()
+        rows=list(reversed(rows))
+        cols=["timestamp","open","high","low","close","volume","turnover"]
+        df=pd.DataFrame(rows,columns=cols)
+        for c in cols:df[c]=pd.to_numeric(df[c],errors="coerce")
+        df=df.dropna(subset=["open","high","low","close","volume"])
+        if len(df)>1:df=df.iloc[:-1]
         return df.reset_index(drop=True)
 
-    def fetch_tickers(self):
-        data = self.get("/v5/market/tickers", {"category": Config.CATEGORY}, use_cache=False)
-        return data["result"]["list"]
+    def fetch_ticker(self,symbol):
+        x=self._get("/v5/market/tickers",{"category":Config.CATEGORY,"symbol":symbol},f"t:{symbol}")
+        rows=x.get("result",{}).get("list",[]) if x else []
+        if not rows:return {}
+        a=rows[0]
+        return {"last_price":safe_float(a.get("lastPrice")),"price_change_24h":safe_float(a.get("price24hPcnt"))*100,"funding_rate":safe_float(a.get("fundingRate")),"open_interest":safe_float(a.get("openInterest"))}
 
-    def fetch_funding(self, symbol):
-        data = self.get("/v5/market/funding/history",
-                         {"category": Config.CATEGORY, "symbol": symbol, "limit": 1}, use_cache=False)
-        rows = data["result"]["list"]
-        if not rows:
-            return 0.0
-        return float(rows[0].get("fundingRate", 0))
+    def fetch_open_interest(self,symbol,interval="1h",limit=10):
+        x=self._get("/v5/market/open-interest",{"category":Config.CATEGORY,"symbol":symbol,"intervalTime":interval,"limit":limit},f"oi:{symbol}:{interval}:{limit}")
+        rows=x.get("result",{}).get("list",[]) if x else []
+        if not rows:return pd.DataFrame()
+        df=pd.DataFrame(rows)
+        for c in ["openInterest","timestamp"]:
+            if c in df:df[c]=pd.to_numeric(df[c],errors="coerce")
+        return df.sort_values("timestamp").reset_index(drop=True) if "timestamp" in df else df
 
-    def fetch_open_interest(self, symbol):
-        data = self.get("/v5/market/open-interest",
-                         {"category": Config.CATEGORY, "symbol": symbol,
-                          "intervalTime": "1h", "limit": Config.OI_LOOKBACK}, use_cache=False)
-        rows = data["result"]["list"]
-        if len(rows) < 2:
-            return 0.0
-        values = [float(x["openInterest"]) for x in rows]
-        old = values[-1]
-        new = values[0]
-        if old == 0:
-            return 0.0
-        return (new - old) / old * 100.0
+    def fetch_orderbook(self,symbol,limit=25):
+        x=self._get("/v5/market/orderbook",{"category":Config.CATEGORY,"symbol":symbol,"limit":limit},f"b:{symbol}")
+        return x.get("result",{}) if x else {}
 
-    def fetch_orderbook(self, symbol):
-        return self.get("/v5/market/orderbook",
-                         {"category": Config.CATEGORY, "symbol": symbol, "limit": 5}, use_cache=False)
+    def fetch_instrument(self,symbol):
+        x=self.instrument_cache.get(symbol)
+        if x is not None:return x
+        d=self._get("/v5/market/instruments-info",{"category":Config.CATEGORY,"symbol":symbol},f"i:{symbol}")
+        rows=d.get("result",{}).get("list",[]) if d else []
+        if not rows:return {}
+        a=rows[0];p=a.get("priceFilter",{});q=a.get("lotSizeFilter",{})
+        x={"tick_size":safe_float(p.get("tickSize")),"qty_step":safe_float(q.get("qtyStep")),"min_order_qty":safe_float(q.get("minOrderQty")),"max_order_qty":safe_float(q.get("maxOrderQty"))}
+        self.instrument_cache.set(symbol,x);return x
 
-    def fetch_instrument(self, symbol):
-        cached = INSTRUMENT_CACHE.get(symbol)
-        if cached is not None:
-            return cached
-        data = self.get("/v5/market/instruments-info",
-                         {"category": Config.CATEGORY, "symbol": symbol})
-        rows = data["result"]["list"]
-        result = rows[0] if rows else {}
-        INSTRUMENT_CACHE.set(symbol, result)
-        return result
+BYBIT=BybitClient()
 
-    def fetch_top_symbols(self):
-        try:
-            tickers = self.fetch_tickers()
-            clean = []
-            for t in tickers:
-                symbol = t.get("symbol", "")
-                if not symbol.endswith("USDT"):
-                    continue
-                if t.get("status") not in [None, "Trading"]:
-                    continue
-                try:
-                    turnover = float(t.get("turnover24h", 0))
-                except Exception:
-                    turnover = 0
-                if turnover <= 0:
-                    continue
-                clean.append((symbol, turnover))
-            clean.sort(key=lambda x: x[1], reverse=True)
-            symbols = [x[0] for x in clean[:Config.SCAN_TOP_N]]
-            if symbols:
-                return symbols
-        except Exception as e:
-            logger.warning("Top symbol scan failed: %s", e)
-        return Config.FALLBACK_COINS.copy()
-
-
-BYBIT = BybitClient()
-# ============================================================
-# INDICATORS
-# ============================================================
-
+def validate_config():
+    if not 0<=Config.MIN_SCORE<=100:raise ValueError("MIN_SCORE")
+    if Config.MIN_RR<=0 or Config.MAX_RR<Config.MIN_RR:raise ValueError("RR")
+    if Config.RISK_PERCENT<=0:raise ValueError("RISK_PERCENT")
+    return True
 class Indicators:
-
     @staticmethod
-    def ema(series, period):
-        return series.ewm(span=period, adjust=False).mean()
-
+    def ema(s,n):return s.ewm(span=n,adjust=False).mean()
     @staticmethod
-    def rsi(series, period=14):
-        delta = series.diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-        rs = avg_gain / avg_loss.replace(0, np.nan)
-        rsi = 100 - (100 / (1 + rs))
-        return rsi.fillna(50)
-
+    def rsi(s,n=14):
+        d=s.diff();g=d.clip(lower=0);l=-d.clip(upper=0)
+        ag=g.ewm(alpha=1/n,adjust=False).mean();al=l.ewm(alpha=1/n,adjust=False).mean()
+        rs=ag/al.replace(0,np.nan);r=100-(100/(1+rs))
+        r=r.where(al!=0,100);return r.where(~((ag==0)&(al==0)),50)
     @staticmethod
-    def atr(df, period=14):
-        prev_close = df["close"].shift(1)
-        tr1 = df["high"] - df["low"]
-        tr2 = (df["high"] - prev_close).abs()
-        tr3 = (df["low"] - prev_close).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        return tr.ewm(alpha=1 / period, adjust=False).mean()
-
+    def atr(df,n=14):
+        pc=df.close.shift(1)
+        tr=pd.concat([df.high-df.low,(df.high-pc).abs(),(df.low-pc).abs()],axis=1).max(axis=1)
+        return tr.ewm(alpha=1/n,adjust=False).mean()
     @staticmethod
-    def add_all(df):
-        df = df.copy()
-        df["ema50"] = Indicators.ema(df["close"], Config.EMA_FAST)
-        df["ema200"] = Indicators.ema(df["close"], Config.EMA_SLOW)
-        df["rsi"] = Indicators.rsi(df["close"], Config.RSI_PERIOD)
-        df["atr"] = Indicators.atr(df, Config.ATR_PERIOD)
-        df["vol_ma"] = df["volume"].rolling(Config.VOLUME_LOOKBACK).mean()
-        return df
-
-
-# ============================================================
-# SWING STRUCTURE
-# DÜZƏLİŞ B: bütün metodlar indi əvvəlcədən hesablanmış `swings`
-# (highs, lows) qəbul edə bilir - eyni df üçün 4 dəfə təkrar
-# axtarış aparılmır (setup_direction/premium_discount/
-# nearest_stop/nearest_target artıq bunu paylaşır).
-# ============================================================
+    def add(df):
+        x=df.copy()
+        x["ema_fast"]=Indicators.ema(x.close,Config.EMA_FAST)
+        x["ema_slow"]=Indicators.ema(x.close,Config.EMA_SLOW)
+        x["rsi"]=Indicators.rsi(x.close,Config.RSI_PERIOD)
+        x["atr"]=Indicators.atr(x,Config.ATR_PERIOD)
+        x["volume_ma"]=x.volume.rolling(Config.VOLUME_LOOKBACK).mean()
+        x["volume_ratio"]=x.volume/x.volume_ma.replace(0,np.nan)
+        x["ema_distance_pct"]=(x.ema_fast-x.ema_slow)/x.close*100
+        x["atr_pct"]=x.atr/x.close*100
+        return x
 
 class Structure:
-
     @staticmethod
-    def swing_points(df):
-        n = Config.SWING_LOOKBACK
-        highs = []
-        lows = []
-        if len(df) < n * 2 + 5:
-            return highs, lows
-        for i in range(n, len(df) - n):
-            h = df["high"].iloc[i]
-            l = df["low"].iloc[i]
-            left_high = df["high"].iloc[i - n:i]
-            right_high = df["high"].iloc[i + 1:i + n + 1]
-            left_low = df["low"].iloc[i - n:i]
-            right_low = df["low"].iloc[i + 1:i + n + 1]
-            if h > left_high.max() and h > right_high.max():
-                highs.append((i, float(h)))
-            if l < left_low.min() and l < right_low.min():
-                lows.append((i, float(l)))
-        return highs, lows
-
+    def swings(df,left=5,right=5):
+        h=df.high.to_numpy();l=df.low.to_numpy();sh=[];sl=[]
+        for i in range(left,len(df)-right):
+            if h[i]>=max(h[i-left:i]) and h[i]>max(h[i+1:i+right+1]):sh.append((i,float(h[i])))
+            if l[i]<=min(l[i-left:i]) and l[i]<min(l[i+1:i+right+1]):sl.append((i,float(l[i])))
+        return sh,sl
     @staticmethod
-    def trend_structure(df, swings=None):
-        highs, lows = swings if swings is not None else Structure.swing_points(df)
-        if len(highs) < 2 or len(lows) < 2:
-            return "neutral"
-        h1, h2 = highs[-2][1], highs[-1][1]
-        l1, l2 = lows[-2][1], lows[-1][1]
-        if h2 > h1 and l2 > l1:
-            return "bullish"
-        if h2 < h1 and l2 < l1:
-            return "bearish"
+    def trend(df):
+        sh,sl=Structure.swings(df)
+        if len(sh)<2 or len(sl)<2:return "neutral"
+        if sh[-1][1]>sh[-2][1] and sl[-1][1]>sl[-2][1]:return "bullish"
+        if sh[-1][1]<sh[-2][1] and sl[-1][1]<sl[-2][1]:return "bearish"
         return "neutral"
 
-    @staticmethod
-    def latest_high(df, swings=None):
-        highs, _ = swings if swings is not None else Structure.swing_points(df)
-        return highs[-1] if highs else None
-
-    @staticmethod
-    def latest_low(df, swings=None):
-        _, lows = swings if swings is not None else Structure.swing_points(df)
-        return lows[-1] if lows else None
-
-
-# ============================================================
-# REGIME FILTER
-# ============================================================
-
-class RegimeFilter:
-
+class Regime:
     @staticmethod
     def analyze(df):
-        if len(df) < 220:
-            return {"bull": False, "bear": False, "quality": 0, "distance": 0.0}
-        last = df.iloc[-1]
-        ema50 = float(last["ema50"])
-        ema200 = float(last["ema200"])
-        price = float(last["close"])
-        if ema200 == 0:
-            return {"bull": False, "bear": False, "quality": 0, "distance": 0.0}
-        distance = abs(ema50 - ema200) / ema200 * 100
-        structure = Structure.trend_structure(df)
-        bull = (price > ema200 and ema50 > ema200 and structure == "bullish")
-        bear = (price < ema200 and ema50 < ema200 and structure == "bearish")
-        quality = min(100, int(distance * 25))
-        return {"bull": bull, "bear": bear, "quality": quality, "distance": distance}
+        if len(df)<220:return {"direction":"neutral","quality":0}
+        x=df.iloc[-1];st=Structure.trend(df)
+        dist=abs(safe_float(x.ema_distance_pct));atr=safe_float(x.atr_pct)
+        q=min(dist,1)*40+min(atr/3,1)*20+(40 if st!="neutral" else 0)
+        long_ok=x.close>x.ema_slow and x.ema_fast>x.ema_slow and st=="bullish" and dist>=Config.MIN_EMA_DISTANCE_PCT
+        short_ok=x.close<x.ema_slow and x.ema_fast<x.ema_slow and st=="bearish" and dist>=Config.MIN_EMA_DISTANCE_PCT
+        return {"direction":"long" if long_ok else "short" if short_ok else "neutral","quality":min(100,q),"structure":st}
 
-
-# ============================================================
-# VOLUME FILTER
-# ============================================================
-
-class VolumeFilter:
-
+def valid_df(df,n):
+    return isinstance(df,pd.DataFrame) and len(df)>=n and all(c in df.columns for c in ["open","high","low","close","volume"])
+class Strategy:
     @staticmethod
-    def check(df):
-        if len(df) < Config.VOLUME_LOOKBACK + 5:
-            return False, 0.0
-        last = df.iloc[-1]
-        ma = float(last["vol_ma"])
-        if ma <= 0:
-            return False, 0.0
-        ratio = float(last["volume"]) / ma
-        return ratio >= Config.MIN_VOLUME_RATIO, ratio
-
-
-# ============================================================
-# ATR FILTER
-# ============================================================
-
-class ATRFilter:
-
+    def setup(df,d):
+        if len(df)<100:return False
+        x=df.iloc[-1]
+        return x.ema_fast>x.ema_slow and x.close>x.ema_fast if d=="long" else x.ema_fast<x.ema_slow and x.close<x.ema_fast
     @staticmethod
-    def check(df):
-        last = df.iloc[-1]
-        price = float(last["close"])
-        atr = float(last["atr"])
-        if price <= 0 or atr <= 0:
-            return False, 0.0
-        atr_pct = atr / price * 100
-        valid = Config.MIN_ATR_PCT <= atr_pct <= Config.MAX_ATR_PCT
-        return valid, atr_pct
-
-
-# ============================================================
-# FRESHNESS FILTER
-# ============================================================
-
-class FreshnessFilter:
-
+    def pullback(df,d):
+        x=df.iloc[-Config.RETEST_MAX_BARS:];atr=safe_float(df.atr.iloc[-1]);ema=safe_float(df.ema_fast.iloc[-1])
+        if atr<=0:return False
+        return bool((x.low<=ema+atr*Config.RETEST_ATR_DISTANCE).any()) if d=="long" else bool((x.high>=ema-atr*Config.RETEST_ATR_DISTANCE).any())
     @staticmethod
-    def check(df):
-        if len(df) < 2:
-            return False
-        last_time = df["timestamp"].iloc[-1]
-        now = pd.Timestamp.now(tz="UTC")
-        age_minutes = (now - last_time).total_seconds() / 60
-        return age_minutes <= 30
-# ============================================================
-# STRATEGY ENGINE
-# DÜZƏLİŞ A+B: trend_4h artıq hazır `regime` qəbul edə bilir;
-# setup_direction/premium_discount/nearest_stop/nearest_target
-# artıq hazır `swings` qəbul edə bilir.
-# ============================================================
-
-class StrategyEngine:
-
+    def rsi_ok(df,d):
+        if len(df)<3:return False
+        a=safe_float(df.rsi.iloc[-2]);b=safe_float(df.rsi.iloc[-1])
+        return a<50<=b if d=="long" else a>50>=b
     @staticmethod
-    def trend_4h(df, regime=None):
-        if len(df) < 220:
-            return "neutral"
-        if regime is None:
-            regime = RegimeFilter.analyze(df)
-        if regime["bull"]:
-            return "long"
-        if regime["bear"]:
-            return "short"
-        return "neutral"
-
+    def bos(df,d):
+        sh,sl=Structure.swings(df)
+        if d=="long" and sh:
+            level=sh[-1][1]
+            for i in range(sh[-1][0]+1,len(df)):
+                if df.close.iloc[i]>level:return {"level":level,"bar":i}
+        if d=="short" and sl:
+            level=sl[-1][1]
+            for i in range(sl[-1][0]+1,len(df)):
+                if df.close.iloc[i]<level:return {"level":level,"bar":i}
+        return None
     @staticmethod
-    def setup_direction(df, swings=None):
-        direction = Structure.trend_structure(df, swings=swings)
-        if direction == "bullish":
-            return "long"
-        if direction == "bearish":
-            return "short"
-        return "neutral"
-
+    def strong(df,i,d):
+        if i<1 or i>=len(df):return False
+        x=df.iloc[i];p=df.iloc[i-1];atr=safe_float(x.atr)
+        if atr<=0 or abs(x.close-x.open)<atr*.5:return False
+        if d=="long":return x.close>x.open and x.close>p.close and x.high-x.close<=atr*.25
+        return x.close<x.open and x.close<p.close and x.close-x.low<=atr*.25
     @staticmethod
-    def pullback(df, direction):
-        if len(df) < 10:
-            return False
-        recent = df.iloc[-4:]
-        if direction == "long":
-            for _, row in recent.iterrows():
-                if row["low"] <= row["ema50"] + row["atr"] * Config.RETEST_ATR_DISTANCE:
-                    return True
-            return False
-        for _, row in recent.iterrows():
-            if row["high"] >= row["ema50"] - row["atr"] * Config.RETEST_ATR_DISTANCE:
-                return True
-        return False
-
+    def sequence(df,bos,d):
+        if not bos:return None
+        level=bos["level"];start=bos["bar"]+1
+        for i in range(start,min(len(df),start+Config.RETEST_MAX_BARS)):
+            x=df.iloc[i];atr=safe_float(x.atr)
+            touch=x.low<=level+atr*Config.RETEST_ATR_DISTANCE if d=="long" else x.high>=level-atr*Config.RETEST_ATR_DISTANCE
+            hold=x.close>=level if d=="long" else x.close<=level
+            if touch and hold:
+                for j in range(i+1,min(len(df),i+1+Config.CONFIRMATION_MAX_BARS_AFTER_RETEST)):
+                    if Strategy.strong(df,j,d):
+                        if d=="long" and df.close.iloc[j]>level:return {"bos":bos["bar"],"retest":i,"confirm":j,"level":level}
+                        if d=="short" and df.close.iloc[j]<level:return {"bos":bos["bar"],"retest":i,"confirm":j,"level":level}
+        return None
     @staticmethod
-    def rsi_reversal(df, direction):
-        if len(df) < 5:
-            return False
-        r = df["rsi"].iloc[-5:]
-        if direction == "long":
-            return (r.iloc[-5] < 50 and r.iloc[-2] <= 50 and r.iloc[-1] > 50 and r.iloc[-1] > r.iloc[-2])
-        return (r.iloc[-5] > 50 and r.iloc[-2] >= 50 and r.iloc[-1] < 50 and r.iloc[-1] < r.iloc[-2])
-
+    def stop(df,e,d):
+        sh,sl=Structure.swings(df);atr=safe_float(df.atr.iloc[-1])
+        if d=="long":
+            v=[x for _,x in sl if x<e];return max(v)-atr*.1 if v else e-atr*1.5
+        v=[x for _,x in sh if x>e];return min(v)+atr*.1 if v else e+atr*1.5
     @staticmethod
-    def fresh_bos(df, direction):
-        if len(df) < 20:
-            return False, None
-        highs, lows = Structure.swing_points(df)
-        if direction == "long":
-            if not highs:
-                return False, None
-            _, level = highs[-1]
-            prev_close = float(df["close"].iloc[-2])
-            last_close = float(df["close"].iloc[-1])
-            return (prev_close <= level and last_close > level), level
-        if not lows:
-            return False, None
-        _, level = lows[-1]
-        prev_close = float(df["close"].iloc[-2])
-        last_close = float(df["close"].iloc[-1])
-        return (prev_close >= level and last_close < level), level
-
+    def target(e,sl,d):
+        r=abs(e-sl)
+        return e+r*Config.MIN_RR if d=="long" else e-r*Config.MIN_RR
     @staticmethod
-    def strong_candle(df, direction):
-        if len(df) < 3:
-            return False
-        row = df.iloc[-1]
-        body = abs(float(row["close"]) - float(row["open"]))
-        atr = float(row["atr"])
-        if atr <= 0:
-            return False
-        body_ok = body >= atr * 0.50
-        if direction == "long":
-            return (body_ok and row["close"] > row["open"] and row["close"] > df["close"].iloc[-2])
-        return (body_ok and row["close"] < row["open"] and row["close"] < df["close"].iloc[-2])
-
+    def pd_zone(df,d):
+        hi=df.high.iloc[-50:].max();lo=df.low.iloc[-50:].min();mid=(hi+lo)/2;p=df.close.iloc[-1]
+        return p<=mid if d=="long" else p>=mid
+class MarketFilters:
     @staticmethod
-    def premium_discount(df, direction, swings=None):
-        highs, lows = swings if swings is not None else Structure.swing_points(df)
-        if not highs or not lows:
-            return False
-        high, low = highs[-1][1], lows[-1][1]
-        if high <= low:
-            return False
-        price = float(df["close"].iloc[-1])
-        midpoint = (high + low) / 2
-        if direction == "long":
-            return price <= midpoint
-        return price >= midpoint
-
+    def funding(x):return not Config.FUNDING_FILTER_ENABLED or abs(safe_float(x))<=Config.MAX_ABS_FUNDING
     @staticmethod
-    def nearest_stop(df, direction, swings=None):
-        atr = float(df["atr"].iloc[-1])
-        highs, lows = swings if swings is not None else Structure.swing_points(df)
-        if direction == "long":
-            if not lows:
-                return None
-            return float(lows[-1][1]) - atr * 0.20
-        if not highs:
-            return None
-        return float(highs[-1][1]) + atr * 0.20
-
+    def oi_change(df):
+        if df is None or len(df)<2:return 0
+        a=safe_float(df.openInterest.iloc[0]);b=safe_float(df.openInterest.iloc[-1])
+        return (b-a)/a*100 if a>0 else 0
     @staticmethod
-    def nearest_target(df, direction, entry, swings=None):
-        highs, lows = swings if swings is not None else Structure.swing_points(df)
-        if direction == "long":
-            targets = [price for _, price in highs if price > entry]
-            return min(targets) if targets else None
-        targets = [price for _, price in lows if price < entry]
-        return max(targets) if targets else None
-
-
-# ============================================================
-# RETEST CONFIRMATION
-# ============================================================
-
-class RetestFilter:
-
+    def oi(x):return not Config.OI_FILTER_ENABLED or x>=Config.MIN_OI_CHANGE_PCT
     @staticmethod
-    def check(df, direction, bos_level):
-        if not Config.REQUIRE_RETEST:
-            return True
-        if bos_level is None:
-            return False
-        atr = float(df["atr"].iloc[-1])
-        recent = df.iloc[-Config.RETEST_MAX_BARS:]
-        for _, row in recent.iterrows():
-            if direction == "long":
-                touched = row["low"] <= bos_level + atr * Config.RETEST_ATR_DISTANCE
-                held = row["close"] >= bos_level
-                if touched and held:
-                    return True
-            else:
-                touched = row["high"] >= bos_level - atr * Config.RETEST_ATR_DISTANCE
-                held = row["close"] <= bos_level
-                if touched and held:
-                    return True
-        return False
-
-
-# ============================================================
-# BTC MARKET FILTER
-# ============================================================
-
-class BTCFilter:
-
+    def btc(x,d,s):
+        if not Config.BTC_FILTER_ENABLED or s=="BTCUSDT" or abs(x)<.5:return True
+        return x>0 if d=="long" else x<0
     @staticmethod
-    def get_bias():
-        if not Config.BTC_FILTER_ENABLED:
-            return "neutral"
+    def spread(book):
         try:
-            df = BYBIT.fetch_klines("BTCUSDT", Config.TREND_TF, 250)
-            df = Indicators.add_all(df)
-            if len(df) < 220:
-                return "neutral"
-            last = df.iloc[-1]
-            if last["close"] > last["ema200"] and last["ema50"] > last["ema200"]:
-                return "bull"
-            if last["close"] < last["ema200"] and last["ema50"] < last["ema200"]:
-                return "bear"
-            return "neutral"
-        except Exception:
-            return "neutral"
-
+            bid=safe_float(book["b"][0][0]);ask=safe_float(book["a"][0][0]);mid=(bid+ask)/2
+            return (ask-bid)/mid*100 if mid>0 else 999
+        except:return 999
     @staticmethod
-    def allows(direction):
-        if not Config.BTC_FILTER_ENABLED:
-            return True
-        bias = BTCFilter.get_bias()
-        if direction == "long":
-            return bias != "bear"
-        return bias != "bull"
+    def correlation(client,symbol):
+        if not Config.CORRELATION_FILTER_ENABLED:return True
+        active=TRACKER.active_signals()
+        if not active:return True
+        base=client.fetch_klines(symbol,Config.ENTRY_TF,80)
+        if len(base)<50:return True
+        a=base.close.pct_change().dropna()
+        for s in active:
+            if s["symbol"]==symbol:continue
+            other=client.fetch_klines(s["symbol"],Config.ENTRY_TF,80)
+            if len(other)<50:continue
+            b=other.close.pct_change().dropna()
+            n=min(len(a),len(b))
+            if n<30:continue
+            corr=a.iloc[-n:].corr(b.iloc[-n:])
+            if safe_float(corr)>=Config.CORRELATION_THRESHOLD:
+                count=sum(1 for z in active if z["symbol"]!=symbol and z["direction"]==s["direction"])
+                if count>=Config.MAX_CORRELATED_ACTIVE:return False
+        return True
 
-
-# ============================================================
-# FUNDING FILTER
-# ============================================================
-
-class FundingFilter:
-
+class Risk:
     @staticmethod
-    def check(symbol, direction):
-        if not Config.FUNDING_FILTER_ENABLED:
-            return True, 0.0
-        try:
-            funding = BYBIT.fetch_funding(symbol)
-            if abs(funding) > Config.MAX_ABS_FUNDING:
-                return False, funding
-            if direction == "long" and funding > Config.MAX_ABS_FUNDING * 0.7:
-                return False, funding
-            if direction == "short" and funding < -Config.MAX_ABS_FUNDING * 0.7:
-                return False, funding
-            return True, funding
-        except Exception:
-            return True, 0.0
-
-
-# ============================================================
-# OPEN INTEREST FILTER
-# ============================================================
-
-class OIFilter:
-
+    def size(e,sl):
+        dist=abs(e-sl)
+        if e<=0 or dist<=0:return {}
+        amount=Config.ACCOUNT_BALANCE*Config.RISK_PERCENT/100
+        return {"risk_amount":amount,"qty":amount/dist}
     @staticmethod
-    def check(symbol, direction):
-        if not Config.OI_FILTER_ENABLED:
-            return True, 0.0
-        try:
-            change = BYBIT.fetch_open_interest(symbol)
-            if change < Config.MIN_OI_CHANGE_PCT:
-                return False, change
-            return True, change
-        except Exception:
-            return True, 0.0
-
-
-# ============================================================
-# SPREAD FILTER
-# ============================================================
-
-class SpreadFilter:
-
+    def leverage(atr,e):
+        r=atr/e
+        return min(2 if r>.05 else 3 if r>.03 else 4 if r>.02 else 5,Config.DEFAULT_LEVERAGE)
     @staticmethod
-    def check(symbol):
-        try:
-            data = BYBIT.fetch_orderbook(symbol)
-            result = data["result"]
-            bids = result.get("b", [])
-            asks = result.get("a", [])
-            if not bids or not asks:
-                return False, 999.0
-            bid = float(bids[0][0])
-            ask = float(asks[0][0])
-            if bid <= 0 or ask <= 0:
-                return False, 999.0
-            mid = (bid + ask) / 2
-            spread = (ask - bid) / mid * 100
-            return spread <= 0.15, spread
-        except Exception:
-            return False, 999.0
-
-
-# ============================================================
-# CORRELATION FILTER
-# ============================================================
-
-class CorrelationFilter:
-
-    @staticmethod
-    def _corr_between(sym1, sym2):
-        try:
-            df1 = BYBIT.fetch_klines(sym1, Config.SETUP_TF, 100)
-            df2 = BYBIT.fetch_klines(sym2, Config.SETUP_TF, 100)
-            if len(df1) < 50 or len(df2) < 50:
-                return 0.0
-            ret1 = df1["close"].pct_change().dropna()
-            ret2 = df2["close"].pct_change().dropna()
-            n = min(len(ret1), len(ret2))
-            if n < 30:
-                return 0.0
-            corr = float(ret1.iloc[-n:].corr(ret2.iloc[-n:]))
-            return abs(corr) if not math.isnan(corr) else 0.0
-        except Exception:
-            return 0.0
-
-    @staticmethod
-    def allows(symbol, active_signals):
-        if not Config.CORRELATION_FILTER_ENABLED:
-            return True, 0.0
-        correlated_count = 0
-        max_corr = 0.0
-        for signal in active_signals:
-            other_symbol = signal.get("symbol")
-            if not other_symbol or other_symbol == symbol:
-                continue
-            corr = CorrelationFilter._corr_between(symbol, other_symbol)
-            max_corr = max(max_corr, corr)
-            if corr >= Config.CORRELATION_THRESHOLD:
-                correlated_count += 1
-        if correlated_count >= Config.MAX_CORRELATED_ACTIVE:
-            return False, max_corr
-        return True, max_corr
-
-
-# ============================================================
-# NEWS FILTER
-# ============================================================
-
-class NewsFilter:
-
-    @staticmethod
-    def check(symbol):
-        if not Config.NEWS_FILTER_ENABLED:
-            return True, "disabled"
-        return True, "not_configured"
-# ============================================================
-# PRECISION
-# ============================================================
+    def costs(notional):
+        return notional*(Config.COMMISSION_PERCENT+Config.SLIPPAGE_PERCENT)/100
 
 class Precision:
-
     @staticmethod
-    def decimals(step):
-        try:
-            text = format(float(step), "f").rstrip("0")
-            if "." not in text:
-                return 0
-            return len(text.split(".")[1])
-        except Exception:
-            return 8
-
-    @staticmethod
-    def round_step(value, step):
-        if not step or step <= 0:
-            return value
-        decimals = Precision.decimals(step)
-        result = math.floor(value / step) * step
-        return round(result, decimals)
-
-    @staticmethod
-    def price(symbol, value):
-        try:
-            info = BYBIT.fetch_instrument(symbol)
-            tick = float(info["priceFilter"]["tickSize"])
-            return Precision.round_step(value, tick)
-        except Exception:
-            return float(value)
-
-    @staticmethod
-    def quantity(symbol, qty):
-        try:
-            info = BYBIT.fetch_instrument(symbol)
-            step = float(info["lotSizeFilter"]["qtyStep"])
-            min_qty = float(info["lotSizeFilter"].get("minOrderQty", 0))
-            qty = Precision.round_step(qty, step)
-            if qty < min_qty:
-                return 0.0
-            return qty
-        except Exception:
-            return round(qty, 6)
-
-
-# ============================================================
-# RISK ENGINE
-# ============================================================
-
-class RiskEngine:
-
-    @staticmethod
-    def position_size(symbol, entry, stop):
-        risk_amount = Config.ACCOUNT_BALANCE * Config.RISK_PERCENT / 100
-        distance = abs(entry - stop)
-        if distance <= 0:
-            return 0.0
-        qty = risk_amount / distance
-        return Precision.quantity(symbol, qty)
-
-    @staticmethod
-    def rr(entry, stop, target):
-        risk = abs(entry - stop)
-        reward = abs(target - entry)
-        if risk <= 0:
-            return 0.0
-        return reward / risk
-
-    @staticmethod
-    def liquidation_estimate(entry, direction, leverage=None):
-        leverage = leverage or Config.DEFAULT_LEVERAGE
-        if leverage <= 0:
-            return None
-        if direction == "long":
-            return entry * (1 - 0.9 / leverage)
-        return entry * (1 + 0.9 / leverage)
-
-
-# ============================================================
-# SCORE ENGINE — yalnız keyfiyyət göstəriciləri (hard-filter deyil)
-# ============================================================
-
-class ScoreEngine:
-
-    @staticmethod
-    def calculate(data):
-        score = 0.0
-
-        rr = data.get("rr", 0.0)
-        rr_range = max(0.0001, Config.MAX_RR - Config.MIN_RR)
-        score += max(0.0, min(1.0, (rr - Config.MIN_RR) / rr_range)) * 30
-
-        ratio = data.get("volume_ratio", 0.0)
-        score += max(0.0, min(1.0, (ratio - Config.MIN_VOLUME_RATIO) / 1.0)) * 20
-
-        regime_quality = data.get("regime_quality", 0)
-        score += (min(100, regime_quality) / 100) * 20
-
-        funding = abs(data.get("funding", 0.0))
-        score += max(0.0, 1 - (funding / max(Config.MAX_ABS_FUNDING, 1e-9))) * 15
-
-        oi_change = data.get("oi_change", 0.0)
-        if oi_change >= 0:
-            score += 10.0
-        else:
-            oi_range = max(0.0001, abs(Config.MIN_OI_CHANGE_PCT))
-            score += max(0.0, 1 - abs(oi_change) / oi_range) * 10
-
-        spread = data.get("spread_pct", 999.0)
-        score += max(0.0, 1 - spread / 0.15) * 5
-
-        return round(min(100.0, max(0.0, score)), 1)
-
-
-# ============================================================
-# SIGNAL SCANNER
-# DÜZƏLİŞ A: regime bir dəfə hesablanır (trend + score üçün paylaşılır)
-# DÜZƏLİŞ B: swing_points(df1) bir dəfə hesablanır, 4 funksiyaya ötürülür
-# DÜZƏLİŞ C: original_risk artıq Precision-dan SONRAKI entry/stop-dan hesablanır
-# ============================================================
-
+    def step(v,s):
+        return v if s<=0 else math.floor(v/s+1e-12)*s
 class SignalScanner:
-
-    def analyze_symbol(self, symbol, manual=False):
-        reasons = []
+    def __init__(self,client):self.client=client
+    def analyze(self,symbol):
         try:
-            df4 = BYBIT.fetch_klines(symbol, Config.TREND_TF, 300)
-            df1 = BYBIT.fetch_klines(symbol, Config.SETUP_TF, 300)
-            df15 = BYBIT.fetch_klines(symbol, Config.ENTRY_TF, 200)
-            if len(df4) < 220 or len(df1) < 80 or len(df15) < 50:
-                return None
-
-            df4 = Indicators.add_all(df4)
-            df1 = Indicators.add_all(df1)
-            df15 = Indicators.add_all(df15)
-
-            fresh_ok = FreshnessFilter.check(df15)
-            if not fresh_ok:
-                reasons.append("stale_market_data")
-
-            # DÜZƏLİŞ A: regime bir dəfə hesablanır
-            regime = RegimeFilter.analyze(df4)
-            trend = StrategyEngine.trend_4h(df4, regime=regime)
-            if trend == "neutral":
-                return None
-            direction = trend
-
-            # DÜZƏLİŞ B: swing_points(df1) bir dəfə hesablanır
-            swings_1h = Structure.swing_points(df1)
-
-            setup_direction = StrategyEngine.setup_direction(df1, swings=swings_1h)
-            if setup_direction != direction:
-                return None
-
-            pullback_ok = StrategyEngine.pullback(df1, direction)
-            if not pullback_ok:
-                reasons.append("no_pullback")
-
-            rsi_ok = StrategyEngine.rsi_reversal(df1, direction)
-            if not rsi_ok:
-                reasons.append("no_rsi_reversal")
-
-            bos_ok, bos_level = StrategyEngine.fresh_bos(df15, direction)
-            if not bos_ok:
-                reasons.append("no_fresh_bos")
-
-            candle_ok = StrategyEngine.strong_candle(df15, direction)
-            if not candle_ok:
-                reasons.append("weak_candle")
-
-            volume_ok, volume_ratio = VolumeFilter.check(df15)
-            if not volume_ok:
-                reasons.append("low_volume")
-
-            atr_ok, atr_pct = ATRFilter.check(df15)
-            if not atr_ok:
-                reasons.append("bad_atr_regime")
-
-            btc_ok = BTCFilter.allows(direction)
-            if not btc_ok:
-                reasons.append("btc_filter")
-
-            funding_ok, funding = FundingFilter.check(symbol, direction)
-            if not funding_ok:
-                reasons.append("funding_extreme")
-
-            oi_ok, oi_change = OIFilter.check(symbol, direction)
-            if not oi_ok:
-                reasons.append("open_interest_filter")
-
-            spread_ok, spread = SpreadFilter.check(symbol)
-            if not spread_ok:
-                reasons.append("spread_too_wide")
-
-            news_ok, _ = NewsFilter.check(symbol)
-
-            retest_ok = RetestFilter.check(df15, direction, bos_level)
-            if not retest_ok:
-                reasons.append("retest_not_confirmed")
-
-            premium_ok = StrategyEngine.premium_discount(df1, direction, swings=swings_1h)
-            if not premium_ok:
-                reasons.append("wrong_premium_discount")
-
-            last = df15.iloc[-1]
-            entry_raw = float(last["close"])
-
-            if bos_ok and bos_level is not None:
-                atr15 = float(df15["atr"].iloc[-1])
-                distance = abs(entry_raw - bos_level)
-                if distance > 0.5 * atr15:
-                    logger.debug("%s rədd edildi: entry_too_far_from_breakout", symbol)
-                    return None
-
-            stop_raw = StrategyEngine.nearest_stop(df1, direction, swings=swings_1h)
-            if stop_raw is None:
-                return None
-
-            target_raw = StrategyEngine.nearest_target(df1, direction, entry_raw, swings=swings_1h)
-            if target_raw is None:
-                return None
-
-            rr = RiskEngine.rr(entry_raw, stop_raw, target_raw)
-            if rr > Config.MAX_RR:
-                risk = abs(entry_raw - stop_raw)
-                if direction == "long":
-                    target_raw = entry_raw + risk * Config.MAX_RR
-                else:
-                    target_raw = entry_raw - risk * Config.MAX_RR
-                rr = Config.MAX_RR
-
-            hard_checks = {
-                "fresh": fresh_ok, "pullback": pullback_ok, "rsi": rsi_ok, "bos": bos_ok,
-                "candle": candle_ok, "volume": volume_ok, "atr": atr_ok, "btc": btc_ok,
-                "funding": funding_ok, "oi": oi_ok, "spread": spread_ok, "news": news_ok,
-                "retest": retest_ok, "premium_discount": premium_ok, "rr": rr >= Config.MIN_RR,
-            }
-            failed = [k for k, v in hard_checks.items() if not v]
-            if failed:
-                logger.debug("%s rədd edildi (hard-filter): %s | reasons=%s", symbol, failed, reasons)
-                return None
-
-            quality_data = {
-                "rr": rr, "volume_ratio": volume_ratio,
-                "regime_quality": regime.get("quality", 0),
-                "funding": funding, "oi_change": oi_change, "spread_pct": spread,
-            }
-            score = ScoreEngine.calculate(quality_data)
-            if score < Config.MIN_SCORE:
-                logger.debug("%s rədd edildi: score=%.1f < MIN_SCORE=%s", symbol, score, Config.MIN_SCORE)
-                return None
-
-            active = TRACKER.active_signals()
-            correlation_ok, correlation = CorrelationFilter.allows(symbol, active)
-            if not correlation_ok:
-                return None
-
-            # DÜZƏLİŞ C: əvvəlcə tick-size-a yuvarlaqlaşdır, sonra RİSK bunlardan hesablanır
-            entry = Precision.price(symbol, entry_raw)
-            stop = Precision.price(symbol, stop_raw)
-            target = Precision.price(symbol, target_raw)
-            original_risk = abs(entry - stop)
-            if original_risk <= 0:
-                return None
-
-            qty = RiskEngine.position_size(symbol, entry, stop)
-            if qty <= 0:
-                return None
-
-            liquidation = RiskEngine.liquidation_estimate(entry, direction)
-
-            signal = {
-                "id": f"{symbol}_{int(time.time())}",
-                "symbol": symbol,
-                "direction": direction.upper(),
-                "entry": entry,
-                "stop": stop,
-                "target": target,
-                "rr": round(rr, 2),
-                "score": score,
-                "quantity": qty,
-                "funding": funding,
-                "oi_change": oi_change,
-                "spread_pct": spread,
-                "volume_ratio": volume_ratio,
-                "atr_pct": atr_pct,
-                "correlation": correlation,
-                "btc_bias": BTCFilter.get_bias(),
-                "bos_level": bos_level,
-                "liquidation_estimate": liquidation,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "status": "ACTIVE",
-                "partial_taken": False,
-                "breakeven": False,
-                "trailing": False,
-                "manual": manual,
-                "last_checked_at": None,
-                "original_risk": original_risk,
-            }
-            return signal
+            d4=self.client.fetch_klines(symbol,Config.TREND_TF,300)
+            d1=self.client.fetch_klines(symbol,Config.SETUP_TF,250)
+            d15=self.client.fetch_klines(symbol,Config.ENTRY_TF,250)
+            if not(valid_df(d4,220) and valid_df(d1,100) and valid_df(d15,100)):return None
+            d4=Indicators.add(d4);d1=Indicators.add(d1);d15=Indicators.add(d15)
+            reg=Regime.analyze(d4);direction=reg["direction"]
+            if direction not in ("long","short"):return None
+            if not Strategy.setup(d1,direction) or not Strategy.pullback(d1,direction):return None
+            if not Strategy.rsi_ok(d15,direction):return None
+            bos=Strategy.bos(d15,direction);seq=Strategy.sequence(d15,bos,direction)
+            if not seq or seq["confirm"]!=len(d15)-1:return None
+            if not Strategy.pd_zone(d15,direction):return None
+            if safe_float(d15.volume.iloc[-1]/d15.volume.iloc[-Config.VOLUME_LOOKBACK:].mean())<Config.MIN_VOLUME_RATIO:return None
+            if not(Config.MIN_ATR_PCT<=safe_float(d15.atr_pct.iloc[-1])<=Config.MAX_ATR_PCT):return None
+            entry=safe_float(d15.close.iloc[-1]);sl=Strategy.stop(d15,entry,direction)
+            if direction=="long" and sl>=entry:return None
+            if direction=="short" and sl<=entry:return None
+            tp=Strategy.target(entry,sl,direction)
+            inst=self.client.fetch_instrument(symbol);tick=safe_float(inst.get("tick_size"));step=safe_float(inst.get("qty_step"))
+            if tick>0:
+                entry=Precision.step(entry,tick);sl=Precision.step(sl,tick);tp=Precision.step(tp,tick)
+            risk=abs(entry-sl);rr=abs(tp-entry)/risk if risk>0 else 0
+            if rr<Config.MIN_RR:return None
+            rr=min(rr,Config.MAX_RR)
+            ticker=self.client.fetch_ticker(symbol)
+            funding=safe_float(ticker.get("funding_rate"))
+            if not MarketFilters.funding(funding):return None
+            oi=MarketFilters.oi_change(self.client.fetch_open_interest(symbol,"1h",Config.OI_LOOKBACK+1))
+            if not MarketFilters.oi(oi):return None
+            btc=0 if symbol=="BTCUSDT" else safe_float(self.client.fetch_ticker("BTCUSDT").get("price_change_24h"))
+            if not MarketFilters.btc(btc,direction,symbol):return None
+            spread=MarketFilters.spread(self.client.fetch_orderbook(symbol))
+            if spread>.20 or not MarketFilters.correlation(self.client,symbol):return None
+            vol=safe_float(d15.volume_ratio.iloc[-1])
+            momentum=80 if (direction=="long" and d15.rsi.iloc[-1]>50) or (direction=="short" and d15.rsi.iloc[-1]<50) else 60
+            score=reg["quality"]*.25+min(vol/2*100,100)*.15+min(max(50+oi*2.5,0),100)*.1+min(rr/Config.MAX_RR*100,100)*.2+momentum*.1+(100-min(spread/.2*100,100))*.1+10
+            if score<Config.MIN_SCORE:return None
+            rd=Risk.size(entry,sl);qty=Precision.step(rd["qty"],step)
+            if qty<=0:return None
+            return {"id":f"{symbol}_{direction}_{utc_timestamp()}","symbol":symbol,"direction":direction,"entry":entry,"sl":sl,"tp":tp,"rr":rr,"score":round(min(score,100),2),"leverage":Risk.leverage(safe_float(d15.atr.iloc[-1]),entry),"risk_amount":rd["risk_amount"],"position_size":qty,"notional":qty*entry,"commission_cost":Risk.costs(qty*entry),"atr":safe_float(d15.atr.iloc[-1]),"volume_ratio":vol,"oi_change_pct":oi,"funding_rate":funding,"spread_pct":spread,"sequence":"BOS -> RETEST -> CONFIRMATION","bos_level":seq["level"],"created_at":utc_iso(),"status":"NEW"}
         except Exception as e:
-            logger.error("%s analysis error: %s", symbol, e)
-            return None
-
-    def scan(self):
-        symbols = BYBIT.fetch_top_symbols()
-        results = []
-        with ThreadPoolExecutor(max_workers=Config.PARALLEL_WORKERS) as executor:
-            futures = {executor.submit(self.analyze_symbol, symbol): symbol for symbol in symbols}
-            for future in as_completed(futures):
+            log.warning("Analyze %s: %s",symbol,e);return None
+    def scan(self,symbols):
+        out=[]
+        with ThreadPoolExecutor(max_workers=Config.PARALLEL_WORKERS) as ex:
+            fs=[ex.submit(self.analyze,s) for s in symbols[:Config.SCAN_TOP_N]]
+            for f in as_completed(fs):
                 try:
-                    result = future.result()
-                    if result:
-                        results.append(result)
-                except Exception as e:
-                    logger.warning("Scanner worker error: %s", e)
-        results.sort(key=lambda x: (x["score"], x["rr"]), reverse=True)
-        return results[:Config.MAX_SIGNALS_TO_SEND]
-# ============================================================
-# PERFORMANCE TRACKER
-# ============================================================
+                    x=f.result()
+                    if x:out.append(x)
+                except:pass
+        return sorted(out,key=lambda x:x["score"],reverse=True)
 
+SCANNER=SignalScanner(BYBIT)
 class PerformanceTracker:
-
     def __init__(self):
-        self.lock = threading.RLock()
-        self.state = load_json(Config.STATE_FILE, {"signals": [], "daily_date": "", "daily_count": 0})
-        self.stats = load_json(Config.STATS_FILE, {
-            "wins": 0, "losses": 0, "breakevens": 0, "total": 0,
-            "profit_r": 0.0, "profit_usdt": 0.0,
-            "total_profit_r": 0.0, "total_loss_r": 0.0,
-            "expectancy": 0.0,
-            "max_consecutive_losses": 0,
-            "score_groups": {},
-            "direction_stats": {}
-        })
-
+        self.lock=threading.RLock();self.signals=[];self.stats={};self.load()
+    def load(self):
+        try:
+            if os.path.exists(Config.SIGNAL_FILE):
+                with open(Config.SIGNAL_FILE,"r",encoding="utf8") as f:self.signals=json.load(f)
+        except:pass
+        self.recalc()
     def save(self):
-        active = [s for s in self.state["signals"] if s.get("status") == "ACTIVE"]
-        closed = [s for s in self.state["signals"] if s.get("status") != "ACTIVE"]
-        closed = closed[-Config.MAX_CLOSED_SIGNALS_KEPT:]
-        self.state["signals"] = active + closed
-        save_json(Config.STATE_FILE, self.state)
-        save_json(Config.STATS_FILE, self.stats)
-
-    def log_signal_created(self, signal):
-        log = load_json(Config.SIGNAL_FILE, [])
-        log.append({
-            "id": signal["id"], "symbol": signal["symbol"], "direction": signal["direction"],
-            "entry": signal["entry"], "stop": signal["stop"], "target": signal["target"],
-            "rr": signal["rr"], "score": signal["score"], "created_at": signal["created_at"]
-        })
-        log = log[-Config.MAX_SIGNAL_LOG_KEPT:]
-        save_json(Config.SIGNAL_FILE, log)
-
-    def reset_day_if_needed(self):
-        today = datetime.now(timezone.utc).date().isoformat()
-        if self.state.get("daily_date") != today:
-            self.state["daily_date"] = today
-            self.state["daily_count"] = 0
-            self.save()
-
-    def can_create_signal(self):
+        try:
+            fd,tmp=tempfile.mkstemp(dir=Config.DATA_DIR);os.close(fd)
+            with open(tmp,"w",encoding="utf8") as f:json.dump(self.signals[-Config.MAX_CLOSED_SIGNALS_KEPT:],f,indent=2)
+            os.replace(tmp,Config.SIGNAL_FILE)
+        except Exception as e:log.warning("Save: %s",e)
+    def active(self):return [x for x in self.signals if x.get("status")=="ACTIVE"]
+    def get(self,sid):
+        return next((x for x in self.signals if x.get("id")==sid),None)
+    def can_add(self,s):
+        today=utc_now().date().isoformat()
+        return len(self.active())<Config.MAX_ACTIVE_SIGNALS and sum(str(x.get("created_at","")).startswith(today) for x in self.signals)<Config.MAX_DAILY_SIGNALS and not any(x.get("symbol")==s["symbol"] and x.get("status")=="ACTIVE" for x in self.signals)
+    def add(self,s):
         with self.lock:
-            self.reset_day_if_needed()
-            active = [x for x in self.state["signals"] if x.get("status") == "ACTIVE"]
-            if len(active) >= Config.MAX_ACTIVE_SIGNALS:
-                return False
-            if self.state["daily_count"] >= Config.MAX_DAILY_SIGNALS:
-                return False
-            return True
-
-    def add_signal(self, signal):
+            if not self.can_add(s):return False
+            x=dict(s);x.update({"status":"ACTIVE","activated_at":utc_iso(),"original_sl":s["sl"],"original_risk":abs(s["entry"]-s["sl"]),"current_r":0.0,"partial_taken":False,"breakeven":False,"trailing":False})
+            self.signals.append(x);self.save();return True
+    def close(self,sid,result,r,price,reason):
         with self.lock:
-            self.reset_day_if_needed()
-            active = [x for x in self.state["signals"] if x.get("status") == "ACTIVE"]
-            if len(active) >= Config.MAX_ACTIVE_SIGNALS:
-                return False
-            if self.state["daily_count"] >= Config.MAX_DAILY_SIGNALS:
-                return False
-            self.state["signals"].append(signal)
-            self.state["daily_count"] += 1
-            self.save()
-            self.log_signal_created(signal)
-            return True
+            x=self.get(sid)
+            if not x or x.get("status")!="ACTIVE":return False
+            x.update({"status":"CLOSED","result":result,"result_r":round(r,4),"close_price":price,"close_reason":reason,"closed_at":utc_iso()})
+            self.recalc();self.save();return True
+    def recalc(self):
+        c=[x for x in self.signals if x.get("status")=="CLOSED"];w=[x for x in c if x.get("result")=="WIN"];l=[x for x in c if x.get("result")=="LOSS"]
+        r=sum(safe_float(x.get("result_r")) for x in c)
+        pnl=sum(safe_float(x.get("result_r"))*safe_float(x.get("risk_amount")) for x in c)
+        gp=sum(safe_float(x.get("result_r"))*safe_float(x.get("risk_amount")) for x in w)
+        gl=abs(sum(safe_float(x.get("result_r"))*safe_float(x.get("risk_amount")) for x in l))
+        self.stats={"total":len(c),"wins":len(w),"losses":len(l),"be":len(c)-len(w)-len(l),"win_rate":round(len(w)/len(c)*100,2) if c else 0,"total_r":round(r,4),"pnl":round(pnl,4),"profit_factor":round(gp/gl,3) if gl else 0,"active":len(self.active())}
+    def text(self):
+        self.recalc();s=self.stats
+        return f"TRADES: {s['total']}\nWINS: {s['wins']} | LOSS: {s['losses']} | BE: {s['be']}\nWIN RATE: {s['win_rate']}%\nTOTAL R: {s['total_r']}\nPNL: {s['pnl']:.2f} USDT\nPF: {s['profit_factor']}\nACTIVE: {s['active']}"
 
-    def active_signals(self):
-        with self.lock:
-            return [x for x in self.state["signals"] if x.get("status") == "ACTIVE"]
-
-    def update_signal(self, signal):
-        with self.lock:
-            for i, item in enumerate(self.state["signals"]):
-                if item.get("id") == signal.get("id"):
-                    self.state["signals"][i] = signal
-                    break
-            self.save()
-
-    def close_signal(self, signal, result, r_multiple):
-        with self.lock:
-            signal["status"] = result
-            signal["closed_at"] = datetime.now(timezone.utc).isoformat()
-            signal["result_r"] = r_multiple
-
-            self.stats["total"] += 1
-            if result == "WIN":
-                self.stats["wins"] += 1
-            elif result == "LOSS":
-                self.stats["losses"] += 1
-            elif result == "BREAKEVEN":
-                self.stats["breakevens"] += 1
-
-            self.stats["profit_r"] += r_multiple
-            self.stats["profit_usdt"] += r_multiple * Config.ACCOUNT_BALANCE * Config.RISK_PERCENT / 100
-
-            self._update_extended_stats(signal, result, r_multiple)
-            self.update_signal(signal)
-
-    def _update_extended_stats(self, signal, result, r_multiple):
-        if r_multiple > 0:
-            self.stats["total_profit_r"] = self.stats.get("total_profit_r", 0.0) + r_multiple
-        elif r_multiple < 0:
-            self.stats["total_loss_r"] = self.stats.get("total_loss_r", 0.0) + abs(r_multiple)
-
-        total_trades = self.stats["total"]
-        if total_trades > 0:
-            self.stats["expectancy"] = self.stats["profit_r"] / total_trades
-
-        if result == "LOSS":
-            max_streak = 0
-            current = 0
-            for s in self.state["signals"]:
-                if s.get("status") == "LOSS":
-                    current += 1
-                    max_streak = max(max_streak, current)
-                else:
-                    current = 0
-            self.stats["max_consecutive_losses"] = max_streak
-
-        score = signal.get("score", 0)
-        if 85 <= score < 95:
-            key = "85-95"
-        elif score >= 95:
-            key = "95+"
-        elif 65 <= score < 85:
-            key = "65-85"
-        else:
-            key = None
-        if key:
-            self.stats.setdefault("score_groups", {})
-            group = self.stats["score_groups"].setdefault(key, {"total": 0, "wins": 0, "pnl_r": 0.0})
-            group["total"] += 1
-            if result == "WIN":
-                group["wins"] += 1
-            group["pnl_r"] += r_multiple
-
-        direction_key = "LONG" if signal.get("direction") == "LONG" else "SHORT"
-        self.stats.setdefault("direction_stats", {})
-        d = self.stats["direction_stats"].setdefault(direction_key, {"total": 0, "wins": 0, "pnl_r": 0.0})
-        d["total"] += 1
-        if result == "WIN":
-            d["wins"] += 1
-        d["pnl_r"] += r_multiple
-
-    def report(self):
-        with self.lock:
-            total = self.stats["total"]
-            winrate = (self.stats["wins"] / total * 100) if total > 0 else 0.0
-
-            total_profit_r = self.stats.get("total_profit_r", 0.0)
-            total_loss_r = self.stats.get("total_loss_r", 0.0)
-
-            if total_loss_r > 0:
-                profit_factor_display = round(total_profit_r / total_loss_r, 2)
-            elif total_profit_r > 0:
-                profit_factor_display = "∞"
-            else:
-                profit_factor_display = 0.0
-
-            return {
-                "total": total,
-                "wins": self.stats["wins"],
-                "losses": self.stats["losses"],
-                "breakevens": self.stats["breakevens"],
-                "winrate": round(winrate, 2),
-                "profit_r": round(self.stats["profit_r"], 2),
-                "profit_usdt": round(self.stats["profit_usdt"], 2),
-                "profit_factor": profit_factor_display,
-                "expectancy": round(self.stats.get("expectancy", 0.0), 4),
-                "max_consecutive_losses": self.stats.get("max_consecutive_losses", 0),
-                "score_groups": self.stats.get("score_groups", {}),
-                "direction_stats": self.stats.get("direction_stats", {})
-            }
-
-
-# ============================================================
-# POSITION MANAGER
-# DÜZƏLİŞ: WIN/LOSS/BREAKEVEN r_mult işarəsinə görə təyin olunur.
-# YENİ: PARTIAL_TP_PERCENT indi real işləyir (informativ - broker
-# icrası olmadığından mövqe bağlanmır, sadəcə qeyd olunur/loglanır).
-# ============================================================
-
+TRACKER=PerformanceTracker()
 class PositionManager:
+    def __init__(self,client,tracker,notify=None):
+        self.client=client;self.tracker=tracker;self.notify=notify;self.running=False
+    def start(self):
+        if self.running:return
+        self.running=True;threading.Thread(target=self.loop,daemon=True,name="Monitor").start()
+    def stop(self):self.running=False
+    def loop(self):
+        while self.running and not STOP_EVENT.is_set():
+            for s in self.tracker.active():
+                try:self.process(s)
+                except Exception:log.exception("Monitor %s",s.get("symbol"))
+            STOP_EVENT.wait(Config.MONITOR_INTERVAL)
+    def process(self,s):
+        price=safe_float(self.client.fetch_ticker(s["symbol"]).get("last_price"))
+        if price<=0:return
+        d=s["direction"];sl=safe_float(s["sl"]);tp=safe_float(s["tp"])
+        if (d=="long" and price<=sl) or (d=="short" and price>=sl):
+            self.close(s,"SL",price);return
+        if (d=="long" and price>=tp) or (d=="short" and price<=tp):
+            self.close(s,"TP",price);return
+        risk=safe_float(s["original_risk"]);entry=safe_float(s["entry"])
+        r=(price-entry)/risk if d=="long" else (entry-price)/risk
+        s["current_r"]=round(r,4)
+        if not s["partial_taken"] and r>=s["rr"]*Config.PARTIAL_TP_PERCENT/100:
+            s["partial_taken"]=True
+            if self.notify:self.notify.notify_partial(s)
+        if not s["breakeven"] and r>=Config.BREAKEVEN_AFTER_R:
+            s["sl"]=entry;s["breakeven"]=True
+            if self.notify:self.notify.notify_breakeven(s)
+        if r>=Config.TRAILING_AFTER_R:self.trailing(s,price)
+        self.tracker.save()
+    def trailing(self,s,price):
+        df=self.client.fetch_klines(s["symbol"],Config.MONITOR_TF,40)
+        if len(df)<20:return
+        df=Indicators.add(df);atr=safe_float(df.atr.iloc[-1])
+        if atr<=0:return
+        d=s["direction"];old=safe_float(s["sl"]);new=price-atr*Config.TRAILING_ATR_MULT if d=="long" else price+atr*Config.TRAILING_ATR_MULT
+        if d=="long" and s["breakeven"]:new=max(new,s["entry"])
+        if d=="short" and s["breakeven"]:new=min(new,s["entry"])
+        if (d=="long" and new>old) or (d=="short" and new<old):
+            s["sl"]=new;s["trailing"]=True
+            if self.notify:self.notify.notify_trailing(s)
+    def close(self,s,reason,price):
+        risk=safe_float(s["original_risk"]);entry=safe_float(s["entry"])
+        r=(price-entry)/risk if s["direction"]=="long" else (entry-price)/risk
+        if reason=="TP":r=abs(r)
+        result="WIN" if r>.05 else "LOSS" if r<-.05 else "BE"
+        if result=="BE":r=0
+        if self.tracker.close(s["id"],result,r,price,reason) and self.notify:self.notify.notify_close(s,result,reason,price,r)
 
-    RESULT_EPSILON = 0.05
-
-    def __init__(self, tracker):
-        self.tracker = tracker
-
-    @staticmethod
-    def _classify(r_mult, epsilon):
-        if r_mult > epsilon:
-            return "WIN"
-        if r_mult < -epsilon:
-            return "LOSS"
-        return "BREAKEVEN"
-
-    def _check_partial(self, signal, direction, entry, target, current):
-        if signal.get("partial_taken"):
-            return
-        pct = Config.PARTIAL_TP_PERCENT / 100
-        if direction == "long":
-            partial_level = entry + (target - entry) * pct
-            reached = current >= partial_level
-        else:
-            partial_level = entry - (entry - target) * pct
-            reached = current <= partial_level
-        if reached:
-            signal["partial_taken"] = True
-            logger.info(
-                "%s qismən-TP səviyyəsinə çatdı (%.0f%%) — informativdir, broker icrası yoxdur",
-                signal["symbol"], Config.PARTIAL_TP_PERCENT
-            )
-
-    def update_one(self, signal):
-        try:
-            df = BYBIT.fetch_klines(signal["symbol"], "1", 100)
-            if len(df) < 5:
-                return
-
-            direction = signal["direction"].lower()
-            entry = float(signal["entry"])
-
-            original_risk = signal.get("original_risk")
-            if not original_risk or original_risk <= 0:
-                original_risk = abs(entry - float(signal["stop"]))
-                signal["original_risk"] = original_risk
-            if original_risk <= 0:
-                return
-
-            last_checked = signal.get("last_checked_at")
-            if last_checked:
-                last_ts = pd.Timestamp(last_checked)
-                bars = df[df["timestamp"] > last_ts]
-            else:
-                bars = df.iloc[-1:]
-
-            if bars.empty:
-                return
-
-            target = float(signal["target"])
-            stop = float(signal["stop"])
-
-            for _, row in bars.iterrows():
-                high = float(row["high"])
-                low = float(row["low"])
-                current = float(row["close"])
-
-                if direction == "long":
-                    if low <= stop:
-                        r_mult = (stop - entry) / original_risk
-                        result = self._classify(r_mult, self.RESULT_EPSILON)
-                        self.tracker.close_signal(signal, result, round(r_mult, 3))
-                        return
-                    if high >= target:
-                        self.tracker.close_signal(signal, "WIN", signal["rr"])
-                        return
-
-                    self._check_partial(signal, direction, entry, target, current)
-
-                    r_now = (current - entry) / original_risk
-                    if r_now >= Config.BREAKEVEN_AFTER_R and not signal.get("breakeven"):
-                        stop = entry
-                        signal["stop"] = entry
-                        signal["breakeven"] = True
-                    if r_now >= Config.TRAILING_AFTER_R:
-                        atr = float(Indicators.atr(df, Config.ATR_PERIOD).iloc[-1])
-                        new_stop = current - atr * Config.TRAILING_ATR_MULT
-                        if new_stop > stop:
-                            stop = Precision.price(signal["symbol"], new_stop)
-                            signal["stop"] = stop
-                            signal["trailing"] = True
-                else:
-                    if high >= stop:
-                        r_mult = (entry - stop) / original_risk
-                        result = self._classify(r_mult, self.RESULT_EPSILON)
-                        self.tracker.close_signal(signal, result, round(r_mult, 3))
-                        return
-                    if low <= target:
-                        self.tracker.close_signal(signal, "WIN", signal["rr"])
-                        return
-
-                    self._check_partial(signal, direction, entry, target, current)
-
-                    r_now = (entry - current) / original_risk
-                    if r_now >= Config.BREAKEVEN_AFTER_R and not signal.get("breakeven"):
-                        stop = entry
-                        signal["stop"] = entry
-                        signal["breakeven"] = True
-                    if r_now >= Config.TRAILING_AFTER_R:
-                        atr = float(Indicators.atr(df, Config.ATR_PERIOD).iloc[-1])
-                        new_stop = current + atr * Config.TRAILING_ATR_MULT
-                        if new_stop < stop:
-                            stop = Precision.price(signal["symbol"], new_stop)
-                            signal["stop"] = stop
-                            signal["trailing"] = True
-
-            signal["last_checked_at"] = df["timestamp"].iloc[-1].isoformat()
-            self.tracker.update_signal(signal)
-        except Exception as e:
-            logger.warning("Position monitor error %s: %s", signal.get("symbol"), e)
-
-    def monitor(self):
-        active = self.tracker.active_signals()
-        if not active:
-            return
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = [executor.submit(self.update_one, signal) for signal in active]
-            for future in futures:
-                try:
-                    future.result()
-                except Exception:
-                    pass
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-class TelegramBot:
-
+POSITION_MANAGER=PositionManager(BYBIT,TRACKER)
+class TelegramManager:
     def __init__(self):
-        self.token = Config.BOT_TOKEN
-        self.chat_id = Config.CHAT_ID
-        self.last_sent = {}
-        self.retry_queue = []
-        self.retry_lock = threading.RLock()
-
-    def enabled(self):
-        return bool(self.token and self.chat_id)
-
-    def send(self, text):
-        if not self.enabled():
-            logger.info("Telegram disabled")
-            return False
-        url = "https://api.telegram.org/bot" + self.token + "/sendMessage"
+        self.token=Config.BOT_TOKEN;self.chat=str(Config.CHAT_ID);self.notify_lock=threading.RLock()
+    def send(self,text):
+        if not self.token:return False
         try:
-            response = requests.post(url, json={"chat_id": self.chat_id, "text": text}, timeout=15)
-            return response.ok
-        except Exception as e:
-            logger.warning("Telegram error: %s", e)
-            return False
+            r=requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage",json={"chat_id":self.chat,"text":text},timeout=Config.REQUEST_TIMEOUT)
+            return r.status_code==200 and r.json().get("ok",False)
+        except:return False
+    def signal(self,s):
+        return self.send(f"🚨 SWING AI {s['direction'].upper()}\n\n{s['symbol']}\nEntry: {s['entry']:.8g}\nSL: {s['sl']:.8g}\nTP: {s['tp']:.8g}\nRR: 1:{s['rr']:.2f}\nScore: {s['score']}/100\nLeverage: {s['leverage']}x\nRisk: {s['risk_amount']:.2f} USDT\n\nBOS → RETEST → CONFIRMATION")
+    def notify_close(self,s,result,reason,price,r):self.send(f"{'✅' if result=='WIN' else '❌' if result=='LOSS' else '🟡'} CLOSED\n{s['symbol']} {s['direction'].upper()}\nResult: {result}\nReason: {reason}\nPrice: {price:.8g}\nR: {r:.2f}")
+    def notify_breakeven(self,s):self.send(f"🛡️ BREAKEVEN\n{s['symbol']}\nSL → Entry")
+    def notify_trailing(self,s):self.send(f"📈 TRAILING\n{s['symbol']}\nSL: {s['sl']:.8g}")
+    def notify_partial(self,s):self.send(f"💰 PARTIAL TP LEVEL\n{s['symbol']}\nR: {s['current_r']:.2f}")
 
-    def _queue_retry(self, text):
-        with self.retry_lock:
-            self.retry_queue.append({"text": text, "attempts": 0})
+TELEGRAM=TelegramManager()
+POSITION_MANAGER.notify=TELEGRAM
 
-    def flush_retry_queue(self):
-        if not self.enabled():
-            return
-        with self.retry_lock:
-            remaining = []
-            for item in self.retry_queue:
-                if item["attempts"] >= 5:
-                    logger.warning("Mesaj 5 cəhddən sonra ləğv edildi")
-                    continue
-                if self.send(item["text"]):
-                    continue
-                item["attempts"] += 1
-                remaining.append(item)
-            self.retry_queue = remaining
-
-    def format_signal(self, s):
-        direction = s["direction"]
-        emoji = "🟢" if direction == "LONG" else "🔴"
-        return (
-            f"{emoji} SWING AI V9\n\n"
-            f"Coin: {s['symbol']}\n"
-            f"Direction: {direction}\n\n"
-            f"Entry: {s['entry']}\n"
-            f"SL: {s['stop']}\n"
-            f"TP: {s['target']}\n\n"
-            f"RR: 1:{s['rr']}\n"
-            f"Score: {s['score']}/100\n"
-            f"Volume: {s['volume_ratio']:.2f}x\n"
-            f"ATR: {s['atr_pct']:.2f}%\n"
-            f"Funding: {s['funding']:.6f}\n"
-            f"OI: {s['oi_change']:.2f}%\n"
-            f"Spread: {s['spread_pct']:.3f}%\n"
-            f"BTC: {s['btc_bias']}\n\n"
-            f"Risk: {Config.RISK_PERCENT}%\n"
-            f"Qty: {s['quantity']}\n\n"
-            f"Status: ACTIVE"
-        )
-
-    def send_signals(self, signals):
-        sent = []
-        for signal in signals:
-            if not TRACKER.can_create_signal():
-                break
-            key = signal["symbol"]
-            last = self.last_sent.get(key, 0)
-            if time.time() - last < 7200:
-                continue
-            if not TRACKER.add_signal(signal):
-                continue
-            text = self.format_signal(signal)
-            if self.send(text):
-                self.last_sent[key] = time.time()
-                sent.append(signal)
-            else:
-                self._queue_retry(text)
-        return sent
-
-    def send_stats(self):
-        stats = TRACKER.report()
-        text = (
-            "📊 SWING AI V9 STATS\n\n"
-            f"Trades: {stats['total']}\n"
-            f"Wins: {stats['wins']}\n"
-            f"Losses: {stats['losses']}\n"
-            f"BE: {stats['breakevens']}\n"
-            f"Winrate: {stats['winrate']}%\n"
-            f"Profit R: {stats['profit_r']}\n"
-            f"Profit USDT: {stats['profit_usdt']}\n"
-            f"Profit Factor: {stats['profit_factor']}\n"
-            f"Expectancy: {stats['expectancy']}\n"
-            f"Max Consecutive Losses: {stats['max_consecutive_losses']}\n\n"
-            f"Score Groups:\n"
-        )
-        for key, val in stats.get('score_groups', {}).items():
-            text += f"{key}: {val['wins']}/{val['total']} (R: {round(val['pnl_r'], 2)})\n"
-        text += "\nDirection Stats:\n"
-        for key, val in stats.get('direction_stats', {}).items():
-            text += f"{key}: {val['wins']}/{val['total']} (R: {round(val['pnl_r'], 2)})\n"
-        self.send(text)
-
-    def send_active(self):
-        active = TRACKER.active_signals()
-        if not active:
-            self.send("Aktiv signal yoxdur.")
-            return
-        lines = ["📌 AKTİV SİQNALLAR\n"]
-        for s in active:
-            lines.append(f"{s['symbol']} {s['direction']} | Entry {s['entry']} | SL {s['stop']} | TP {s['target']}")
-        self.send("\n".join(lines))
-
-
-TELEGRAM = None  # aşağıda instansiya olunur
-
-
-class TelegramCommandWorker:
-
-    def __init__(self):
-        self.offset = 0
-        self.running = True
-
-    def get_updates(self):
-        if not TELEGRAM.enabled():
-            return []
-        url = "https://api.telegram.org/bot" + Config.BOT_TOKEN + "/getUpdates"
+class ScannerWorker:
+    def __init__(self):self.running=False
+    def start(self):
+        if self.running:return
+        self.running=True;threading.Thread(target=self.loop,daemon=True,name="Scanner").start()
+    def stop(self):self.running=False
+    def symbols(self):
         try:
-            r = requests.get(url, params={"offset": self.offset, "timeout": 20}, timeout=25)
-            data = r.json()
-            if not data.get("ok"):
-                return []
-            return data.get("result", [])
-        except Exception:
-            return []
-
-    def handle(self, update):
-        try:
-            message = update.get("message", {})
-            text = message.get("text", "").strip().lower()
-            chat_id = str(message.get("chat", {}).get("id", ""))
-            if chat_id != str(Config.CHAT_ID):
-                return
-            if text == "/start":
-                TELEGRAM.send("SWING AI V9 Professional aktivdir.")
-            elif text == "/stats":
-                TELEGRAM.send_stats()
-            elif text == "/signals":
-                TELEGRAM.send_active()
-            elif text == "/analiz":
-                TELEGRAM.send("🔎 Professional scan başlayır...")
-                signals = SCANNER.scan()
-                if not signals:
-                    TELEGRAM.send("❌ Hazırda bütün filtrləri keçən setup yoxdur.")
-                    return
-                for s in signals:
-                    TELEGRAM.send(TELEGRAM.format_signal(s))
-            elif text == "/help":
-                TELEGRAM.send("/start\n/stats\n/signals\n/analiz\n/help")
-        except Exception as e:
-            logger.warning("Command handle error: %s", e)
-
-    def run(self):
-        if not TELEGRAM.enabled():
-            return
-        while self.running:
-            updates = self.get_updates()
-            for update in updates:
-                self.offset = max(self.offset, update.get("update_id", 0) + 1)
-                self.handle(update)
-            time.sleep(1)
-
-
-class RetryWorker:
-
-    def __init__(self, telegram_bot):
-        self.telegram = telegram_bot
-        self.running = True
-
-    def run(self):
-        while self.running:
+            x=BYBIT._get("/v5/market/instruments-info",{"category":Config.CATEGORY,"limit":1000})
+            rows=x.get("result",{}).get("list",[]) if x else []
+            z=[a["symbol"] for a in rows if a.get("symbol","").endswith("USDT") and a.get("status")=="Trading" and a.get("contractType")=="LinearPerpetual"]
+            return z or Config.FALLBACK_COINS
+        except:return Config.FALLBACK_COINS
+    def loop(self):
+        while self.running and not STOP_EVENT.is_set():
             try:
-                self.telegram.flush_retry_queue()
-            except Exception as e:
-                logger.warning("Retry worker error: %s", e)
-            time.sleep(60)
+                results=SCANNER.scan(self.symbols());sent=0
+                for s in results:
+                    if sent>=Config.MAX_SIGNALS_TO_SEND:break
+                    if TRACKER.add(s):
+                        TELEGRAM.signal(s);sent+=1
+                log.info("SCAN candidates=%d new=%d",len(results),sent)
+            except Exception:log.exception("Scanner error")
+            STOP_EVENT.wait(Config.CHECK_INTERVAL)
 
+SCANNER_WORKER=ScannerWorker()
 
-# ============================================================
-# QLOBAL OBYEKTLƏR
-# ============================================================
+try:
+    from flask import Flask,jsonify
+    app=Flask(__name__)
+    @app.route("/")
+    def home():return jsonify({"bot":BOT_VERSION,"status":"running","active":len(TRACKER.active())})
+    @app.route("/health")
+    def health():return jsonify({"status":"ok","version":BOT_VERSION,"active":len(TRACKER.active())})
+    @app.route("/stats")
+    def stats():return jsonify(TRACKER.stats)
+    def flask_start():app.run(host="0.0.0.0",port=Config.FLASK_PORT,debug=False,use_reloader=False)
+except:
+    app=None
+    def flask_start():pass
 
-TRACKER = PerformanceTracker()
-SCANNER = SignalScanner()
-POSITION_MANAGER = PositionManager(TRACKER)
-TELEGRAM = TelegramBot()
-RETRY_WORKER = RetryWorker(TELEGRAM)
+def shutdown(sig=None,frame=None):
+    if STOP_EVENT.is_set():return
+    STOP_EVENT.set();SCANNER_WORKER.stop();POSITION_MANAGER.stop();TRACKER.save();log.info("BOT STOPPED")
 
-
-# ============================================================
-# FLASK HEALTH SERVER
-# ============================================================
-
-app = Flask(__name__)
-
-
-@app.route("/")
-def home():
-    return jsonify({"bot": "SWING AI", "version": BOT_VERSION, "status": "running"})
-
-
-@app.route("/health")
-def health():
-    return jsonify({
-        "status": "ok",
-        "time": datetime.now(timezone.utc).isoformat(),
-        "active_signals": len(TRACKER.active_signals())
-    })
-
-
-@app.route("/stats")
-def stats():
-    return jsonify(TRACKER.report())
-
-
-@app.route("/active")
-def active():
-    return jsonify(TRACKER.active_signals())
-
-
-def start_flask():
-    app.run(host="0.0.0.0", port=Config.FLASK_PORT, debug=False, use_reloader=False)
-
-
-# ============================================================
-# WORKERS
-# ============================================================
-
-def scanner_loop():
-    while True:
-        try:
-            logger.info("Professional market scan started...")
-            signals = SCANNER.scan()
-            if signals:
-                logger.info("Found %s professional setup(s)", len(signals))
-                sent = TELEGRAM.send_signals(signals)
-                for s in sent:
-                    logger.info("SIGNAL: %s %s Score=%s RR=%s", s["symbol"], s["direction"], s["score"], s["rr"])
-            else:
-                logger.info("No setup passed all professional filters.")
-        except Exception as e:
-            logger.error("Scanner loop error: %s", e)
-        time.sleep(Config.CHECK_INTERVAL)
-
-
-def monitor_loop():
-    while True:
-        try:
-            POSITION_MANAGER.monitor()
-        except Exception as e:
-            logger.warning("Monitor loop error: %s", e)
-        time.sleep(Config.MONITOR_INTERVAL)
-
-
-def startup_message():
-    logger.info("=" * 60)
-    logger.info("SWING AI BOT %s", BOT_VERSION)
-    logger.info("=" * 60)
-    logger.info("Strategy:")
-    logger.info("4H Trend -> 1H Structure -> Pullback -> RSI Reversal")
-    logger.info("15M Fresh BOS -> Retest -> Strong Candle")
-    logger.info("Volume + ATR + BTC + Funding + OI + Spread")
-    logger.info("Premium/Discount + Correlation + RR")
-    logger.info("Risk=%s%% | MinScore=%s | RR=1:%s-1:%s",
-                Config.RISK_PERCENT, Config.MIN_SCORE, Config.MIN_RR, Config.MAX_RR)
-    logger.info("Max Active=%s | Max Daily=%s", Config.MAX_ACTIVE_SIGNALS, Config.MAX_DAILY_SIGNALS)
-    logger.info("Telegram=%s", "ON" if TELEGRAM.enabled() else "OFF")
-    logger.info("=" * 60)
-
+signal.signal(signal.SIGINT,shutdown)
+signal.signal(signal.SIGTERM,shutdown)
 
 def main():
-    try:
-        Config.validate()
-    except ValueError as e:
-        logger.error("Konfiqurasiya xətası: %s", e)
-        return
+    validate_config()
+    log.info("="*40)
+    log.info("SWING AI BOT %s",BOT_VERSION)
+    log.info("4H + 1H + 15M | BOS + RETEST + CONFIRMATION")
+    log.info("="*40)
+    POSITION_MANAGER.start();SCANNER_WORKER.start()
+    if Config.BOT_TOKEN:TELEGRAM.send(f"🟢 SWING AI BOT {BOT_VERSION}\nSTARTED")
+    if app is not None:threading.Thread(target=flask_start,daemon=True).start()
+    while not STOP_EVENT.is_set():STOP_EVENT.wait(5)
+    shutdown()
 
-    startup_message()
-
-    threading.Thread(target=start_flask, daemon=True).start()
-    threading.Thread(target=scanner_loop, daemon=True).start()
-    threading.Thread(target=monitor_loop, daemon=True).start()
-    threading.Thread(target=TelegramCommandWorker().run, daemon=True).start()
-    threading.Thread(target=RETRY_WORKER.run, daemon=True).start()
-
-    logger.info("SWING AI BOT %s STARTED", BOT_VERSION)
-
-    while True:
-        try:
-            time.sleep(60)
-        except KeyboardInterrupt:
-            logger.info("Bot stopped by user.")
-            break
-        except Exception:
-            time.sleep(5)
-
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__":main()
