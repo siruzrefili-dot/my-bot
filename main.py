@@ -506,81 +506,377 @@ class PositionManager:
 POSITION_MANAGER=PositionManager(BYBIT,TRACKER)
 class TelegramManager:
     def __init__(self):
-        self.token=Config.BOT_TOKEN;self.chat=str(Config.CHAT_ID);self.notify_lock=threading.RLock()
-    def send(self,text):
+        self.token=Config.BOT_TOKEN
+        self.chat=str(Config.CHAT_ID)
+        self.running=True
+        self.offset=0
+        self.lock=threading.RLock()
+
+    def send(self,text,chat_id=None):
         if not self.token:return False
+        cid=str(chat_id or self.chat)
         try:
-            r=requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage",json={"chat_id":self.chat,"text":text},timeout=Config.REQUEST_TIMEOUT)
+            r=requests.post(
+                f"https://api.telegram.org/bot{self.token}/sendMessage",
+                json={"chat_id":cid,"text":text},
+                timeout=Config.REQUEST_TIMEOUT
+            )
             return r.status_code==200 and r.json().get("ok",False)
-        except:return False
+        except Exception as e:
+            log.warning("Telegram send: %s",e)
+            return False
+
     def signal(self,s):
-        return self.send(f"🚨 SWING AI {s['direction'].upper()}\n\n{s['symbol']}\nEntry: {s['entry']:.8g}\nSL: {s['sl']:.8g}\nTP: {s['tp']:.8g}\nRR: 1:{s['rr']:.2f}\nScore: {s['score']}/100\nLeverage: {s['leverage']}x\nRisk: {s['risk_amount']:.2f} USDT\n\nBOS → RETEST → CONFIRMATION")
-    def notify_close(self,s,result,reason,price,r):self.send(f"{'✅' if result=='WIN' else '❌' if result=='LOSS' else '🟡'} CLOSED\n{s['symbol']} {s['direction'].upper()}\nResult: {result}\nReason: {reason}\nPrice: {price:.8g}\nR: {r:.2f}")
-    def notify_breakeven(self,s):self.send(f"🛡️ BREAKEVEN\n{s['symbol']}\nSL → Entry")
-    def notify_trailing(self,s):self.send(f"📈 TRAILING\n{s['symbol']}\nSL: {s['sl']:.8g}")
-    def notify_partial(self,s):self.send(f"💰 PARTIAL TP LEVEL\n{s['symbol']}\nR: {s['current_r']:.2f}")
+        return self.send(
+            f"🚨 SWING AI {s['direction'].upper()}\n\n"
+            f"{s['symbol']}\n"
+            f"Entry: {s['entry']:.8g}\n"
+            f"SL: {s['sl']:.8g}\n"
+            f"TP: {s['tp']:.8g}\n"
+            f"RR: 1:{s['rr']:.2f}\n"
+            f"Score: {s['score']}/100\n"
+            f"Leverage: {s['leverage']}x\n"
+            f"Risk: {s['risk_amount']:.2f} USDT\n\n"
+            f"BOS → RETEST → CONFIRMATION"
+        )
+
+    def notify_close(self,s,result,reason,price,r):
+        icon="✅" if result=="WIN" else "❌" if result=="LOSS" else "🟡"
+        self.send(
+            f"{icon} CLOSED\n"
+            f"{s['symbol']} {s['direction'].upper()}\n"
+            f"Result: {result}\n"
+            f"Reason: {reason}\n"
+            f"Price: {price:.8g}\n"
+            f"R: {r:.2f}"
+        )
+
+    def notify_breakeven(self,s):
+        self.send(f"🛡️ BREAKEVEN\n{s['symbol']}\nSL → Entry")
+
+    def notify_trailing(self,s):
+        self.send(f"📈 TRAILING\n{s['symbol']}\nSL: {s['sl']:.8g}")
+
+    def notify_partial(self,s):
+        self.send(f"💰 PARTIAL TP LEVEL\n{s['symbol']}\nR: {s['current_r']:.2f}")
+
+    def commands(self,chat_id):
+        active=TRACKER.active()
+
+        if not active:
+            active_text="Aktiv siqnal yoxdur."
+        else:
+            lines=[]
+            for s in active:
+                lines.append(
+                    f"{s['symbol']} | {s['direction'].upper()}\n"
+                    f"Entry: {s['entry']:.8g}\n"
+                    f"SL: {s['sl']:.8g}\n"
+                    f"TP: {s['tp']:.8g}\n"
+                    f"RR: 1:{s['rr']:.2f}\n"
+                    f"Score: {s['score']}/100"
+                )
+            active_text="\n\n".join(lines)
+
+        text=(
+            "🤖 SWING AI BOT\n\n"
+            "📌 ƏMRLƏR:\n"
+            "/start - Bot haqqında məlumat\n"
+            "/status - Bot statusu\n"
+            "/signals - Aktiv siqnallar\n"
+            "/stats - Trading statistikası\n"
+            "/scan - İndi analiz et\n"
+            "/help - Əmrlər\n\n"
+            f"📊 Aktiv: {len(active)}/{Config.MAX_ACTIVE_SIGNALS}\n\n"
+            f"{active_text}"
+        )
+        self.send(text,chat_id)
+
+    def status(self,chat_id):
+        self.send(
+            "🟢 SWING AI STATUS\n\n"
+            f"Version: {BOT_VERSION}\n"
+            f"Scanner: {'ON' if SCANNER_WORKER.running else 'OFF'}\n"
+            f"Monitor: {'ON' if POSITION_MANAGER.running else 'OFF'}\n"
+            f"Active signals: {len(TRACKER.active())}/{Config.MAX_ACTIVE_SIGNALS}\n"
+            f"Scan interval: {Config.CHECK_INTERVAL}s\n"
+            f"Monitor interval: {Config.MONITOR_INTERVAL}s",
+            chat_id
+        )
+
+    def signals(self,chat_id):
+        active=TRACKER.active()
+        if not active:
+            self.send("📭 Hazırda aktiv siqnal yoxdur.",chat_id)
+            return
+
+        text="📌 AKTİV SİQNALLAR\n\n"
+        for s in active:
+            text+=(
+                f"🔥 {s['symbol']} {s['direction'].upper()}\n"
+                f"Entry: {s['entry']:.8g}\n"
+                f"SL: {s['sl']:.8g}\n"
+                f"TP: {s['tp']:.8g}\n"
+                f"RR: 1:{s['rr']:.2f}\n"
+                f"Score: {s['score']}/100\n"
+                f"Current R: {s.get('current_r',0):.2f}\n\n"
+            )
+        self.send(text,chat_id)
+
+    def stats(self,chat_id):
+        self.send("📊 TRADING STATISTICS\n\n"+TRACKER.text(),chat_id)
+
+    def scan_now(self,chat_id):
+        self.send("🔎 Analiz başlayır...",chat_id)
+        try:
+            results=SCANNER.scan(SCANNER_WORKER.symbols())
+            if not results:
+                self.send("❌ Hazırda uyğun siqnal tapılmadı.",chat_id)
+                return
+
+            text=f"🔎 SCAN NƏTİCƏSİ\n\nTapılan: {len(results)}\n\n"
+            for s in results[:5]:
+                text+=(
+                    f"• {s['symbol']} {s['direction'].upper()}\n"
+                    f"Score: {s['score']}/100\n"
+                    f"RR: 1:{s['rr']:.2f}\n"
+                    f"Entry: {s['entry']:.8g}\n\n"
+                )
+            self.send(text,chat_id)
+        except Exception as e:
+            self.send(f"❌ Scan xətası: {e}",chat_id)
+
+    def help(self,chat_id):
+        self.send(
+            "🤖 SWING AI ƏMRLƏRİ\n\n"
+            "/start — Bot haqqında məlumat\n"
+            "/status — Botun işləmə vəziyyəti\n"
+            "/signals — Aktiv LONG/SHORT siqnallar\n"
+            "/stats — Win rate, P&L, R və PF\n"
+            "/scan — Dərhal bütün coinləri analiz et\n"
+            "/help — Əmrlər siyahısı",
+            chat_id
+        )
+
+    def handle(self,text,chat_id):
+        cmd=text.strip().split()[0].lower().split("@")[0]
+
+        if cmd=="/start":
+            self.commands(chat_id)
+        elif cmd=="/status":
+            self.status(chat_id)
+        elif cmd=="/signals":
+            self.signals(chat_id)
+        elif cmd=="/stats":
+            self.stats(chat_id)
+        elif cmd=="/scan":
+            threading.Thread(
+                target=self.scan_now,
+                args=(chat_id,),
+                daemon=True
+            ).start()
+        elif cmd=="/help":
+            self.help(chat_id)
+        else:
+            self.send("❓ Naməlum əmr.\n/help yaz.",chat_id)
+
+    def poll(self):
+        if not self.token:
+            log.warning("BOT_TOKEN yoxdur. Telegram command sistemi aktiv deyil.")
+            return
+
+        while self.running and not STOP_EVENT.is_set():
+            try:
+                r=requests.get(
+                    f"https://api.telegram.org/bot{self.token}/getUpdates",
+                    params={
+                        "timeout":20,
+                        "offset":self.offset
+                    },
+                    timeout=30
+                )
+                data=r.json()
+                if not data.get("ok"):
+                    time.sleep(3)
+                    continue
+
+                for update in data.get("result",[]):
+                    self.offset=update["update_id"]+1
+                    msg=update.get("message",{})
+                    text=msg.get("text","")
+                    chat=msg.get("chat",{})
+                    chat_id=str(chat.get("id",""))
+
+                    if not text or not chat_id:
+                        continue
+
+                    if self.chat and chat_id!=self.chat:
+                        self.send("⛔ Bu bot yalnız sahibinin Telegram ID-si üçün aktivdir.",chat_id)
+                        continue
+
+                    if text.startswith("/"):
+                        self.handle(text,chat_id)
+
+            except Exception as e:
+                log.warning("Telegram polling: %s",e)
+                STOP_EVENT.wait(3)
+
+    def start_commands(self):
+        if not self.token:
+            return
+        threading.Thread(
+            target=self.poll,
+            daemon=True,
+            name="TelegramCommands"
+        ).start()
+
 
 TELEGRAM=TelegramManager()
 POSITION_MANAGER.notify=TELEGRAM
 
+
 class ScannerWorker:
-    def __init__(self):self.running=False
+    def __init__(self):
+        self.running=False
+
     def start(self):
         if self.running:return
-        self.running=True;threading.Thread(target=self.loop,daemon=True,name="Scanner").start()
-    def stop(self):self.running=False
+        self.running=True
+        threading.Thread(
+            target=self.loop,
+            daemon=True,
+            name="Scanner"
+        ).start()
+
+    def stop(self):
+        self.running=False
+
     def symbols(self):
         try:
-            x=BYBIT._get("/v5/market/instruments-info",{"category":Config.CATEGORY,"limit":1000})
+            x=BYBIT._get(
+                "/v5/market/instruments-info",
+                {"category":Config.CATEGORY,"limit":1000}
+            )
             rows=x.get("result",{}).get("list",[]) if x else []
-            z=[a["symbol"] for a in rows if a.get("symbol","").endswith("USDT") and a.get("status")=="Trading" and a.get("contractType")=="LinearPerpetual"]
+            z=[
+                a["symbol"] for a in rows
+                if a.get("symbol","").endswith("USDT")
+                and a.get("status")=="Trading"
+                and a.get("contractType")=="LinearPerpetual"
+            ]
             return z or Config.FALLBACK_COINS
-        except:return Config.FALLBACK_COINS
+        except:
+            return Config.FALLBACK_COINS
+
     def loop(self):
         while self.running and not STOP_EVENT.is_set():
             try:
-                results=SCANNER.scan(self.symbols());sent=0
+                results=SCANNER.scan(self.symbols())
+                sent=0
                 for s in results:
-                    if sent>=Config.MAX_SIGNALS_TO_SEND:break
+                    if sent>=Config.MAX_SIGNALS_TO_SEND:
+                        break
                     if TRACKER.add(s):
-                        TELEGRAM.signal(s);sent+=1
-                log.info("SCAN candidates=%d new=%d",len(results),sent)
-            except Exception:log.exception("Scanner error")
+                        TELEGRAM.signal(s)
+                        sent+=1
+                log.info(
+                    "SCAN candidates=%d new=%d",
+                    len(results),sent
+                )
+            except Exception:
+                log.exception("Scanner error")
+
             STOP_EVENT.wait(Config.CHECK_INTERVAL)
 
+
 SCANNER_WORKER=ScannerWorker()
+
 
 try:
     from flask import Flask,jsonify
     app=Flask(__name__)
+
     @app.route("/")
-    def home():return jsonify({"bot":BOT_VERSION,"status":"running","active":len(TRACKER.active())})
+    def home():
+        return jsonify({
+            "bot":BOT_VERSION,
+            "status":"running",
+            "active":len(TRACKER.active())
+        })
+
     @app.route("/health")
-    def health():return jsonify({"status":"ok","version":BOT_VERSION,"active":len(TRACKER.active())})
+    def health():
+        return jsonify({
+            "status":"ok",
+            "version":BOT_VERSION,
+            "active":len(TRACKER.active())
+        })
+
     @app.route("/stats")
-    def stats():return jsonify(TRACKER.stats)
-    def flask_start():app.run(host="0.0.0.0",port=Config.FLASK_PORT,debug=False,use_reloader=False)
+    def stats():
+        return jsonify(TRACKER.stats)
+
+    def flask_start():
+        app.run(
+            host="0.0.0.0",
+            port=Config.FLASK_PORT,
+            debug=False,
+            use_reloader=False
+        )
+
 except:
     app=None
-    def flask_start():pass
+
+    def flask_start():
+        pass
+
 
 def shutdown(sig=None,frame=None):
-    if STOP_EVENT.is_set():return
-    STOP_EVENT.set();SCANNER_WORKER.stop();POSITION_MANAGER.stop();TRACKER.save();log.info("BOT STOPPED")
+    if STOP_EVENT.is_set():
+        return
+    STOP_EVENT.set()
+    SCANNER_WORKER.stop()
+    POSITION_MANAGER.stop()
+    TELEGRAM.running=False
+    TRACKER.save()
+    log.info("BOT STOPPED")
+
 
 signal.signal(signal.SIGINT,shutdown)
 signal.signal(signal.SIGTERM,shutdown)
 
+
 def main():
     validate_config()
+
     log.info("="*40)
     log.info("SWING AI BOT %s",BOT_VERSION)
     log.info("4H + 1H + 15M | BOS + RETEST + CONFIRMATION")
     log.info("="*40)
-    POSITION_MANAGER.start();SCANNER_WORKER.start()
-    if Config.BOT_TOKEN:TELEGRAM.send(f"🟢 SWING AI BOT {BOT_VERSION}\nSTARTED")
-    if app is not None:threading.Thread(target=flask_start,daemon=True).start()
-    while not STOP_EVENT.is_set():STOP_EVENT.wait(5)
+
+    POSITION_MANAGER.start()
+    SCANNER_WORKER.start()
+    TELEGRAM.start_commands()
+
+    if Config.BOT_TOKEN:
+        TELEGRAM.send(
+            f"🟢 SWING AI BOT {BOT_VERSION}\n"
+            f"STARTED\n\n"
+            f"Telegram komandaları aktivdir.\n"
+            f"/help"
+        )
+
+    if app is not None:
+        threading.Thread(
+            target=flask_start,
+            daemon=True
+        ).start()
+
+    while not STOP_EVENT.is_set():
+        STOP_EVENT.wait(5)
+
     shutdown()
 
-if __name__=="__main__":main()
+
+if __name__=="__main__":
+    main()
