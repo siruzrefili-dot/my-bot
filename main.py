@@ -3,7 +3,7 @@ from datetime import datetime,timezone
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from flask import Flask,jsonify
 
-BOT_VERSION="9.9 BALANCED FIXED"
+BOT_VERSION="10.0 BALANCED"
 class Config:
  BOT_TOKEN=os.getenv("BOT_TOKEN","");CHAT_ID=os.getenv("CHAT_ID","1121794078");BASE_URL="https://api.bybit.com";CATEGORY="linear"
  SCAN_TOP_N=40;CHECK_INTERVAL=300;MONITOR_INTERVAL=5;PARALLEL_WORKERS=6
@@ -145,28 +145,41 @@ class Strategy:
  @staticmethod
  def setup(df,d):
   if len(df)<100:return False
-  x=df.iloc[-1]
-  if d=="long":return bool(x.close>x.ema_slow and x.ema_fast>x.ema_slow and x.close>=x.ema_fast*.995)
-  return bool(x.close<x.ema_slow and x.ema_fast<x.ema_slow and x.close<=x.ema_fast*1.005)
+  x=df.iloc[-1];atr=safe_float(x.atr)
+  if atr<=0:return False
+  if d=="long":
+   trend=x.close>x.ema_slow and x.ema_fast>x.ema_slow
+   near=x.close>=x.ema_fast-atr*1.5
+   return bool(trend and near)
+  trend=x.close<x.ema_slow and x.ema_fast<x.ema_slow
+  near=x.close<=x.ema_fast+atr*1.5
+  return bool(trend and near)
 
  @staticmethod
  def pullback(df,d):
   if len(df)<6:return False
   x=df.iloc[-6:];atr=safe_float(df.atr.iloc[-1]);ema=safe_float(df.ema_fast.iloc[-1])
   if atr<=0:return False
-  if d=="long":return bool((x.low<=ema+atr).any())
-  return bool((x.high>=ema-atr).any())
+  if d=="long":return bool((x.low<=ema+atr*1.5).any())
+  return bool((x.high>=ema-atr*1.5).any())
 
  @staticmethod
- def rsi_ok(df,d):
-  if len(df)<3:return False
-  a=safe_float(df.rsi.iloc[-2]);b=safe_float(df.rsi.iloc[-1])
-  return b>=47 and b>=a if d=="long" else b<=53 and b<=a
+ def rsi_score(df,d):
+  if len(df)<3:return 50
+  b=safe_float(df.rsi.iloc[-1])
+  if d=="long":
+   if 48<=b<=58:return 100
+   if 42<=b<48 or 58<b<=65:return 75
+   if b<42:return 55
+   return 45
+  if 42<=b<=52:return 100
+  if 35<=b<42 or 52<b<=58:return 75
+  if b>58:return 55
+  return 45
 
  @staticmethod
  def bos(df,d):
-  sh,sl=Structure.swings(df);n=len(df);best=None
-  swings=sh if d=="long" else sl
+  sh,sl=Structure.swings(df);n=len(df);best=None;swings=sh if d=="long" else sl
   for si,level in reversed(swings):
    if si<max(0,n-Config.BOS_LOOKBACK-10):continue
    for i in range(si+1,n):
@@ -255,8 +268,7 @@ class BTCFilter:
  def direction(client):
   d4=client.klines("BTCUSDT",Config.TREND_TF,230);d1=client.klines("BTCUSDT",Config.SETUP_TF,220)
   if not(valid(d4,220) and valid(d1,100)):return "neutral"
-  d4=Indicators.add(d4);d1=Indicators.add(d1)
-  r4=Regime.analyze(d4);x=d1.iloc[-1]
+  d4=Indicators.add(d4);d1=Indicators.add(d1);r4=Regime.analyze(d4);x=d1.iloc[-1]
   if r4["direction"]=="long" and x.close>x.ema_slow and x.ema_fast>x.ema_slow:return "long"
   if r4["direction"]=="short" and x.close<x.ema_slow and x.ema_fast<x.ema_slow:return "short"
   return "neutral"
@@ -298,8 +310,7 @@ class Correlation:
  @staticmethod
  def allowed(client,tracker,symbol,direction,extra=None):
   if not Config.CORRELATION_FILTER_ENABLED:return True
-  active=tracker.active()+(extra or [])
-  base=client.klines(symbol,Config.ENTRY_TF,80)
+  active=tracker.active()+(extra or []);base=client.klines(symbol,Config.ENTRY_TF,80)
   if len(base)<50:return True
   a=base.close.pct_change().dropna();ncor=0
   for s in active:
@@ -324,7 +335,6 @@ class SignalScanner:
    if d not in ("long","short"):return self.reject(s,"4H_TREND")
    if not Strategy.setup(d1,d):return self.reject(s,"1H_SETUP")
    if not Strategy.pullback(d1,d):return self.reject(s,"PULLBACK")
-   if not Strategy.rsi_ok(d15,d):return self.reject(s,"RSI")
    bos=Strategy.bos(d15,d)
    if not bos:return self.reject(s,"BOS")
    seq=Strategy.sequence(d15,bos,d)
@@ -337,8 +347,7 @@ class SignalScanner:
 
    e=safe_float(d15.close.iloc[-1]);atr=safe_float(d15.atr.iloc[-1])
    if e<=0 or atr<=0:return self.reject(s,"PRICE")
-   lev=Risk.leverage(atr,e);sl=Strategy.stop(d15,e,d)
-   sl_dist=abs(e-sl)
+   lev=Risk.leverage(atr,e);sl=Strategy.stop(d15,e,d);sl_dist=abs(e-sl)
    if sl_dist>atr*Config.MAX_SL_ATR:
     sl=e-atr*Config.MAX_SL_ATR if d=="long" else e+atr*Config.MAX_SL_ATR
    if d=="long" and sl>=e:return self.reject(s,"SL")
@@ -346,8 +355,7 @@ class SignalScanner:
 
    inst=self.client.instrument(s);tick=safe_float(inst.get("tick"));step=safe_float(inst.get("step"));mn=safe_float(inst.get("min"));mx=safe_float(inst.get("max"))
    if tick>0:
-    e=Precision.price(e,tick)
-    sl=Precision.price(sl,tick,"down" if d=="long" else "up")
+    e=Precision.price(e,tick);sl=Precision.price(sl,tick,"down" if d=="long" else "up")
    rd=Risk.size(e,sl,lev)
    if not rd:return self.reject(s,"RISK")
 
@@ -360,12 +368,11 @@ class SignalScanner:
    if not Filters.funding(fund):return self.reject(s,"FUNDING")
    if not Filters.oi(oi):return self.reject(s,"OI")
    if not BTCFilter.allowed(self.client,d,s):return self.reject(s,"BTC")
-
    spread=Filters.spread(self.client.book(s))
    if spread>.25:return self.reject(s,"SPREAD")
 
-   zone=Strategy.zone_score(d15,d)
-   rsi=safe_float(d15.rsi.iloc[-1]);momentum=75 if (d=="long" and rsi>=50) or (d=="short" and rsi<=50) else 60
+   zone=Strategy.zone_score(d15,d);rsi=Strategy.rsi_score(d15,d)
+   momentum=90 if rsi>=90 else rsi
    quality=safe_float(reg["quality"]);vs=min(vol/1.5*100,100);ois=min(max(50+oi*2.5,0),100);rrs=min(rr/Config.MAX_RR*100,100);ss=max(0,100-spread/.25*100)
    score=min(100,quality*.23+vs*.14+ois*.08+rrs*.18+momentum*.10+ss*.08+zone*.09+10)
    if score<Config.MIN_SCORE:return self.reject(s,f"SCORE_{score:.1f}")
@@ -378,7 +385,8 @@ class SignalScanner:
     "rr":round(rr,2),"score":round(score,2),"leverage":lev,"risk_amount":rd["risk"],
     "position_size":qty,"notional":qty*e,"estimated_cost":Risk.costs(qty*e),"atr":atr,
     "volume_ratio":vol,"oi_change_pct":oi,"funding_rate":fund,"spread_pct":spread,
-    "zone_score":zone,"sequence":"BOS -> RETEST -> CONFIRMATION","bos_level":seq["level"],
+    "rsi":safe_float(d15.rsi.iloc[-1]),"rsi_score":rsi,"zone_score":zone,
+    "sequence":"BOS -> RETEST -> CONFIRMATION","bos_level":seq["level"],
     "bos_bar":seq["bos"],"retest_bar":seq["retest"],"confirm_bar":seq["confirm"],
     "created_at":utc_iso(),"status":"NEW"
    },"symbol":s,"reason":None}
@@ -516,7 +524,7 @@ class TelegramManager:
    return r.status_code==200 and r.json().get("ok",False)
   except:return False
  def signal(self,s):
-  return self.send(f"🚨 SWING AI {s['direction'].upper()}\n\n{s['symbol']}\nEntry: {s['entry']:.8g}\nSL: {s['sl']:.8g}\nTP: {s['tp']:.8g}\nRR: 1:{s['rr']:.2f}\nScore: {s['score']}/100\nLeverage: {s['leverage']}x\nRisk: {s['risk_amount']:.2f} USDT\n\nBOS → RETEST → CONFIRMATION")
+  return self.send(f"🚨 SWING AI {s['direction'].upper()}\n\n{s['symbol']}\nEntry: {s['entry']:.8g}\nSL: {s['sl']:.8g}\nTP: {s['tp']:.8g}\nRR: 1:{s['rr']:.2f}\nScore: {s['score']}/100\nRSI: {s['rsi']:.1f}\nLeverage: {s['leverage']}x\nRisk: {s['risk_amount']:.2f} USDT\n\nBOS → RETEST → CONFIRMATION")
  def notify_close(self,s,result,reason,price,r):
   icon="✅" if result=="WIN" else "❌" if result=="LOSS" else "🟡";self.send(f"{icon} CLOSED\n{s['symbol']} {s['direction'].upper()}\nResult: {result}\nReason: {reason}\nPrice: {price:.8g}\nR: {r:.2f}")
  def notify_breakeven(self,s):self.send(f"🛡️ BREAKEVEN\n{s['symbol']}\nSL → Entry")
@@ -612,10 +620,10 @@ def shutdown(sig=None,frame=None):
 signal.signal(signal.SIGINT,shutdown);signal.signal(signal.SIGTERM,shutdown)
 
 def main():
- validate_config();log.info("="*45);log.info("SWING AI BOT %s",BOT_VERSION);log.info("4H EMA + 1H SETUP/PULLBACK + 15M BOS/RETEST/CONFIRM");log.info("TOP 40 TURNOVER | BALANCED FIXED");log.info("="*45)
+ validate_config();log.info("="*45);log.info("SWING AI BOT %s",BOT_VERSION);log.info("4H EMA + 1H BALANCED SETUP/PULLBACK + 15M BOS/RETEST/CONFIRM");log.info("TOP 40 TURNOVER | RSI SOFT FILTER");log.info("="*45)
  POSITION_MANAGER.start();SCANNER_WORKER.start();TELEGRAM.start_commands()
  if Config.BOT_TOKEN:
-  TELEGRAM.send(f"🟢 SWING AI BOT {BOT_VERSION}\nSTARTED\n\n4H EMA TREND\n1H SETUP + PULLBACK\n15M BOS → RETEST → CONFIRMATION\nTOP 40 LIQUIDITY\n/help")
+  TELEGRAM.send(f"🟢 SWING AI BOT {BOT_VERSION}\nSTARTED\n\n4H EMA TREND\n1H BALANCED SETUP + PULLBACK\n15M BOS → RETEST → CONFIRMATION\nRSI = SCORE FILTER\nTOP 40 LIQUIDITY\n/help")
  threading.Thread(target=flask_start,daemon=True,name="Flask").start()
  while not STOP_EVENT.is_set():STOP_EVENT.wait(5)
  shutdown()
