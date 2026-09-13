@@ -234,11 +234,30 @@ class Filters:
   return math.isfinite(a) and math.isfinite(b) and a>0 and (b-a)/a*100>=Config.MIN_OI_CHANGE_PCT
 class Filters:
  @staticmethod
+ def volatility(df):
+  a=safe(df.atr_pct.iloc[-1],math.nan)
+  return math.isfinite(a) and Config.MIN_ATR_PCT<=a<=Config.MAX_ATR_PCT
+ @staticmethod
+ def volume(df):
+  return safe(df.volume_ratio.iloc[-1],0)>=Config.MIN_VOLUME_RATIO
+ @staticmethod
+ def funding(symbol):
+  x=BYBIT.funding(symbol)
+  return math.isfinite(x) and abs(x)<=Config.MAX_ABS_FUNDING
+ @staticmethod
+ def oi(symbol):
+  d=BYBIT.oi(symbol,Config.OI_LOOKBACK+2)
+  if len(d)<2:return False
+  a=safe(d.oi_value.iloc[0],math.nan);b=safe(d.oi_value.iloc[-1],math.nan)
+  return math.isfinite(a) and math.isfinite(b) and a>0 and (b-a)/a*100>=Config.MIN_OI_CHANGE_PCT
+ @staticmethod
  def spread(symbol):
-  x=BYBIT.spread(symbol);return math.isfinite(x) and x<=Config.MAX_SPREAD_PCT
+  x=BYBIT.spread(symbol)
+  return math.isfinite(x) and x<=Config.MAX_SPREAD_PCT
  @staticmethod
  def ticker(symbol):
-  x=BYBIT.ticker(symbol);return safe(x.get("lastPrice"))>0 and safe(x.get("bid1Price"))>0 and safe(x.get("ask1Price"))>0
+  x=BYBIT.ticker(symbol)
+  return safe(x.get("lastPrice"))>0 and safe(x.get("bid1Price"))>0 and safe(x.get("ask1Price"))>0
  @staticmethod
  def btc(symbol,d):
   if not Config.BTC_FILTER_ENABLED or symbol=="BTCUSDT":return True
@@ -258,7 +277,8 @@ class Correlation:
    for s in active:
     b=BYBIT.klines(s,"60",100)
     if len(b)<50:continue
-    br=b.close.pct_change().dropna();n=min(len(ar),len(br))
+    br=b.close.pct_change().dropna()
+    n=min(len(ar),len(br))
     c=ar.iloc[-n:].corr(br.iloc[-n:])
     if math.isfinite(float(c)) and abs(float(c))>=Config.CORRELATION_THRESHOLD:return False
    return True
@@ -269,8 +289,10 @@ class Risk:
  def structural_stop(df,e,d):
   sh,sl=Structure.swings(df);atr=safe(df.atr.iloc[-1]);buf=atr*Config.SL_BUFFER_ATR;cut=max(0,len(df)-Config.TARGET_LOOKBACK_15)
   if d=="long":
-   v=[x for i,x in sl if i>=cut and x<e];return max(v)-buf if v else e-atr*Config.MIN_SL_ATR
-  v=[x for i,x in sh if i>=cut and x>e];return min(v)+buf if v else e+atr*Config.MIN_SL_ATR
+   v=[x for i,x in sl if i>=cut and x<e]
+   return max(v)-buf if v else e-atr*Config.MIN_SL_ATR
+  v=[x for i,x in sh if i>=cut and x>e]
+  return min(v)+buf if v else e+atr*Config.MIN_SL_ATR
  @staticmethod
  def targets(df,d,e,lookback):
   sh,sl=Structure.swings(df);cut=max(0,len(df)-lookback)
@@ -284,9 +306,11 @@ class Risk:
   sl=min(raw,e-mn) if d=="long" else max(raw,e+mn);risk=abs(e-sl)
   if risk<=0 or risk>mx:return None
   cs=[]
-  for df,lb in ((d1,Config.TARGET_LOOKBACK_1H),(d15,Config.TARGET_LOOKBACK_15),(d4,Config.TARGET_LOOKBACK_4H)):cs+=Risk.targets(df,d,e,lb)
+  for df,lb in ((d1,Config.TARGET_LOOKBACK_1H),(d15,Config.TARGET_LOOKBACK_15),(d4,Config.TARGET_LOOKBACK_4H)):
+   cs+=Risk.targets(df,d,e,lb)
   cs=sorted(set(cs),reverse=d=="short")
-  lo=e+risk*Config.MIN_RR if d=="long" else e-risk*Config.MIN_RR;hi=e+risk*Config.MAX_RR if d=="long" else e-risk*Config.MAX_RR
+  lo=e+risk*Config.MIN_RR if d=="long" else e-risk*Config.MIN_RR
+  hi=e+risk*Config.MAX_RR if d=="long" else e-risk*Config.MAX_RR
   for lv in cs:
    tp=lv-atr*Config.TARGET_BUFFER_ATR if d=="long" else lv+atr*Config.TARGET_BUFFER_ATR
    if (lo<=tp<=hi if d=="long" else hi<=tp<=lo):
@@ -299,8 +323,7 @@ class Score:
  def calc(d4,d1,d15,reg,bos,rc):
   s=0
   s+=20 if reg["quality"]>=60 else 12
-  s+=15
-  s+=10
+  s+=15;s+=10
   s+=10 if Strategy.pullback(d1,reg["direction"]) else 0
   s+=10 if Strategy.rsi_allowed(d15,reg["direction"]) else 0
   s+=10 if Filters.volatility(d15) else 0
