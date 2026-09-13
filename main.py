@@ -1,11 +1,11 @@
-# SWING AI v11.2 BALANCED - PART 1/8
+# SWING AI v11.3 BALANCED TUNED - PART 1/8
 import os,time,json,math,signal,logging,threading
 import requests,numpy as np,pandas as pd
 from datetime import datetime,timezone
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from flask import Flask,jsonify
 
-BOT_VERSION="11.2 BALANCED"
+BOT_VERSION="11.3 BALANCED TUNED"
 
 class Config:
  BOT_TOKEN=os.getenv("BOT_TOKEN","");CHAT_ID=os.getenv("CHAT_ID","1121794078")
@@ -13,7 +13,7 @@ class Config:
  SCAN_TOP_N=40;CANDIDATE_LIMIT=80;CHECK_INTERVAL=300;MONITOR_INTERVAL=5;PARALLEL_WORKERS=3
  TREND_TF="240";SETUP_TF="60";ENTRY_TF="15";EMA_FAST=50;EMA_SLOW=200
  RSI_PERIOD=14;ATR_PERIOD=14;VOLUME_LOOKBACK=20
- # === BALANCED CORE ===
+ # === CORE BALANCED ===
  MIN_SCORE=58;MIN_RR=2.0;MAX_RR=3.5
  ACCOUNT_BALANCE=1000.0;RISK_PERCENT=1.0
  MAX_ACTIVE_SIGNALS=3;MAX_DAILY_SIGNALS=5;MAX_SIGNALS_TO_SEND=2
@@ -21,15 +21,19 @@ class Config:
  MIN_VOLUME_RATIO=1.05;MIN_EMA_DISTANCE_PCT=0.09
  MIN_SL_ATR=0.80;MAX_SL_ATR=2.50;SL_BUFFER_ATR=0.15
  LONG_RSI_MIN=40.0;LONG_RSI_MAX=68.0;SHORT_RSI_MIN=32.0;SHORT_RSI_MAX=60.0
- BOS_BUFFER_ATR=0.05;ALLOW_RECLAIM_BOS=True;BOS_LOOKBACK=75
- RETEST_MAX_BARS=8;RETEST_ATR_DISTANCE=0.70
- CONFIRMATION_MAX_BARS_AFTER_RETEST=3;MAX_CONFIRM_AGE=3
- MAX_ENTRY_EXTENSION_ATR=1.3
+ # === v11.3 TUNED ===
+ BOS_BUFFER_ATR=0.05;ALLOW_RECLAIM_BOS=True;BOS_LOOKBACK=100
+ RETEST_MAX_BARS=12;RETEST_ATR_DISTANCE=0.70
+ CONFIRMATION_MAX_BARS_AFTER_RETEST=5;MAX_CONFIRM_AGE=3
+ MAX_ENTRY_EXTENSION_ATR=2.0
+ # === TARGETS ===
  TARGET_LOOKBACK_15=80;TARGET_LOOKBACK_1H=80;TARGET_LOOKBACK_4H=80
  TARGET_BUFFER_ATR=0.10
+ # === FILTERS ===
  MAX_ABS_FUNDING=0.003;MIN_OI_CHANGE_PCT=-10.0;OI_LOOKBACK=5;MAX_SPREAD_PCT=0.20
  BTC_FILTER_ENABLED=True;CORRELATION_FILTER_ENABLED=False
  MAX_CORRELATED_ACTIVE=2;CORRELATION_THRESHOLD=0.85
+ # === RUNTIME ===
  MAX_HOLD_HOURS=96;DATA_DIR="swing_bot_data"
  FLASK_PORT=int(os.getenv("PORT","10000"))
  REQUEST_TIMEOUT=15;CACHE_TTL=10;TICKER_CACHE_TTL=30;INSTRUMENT_CACHE_TTL=3600
@@ -66,7 +70,7 @@ class Cache:
    return x[0]
  def set(self,k,v):
   with self.lock:self.data[k]=(v,time.time())
-# SWING AI v11.2 BALANCED - PART 2/8
+# SWING AI v11.3 BALANCED TUNED - PART 2/8
 class BybitClient:
  def __init__(self):
   self.base=Config.BASE_URL
@@ -76,7 +80,7 @@ class BybitClient:
   self.local=threading.local();self._lock=threading.Lock();self._last=0.0
  def session(self):
   if not hasattr(self.local,"session"):
-   s=requests.Session();s.headers.update({"User-Agent":"SwingAI/11.2"})
+   s=requests.Session();s.headers.update({"User-Agent":"SwingAI/11.3"})
    self.local.session=s
   return self.local.session
  def _rate(self):
@@ -167,7 +171,7 @@ def validate_config():
  if not (Config.LONG_RSI_MIN<Config.LONG_RSI_MAX and Config.SHORT_RSI_MIN<Config.SHORT_RSI_MAX):
   raise ValueError("rsi")
  if not (0<Config.MIN_SL_ATR<Config.MAX_SL_ATR):raise ValueError("sl_atr")
-# SWING AI v11.2 BALANCED - PART 3/8
+# SWING AI v11.3 BALANCED TUNED - PART 3/8
 class Indicators:
  @staticmethod
  def ema(s,n):return s.ewm(span=n,adjust=False).mean()
@@ -220,7 +224,7 @@ class Structure:
   if sh[-1][1]>sh[-2][1] and sl[-1][1]>sl[-2][1]:return "bullish"
   if sh[-1][1]<sh[-2][1] and sl[-1][1]<sl[-2][1]:return "bearish"
   return "neutral"
-# SWING AI v11.2 BALANCED - PART 4/8
+# SWING AI v11.3 BALANCED TUNED - PART 4/8
 class Regime:
  @staticmethod
  def analyze(df):
@@ -239,11 +243,12 @@ class Regime:
 class Strategy:
  @staticmethod
  def setup(df,d):
-  # BALANCED: yalnız EMA alignment (trend istiqaməti)
+  # v11.3: OR məntiqi - EMA cross VƏ YA close doğru tərəfdə
   if len(df)<100:return False
   x=df.iloc[-1]
-  if d=="long":return bool(x.ema_fast>x.ema_slow)
-  return bool(x.ema_fast<x.ema_slow)
+  if d=="long":
+   return bool(x.ema_fast>x.ema_slow or x.close>x.ema_slow)
+  return bool(x.ema_fast<x.ema_slow or x.close<x.ema_slow)
  @staticmethod
  def pullback(df,d):
   if len(df)<8:return False
@@ -295,7 +300,8 @@ class Strategy:
      cands.append({"level":lv,"bar":i,"swing":si,"type":"CLOSE_BOS" if cb else "RECLAIM_BOS"});break
   if not cands:return None
   best=max(cands,key=lambda z:z["bar"]);age=n-1-best["bar"]
-  max_age=Config.RETEST_MAX_BARS+Config.CONFIRMATION_MAX_BARS_AFTER_RETEST+2
+  # v11.3: +5 əvəzinə +2
+  max_age=Config.RETEST_MAX_BARS+Config.CONFIRMATION_MAX_BARS_AFTER_RETEST+5
   return best if age<=max_age else None
  @staticmethod
  def sequence(df,bos,d):
@@ -330,7 +336,7 @@ class Strategy:
   if p>=mid:return 100
   if p>=mid-atr:return 70
   return 35
-# SWING AI v11.2 BALANCED - PART 5/8
+# SWING AI v11.3 BALANCED TUNED - PART 5/8
 class Filters:
  @staticmethod
  def volatility(df):
@@ -427,7 +433,7 @@ class Risk:
    if Config.MIN_RR<=rr<=Config.MAX_RR:
     return {"entry":e,"sl":sl,"tp":tp,"risk":risk,"rr":rr}
   return None
-# SWING AI v11.2 BALANCED - PART 6/8
+# SWING AI v11.3 BALANCED TUNED - PART 6/8
 class Scoring:
  @staticmethod
  def calculate(d4,d15,d,seq):
@@ -504,7 +510,7 @@ def analyze_symbol(s):
   a=Analyzer(s);x=a.run();return x,("" if x else a.reject)
  except Exception as e:
   log.warning("%s: %s",s,e);return None,"ERROR"
-# SWING AI v11.2 BALANCED - PART 7/8
+# SWING AI v11.3 BALANCED TUNED - PART 7/8
 class Store:
  def __init__(self):
   self.lock=threading.RLock();self.active=[];self.closed=[]
@@ -635,7 +641,7 @@ class Telegram:
    return f"🚫 REJECTIONS\n{body}"
   if t=="/help":return "/status\n/signals\n/stats\n/scan\n/rejections\n/help"
   return None
-# SWING AI v11.2 BALANCED - PART 8/8
+# SWING AI v11.3 BALANCED TUNED - PART 8/8
 class PositionManager:
  def check(self,x):
   t=BYBIT.ticker(x["symbol"],fresh=True)
