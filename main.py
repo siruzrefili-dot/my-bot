@@ -1,5 +1,5 @@
 # ============================================
-# SWING AI v11 - PART 1/8
+# SWING AI v11.1 - PART 1/8
 # Imports, Config, Utils, Cache
 # ============================================
 import os, time, json, math, signal, logging, threading
@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, jsonify
 
-BOT_VERSION = "11.0 STRICT PRO"
+BOT_VERSION = "11.1 SOFT STRUCT PRO"
 
 class Config:
     BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -30,7 +30,7 @@ class Config:
     RSI_PERIOD = 14
     ATR_PERIOD = 14
     VOLUME_LOOKBACK = 20
-    MIN_SCORE = 62
+    MIN_SCORE = 58
     MIN_RR = 2.0
     MAX_RR = 3.5
     ACCOUNT_BALANCE = 1000.0
@@ -38,10 +38,10 @@ class Config:
     MAX_ACTIVE_SIGNALS = 3
     MAX_DAILY_SIGNALS = 5
     MAX_SIGNALS_TO_SEND = 3
-    MIN_ATR_PCT = 0.25
-    MAX_ATR_PCT = 8.0
+    MIN_ATR_PCT = 0.15
+    MAX_ATR_PCT = 12.0
     MIN_VOLUME_RATIO = 1.05
-    MIN_EMA_DISTANCE_PCT = 0.10
+    MIN_EMA_DISTANCE_PCT = 0.08
     MIN_SL_ATR = 0.80
     MAX_SL_ATR = 2.50
     SL_BUFFER_ATR = 0.15
@@ -129,7 +129,7 @@ class Cache:
         with self.lock:
             self.data[k] = (v, time.time())
 # ============================================
-# SWING AI v11 - PART 2/8
+# SWING AI v11.1 - PART 2/8
 # Bybit API Client (retry, rate limit)
 # ============================================
 
@@ -146,7 +146,7 @@ class BybitClient:
     def session(self):
         if not hasattr(self.local, "session"):
             s = requests.Session()
-            s.headers.update({"User-Agent": "SwingAI/11.0"})
+            s.headers.update({"User-Agent": "SwingAI/11.1"})
             self.local.session = s
         return self.local.session
 
@@ -286,7 +286,7 @@ def validate_config():
     if not (0 < Config.MIN_SL_ATR < Config.MAX_SL_ATR):
         raise ValueError("sl atr")
 # ============================================
-# SWING AI v11 - PART 3/8
+# SWING AI v11.1 - PART 3/8
 # Indicators + Structure (swing high/low)
 # ============================================
 
@@ -365,8 +365,8 @@ class Structure:
             return "bearish"
         return "neutral"
 # ============================================
-# SWING AI v11 - PART 4/8
-# Regime + Strategy (BOS, Retest, Sequence)
+# SWING AI v11.1 - PART 4/8
+# Regime (soft structure) + Strategy (BOS, Retest)
 # ============================================
 
 class Regime:
@@ -378,19 +378,42 @@ class Regime:
         st = Structure.trend(df)
         dist = abs(safe_float(x.ema_distance_pct))
         atr_pct = safe_float(x.atr_pct)
-        long_align = (x.close > x.ema_slow and x.ema_fast > x.ema_slow
-                      and dist >= Config.MIN_EMA_DISTANCE_PCT)
-        short_align = (x.close < x.ema_slow and x.ema_fast < x.ema_slow
-                       and dist >= Config.MIN_EMA_DISTANCE_PCT)
-        aligned_long = long_align and st == "bullish"
-        aligned_short = short_align and st == "bearish"
-        quality = min(dist, 1) * 35 + min(atr_pct / 3, 1) * 20
-        quality += 45 if (aligned_long or aligned_short) else 20
-        if aligned_long:
-            return {"direction": "long", "quality": min(100, quality), "structure": st}
-        if aligned_short:
-            return {"direction": "short", "quality": min(100, quality), "structure": st}
-        return {"direction": "neutral", "quality": min(100, quality), "structure": st}
+
+        ema_bull = x.close > x.ema_slow and x.ema_fast > x.ema_slow
+        ema_bear = x.close < x.ema_slow and x.ema_fast < x.ema_slow
+
+        # Hard requirement 1: EMA alignment
+        if not (ema_bull or ema_bear):
+            return {"direction": "neutral", "quality": 25, "structure": st}
+
+        # Hard requirement 2: EMA separation
+        if dist < Config.MIN_EMA_DISTANCE_PCT:
+            return {"direction": "neutral", "quality": 35, "structure": st}
+
+        # Direction chosen
+        if ema_bull:
+            direction = "long"
+            structure_match = (st == "bullish")
+            structure_opposite = (st == "bearish")
+        else:
+            direction = "short"
+            structure_match = (st == "bearish")
+            structure_opposite = (st == "bullish")
+
+        # Quality scoring - structure is BONUS, not hard requirement
+        q_dist = min(dist / 1.5, 1.0) * 40       # 0-40 puan
+        q_atr = min(atr_pct / 2.0, 1.0) * 20     # 0-20 puan
+        if structure_match:
+            q_struct = 40
+        elif structure_opposite:
+            q_struct = 0
+        else:
+            q_struct = 25  # neutral structure = partial credit
+
+        quality = q_dist + q_atr + q_struct
+        return {"direction": direction,
+                "quality": min(100, max(0, quality)),
+                "structure": st}
 
 class Strategy:
     @staticmethod
@@ -398,9 +421,10 @@ class Strategy:
         if len(df) < 100:
             return False
         x = df.iloc[-1]
+        # Yalnız EMA cross + qiymət slow EMA-nın doğru tərəfində olsun
         if d == "long":
-            return bool(x.close > x.ema_fast > x.ema_slow)
-        return bool(x.close < x.ema_fast < x.ema_slow)
+            return bool(x.ema_fast > x.ema_slow and x.close > x.ema_slow)
+        return bool(x.ema_fast < x.ema_slow and x.close < x.ema_slow)
 
     @staticmethod
     def pullback(df, d):
@@ -548,7 +572,7 @@ class Strategy:
             return 70
         return 35
 # ============================================
-# SWING AI v11 - PART 5/8
+# SWING AI v11.1 - PART 5/8
 # Filters + BTC + Correlation + Risk
 # ============================================
 
@@ -680,8 +704,8 @@ class Risk:
                 return {"entry": e, "sl": sl, "tp": tp, "risk": risk, "rr": rr}
         return None
 # ============================================
-# SWING AI v11 - PART 6/8
-# Scoring + Analyzer
+# SWING AI v11.1 - PART 6/8
+# Scoring + Analyzer (4H debug əlavə edildi)
 # ============================================
 
 class Scoring:
@@ -720,6 +744,15 @@ class Analyzer:
         d15 = Indicators.add(d15)
         reg = Regime.analyze(d4)
         d = reg["direction"]
+        # 4H fail səbəbi debug
+        if d == "neutral":
+            x4 = d4.iloc[-1]
+            ema_bull = x4.close > x4.ema_slow and x4.ema_fast > x4.ema_slow
+            ema_bear = x4.close < x4.ema_slow and x4.ema_fast < x4.ema_slow
+            if not (ema_bull or ema_bear):
+                STORE.add_bos_debug("4H_NO_EMA_ALIGN")
+            else:
+                STORE.add_bos_debug("4H_LOW_DISTANCE")
         checks = [(d != "neutral", "4H_TREND"),
                   (Strategy.setup(d1, d), "1H_SETUP"),
                   (Strategy.pullback(d1, d), "1H_PULLBACK"),
@@ -816,7 +849,7 @@ def analyze_symbol(s):
         log.warning("%s: %s", s, e)
         return None, "ERROR"
 # ============================================
-# SWING AI v11 - PART 7/8
+# SWING AI v11.1 - PART 7/8
 # Store + Performance + Telegram
 # ============================================
 
@@ -997,7 +1030,7 @@ class Telegram:
             return "/status\n/signals\n/stats\n/scan\n/rejections\n/help"
         return None
 # ============================================
-# SWING AI v11 - PART 8/8
+# SWING AI v11.1 - PART 8/8
 # Scanner + PositionManager + Flask + Main
 # ============================================
 
