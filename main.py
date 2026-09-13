@@ -256,32 +256,41 @@ class Correlation:
     if math.isfinite(safe_float(c,math.nan)) and c>=Config.CORRELATION_THRESHOLD:n+=1
    except:continue
   return n<Config.MAX_CORRELATED_ACTIVE
-
 class Risk:
  @staticmethod
  def structural_stop(df,e,d):
   sh,sl=Structure.swings(df);atr=safe_float(df.atr.iloc[-1]);buf=atr*Config.SL_BUFFER_ATR
+  cut=max(0,len(df)-Config.TARGET_LOOKBACK_15)
   if d=="long":
-   v=[x for i,x in sl if i>=max(0,len(df)-Config.TARGET_LOOKBACK_15) and x<e];return max(v)-buf if v else e-atr*Config.MIN_SL_ATR
-  v=[x for i,x in sh if i>=max(0,len(df)-Config.TARGET_LOOKBACK_15) and x>e];return min(v)+buf if v else e+atr*Config.MIN_SL_ATR
+   v=[x for i,x in sl if i>=cut and x<e]
+   return max(v)-buf if v else e-atr*Config.MIN_SL_ATR
+  v=[x for i,x in sh if i>=cut and x>e]
+  return min(v)+buf if v else e+atr*Config.MIN_SL_ATR
+
  @staticmethod
-  def target_candidates(df,d,e,lookback):
-  sh,sl=Structure.swings(df);cut=max(0,len(df)-lookback);v=[x for i,x in (sh if d=="long" else sl) if i>=cut and (x>e if d=="long" else x<e)]
+ def target_candidates(df,d,e,lookback):
+  sh,sl=Structure.swings(df);cut=max(0,len(df)-lookback)
+  v=[x for i,x in (sh if d=="long" else sl) if i>=cut and (x>e if d=="long" else x<e)]
   return sorted(set(v),reverse=(d=="short"))
+
  @staticmethod
  def levels(d15,d1,d4,d):
   e=safe_float(d15.close.iloc[-1]);atr=safe_float(d15.atr.iloc[-1])
   if e<=0 or atr<=0:return None
-  raw=Risk.structural_stop(d15,e,d);minrisk=atr*Config.MIN_SL_ATR;maxrisk=atr*Config.MAX_SL_ATR
-  sl=min(raw,e-minrisk) if d=="long" else max(raw,e+minrisk);risk=abs(e-sl)
-  if risk<=0 or risk>maxrisk:return None
+  raw=Risk.structural_stop(d15,e,d);mn=atr*Config.MIN_SL_ATR;mx=atr*Config.MAX_SL_ATR
+  sl=min(raw,e-mn) if d=="long" else max(raw,e+mn)
+  risk=abs(e-sl)
+  if risk<=0 or risk>mx:return None
   cs=Risk.target_candidates(d1,d,e,Config.TARGET_LOOKBACK_1H)+Risk.target_candidates(d15,d,e,Config.TARGET_LOOKBACK_15)+Risk.target_candidates(d4,d,e,Config.TARGET_LOOKBACK_4H)
-  cs=sorted(set(cs),reverse=(d=="short"));lo=e+risk*Config.MIN_RR if d=="long" else e-risk*Config.MIN_RR;hi=e+risk*Config.MAX_RR if d=="long" else e-risk*Config.MAX_RR
+  cs=sorted(set(cs),reverse=(d=="short"))
+  lo=e+risk*Config.MIN_RR if d=="long" else e-risk*Config.MIN_RR
+  hi=e+risk*Config.MAX_RR if d=="long" else e-risk*Config.MAX_RR
   for level in cs:
    tp=level-atr*Config.TARGET_BUFFER_ATR if d=="long" else level+atr*Config.TARGET_BUFFER_ATR
    if (lo<=tp<=hi if d=="long" else hi<=tp<=lo):
     rr=abs(tp-e)/risk
-    if Config.MIN_RR<=rr<=Config.MAX_RR:return {"entry":e,"sl":sl,"tp":tp,"risk":risk,"rr":rr}
+    if Config.MIN_RR<=rr<=Config.MAX_RR:
+     return {"entry":e,"sl":sl,"tp":tp,"risk":risk,"rr":rr}
   return None
 
 class Scoring:
