@@ -1,11 +1,11 @@
-# SWING AI v12.1 ELITE TIER + VOL FIX - PART 1/8
-import os,time,json,math,signal,logging,threading
+# SWING AI v12.2 ELITE TIER + VOL FIX + ERROR LOG - PART 1/8
+import os,time,json,math,signal,logging,threading,traceback
 import requests,numpy as np,pandas as pd
 from datetime import datetime,timezone
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from flask import Flask,jsonify
 
-BOT_VERSION="12.1 ELITE TIER + VOL FIX"
+BOT_VERSION="12.2 ELITE + VOL + ERR"
 
 class Config:
  BOT_TOKEN=os.getenv("BOT_TOKEN","");CHAT_ID=os.getenv("CHAT_ID","1121794078")
@@ -19,7 +19,7 @@ class Config:
  MAX_ACTIVE_SIGNALS=3;MAX_DAILY_SIGNALS=5;MAX_SIGNALS_TO_SEND=2
  # === TIER ===
  TIER_A_SCORE=72;TIER_B_SCORE=65;MIN_RR_ELITE=2.3
- # === VOLATİLİK / VOLUME ===
+ # === VOLATILIK / VOLUME ===
  MIN_ATR_PCT=0.20;MAX_ATR_PCT=10.0
  MIN_VOLUME_RATIO=1.00;VOLUME_WINDOW=5
  MIN_EMA_DISTANCE_PCT=0.09
@@ -35,7 +35,7 @@ class Config:
  # === TARGETS ===
  TARGET_LOOKBACK_15=80;TARGET_LOOKBACK_1H=80;TARGET_LOOKBACK_4H=80
  TARGET_BUFFER_ATR=0.10
- # === FİLTRLƏR ===
+ # === FILTRLER ===
  MAX_ABS_FUNDING=0.003;MIN_OI_CHANGE_PCT=-10.0;OI_LOOKBACK=5;MAX_SPREAD_PCT=0.20
  BTC_FILTER_ENABLED=True;CORRELATION_FILTER_ENABLED=False
  MAX_CORRELATED_ACTIVE=2;CORRELATION_THRESHOLD=0.85
@@ -43,7 +43,7 @@ class Config:
  MAX_HOLD_HOURS=96;DATA_DIR="swing_bot_data"
  FLASK_PORT=int(os.getenv("PORT","10000"))
  REQUEST_TIMEOUT=15;CACHE_TTL=10;TICKER_CACHE_TTL=30;INSTRUMENT_CACHE_TTL=3600
- MAX_CLOSED_SIGNALS_KEPT=200
+ MAX_CLOSED_SIGNALS_KEPT=200;MAX_ERRORS_KEPT=50
  SIGNAL_FILE=os.path.join(DATA_DIR,"signals.json")
  FALLBACK_COINS=["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT",
                  "AVAXUSDT","DOGEUSDT","LINKUSDT","SUIUSDT","ARBUSDT","OPUSDT"]
@@ -66,6 +66,13 @@ def utc_now():return datetime.now(timezone.utc)
 def utc_iso():return utc_now().isoformat()
 def valid(df,n):return isinstance(df,pd.DataFrame) and len(df)>=n
 
+def short_tb(tb,maxlen=200):
+ """Traceback-dan son 2 sətri götür."""
+ try:
+  lines=[l.strip() for l in tb.strip().split("\n") if l.strip()]
+  return " | ".join(lines[-2:])[:maxlen]
+ except:return "?"
+
 class Cache:
  def __init__(self,ttl):self.ttl=ttl;self.data={};self.lock=threading.RLock()
  def get(self,k):
@@ -76,7 +83,7 @@ class Cache:
    return x[0]
  def set(self,k,v):
   with self.lock:self.data[k]=(v,time.time())
-# SWING AI v12.1 ELITE TIER + VOL FIX - PART 2/8
+ # SWING AI v12.2 ELITE TIER + VOL FIX + ERROR LOG - PART 2/8
 class BybitClient:
  def __init__(self):
   self.base=Config.BASE_URL
@@ -86,7 +93,7 @@ class BybitClient:
   self.local=threading.local();self._lock=threading.Lock();self._last=0.0
  def session(self):
   if not hasattr(self.local,"session"):
-   s=requests.Session();s.headers.update({"User-Agent":"SwingAI/12.1"})
+   s=requests.Session();s.headers.update({"User-Agent":"SwingAI/12.2"})
    self.local.session=s
   return self.local.session
  def _rate(self):
@@ -179,7 +186,7 @@ def validate_config():
  if not (0<Config.MIN_SL_ATR<Config.MAX_SL_ATR):raise ValueError("sl_atr")
  if not (Config.TIER_A_SCORE>Config.TIER_B_SCORE>Config.MIN_SCORE):
   raise ValueError("tier hierarchy")
-# SWING AI v12.1 ELITE TIER + VOL FIX - PART 3/8
+# SWING AI v12.2 ELITE TIER + VOL FIX + ERROR LOG - PART 3/8
 class Indicators:
  @staticmethod
  def ema(s,n):return s.ewm(span=n,adjust=False).mean()
@@ -232,7 +239,7 @@ class Structure:
   if sh[-1][1]>sh[-2][1] and sl[-1][1]>sl[-2][1]:return "bullish"
   if sh[-1][1]<sh[-2][1] and sl[-1][1]<sl[-2][1]:return "bearish"
   return "neutral"
-# SWING AI v12.1 ELITE TIER + VOL FIX - PART 4/8
+# SWING AI v12.2 ELITE TIER + VOL FIX + ERROR LOG - PART 4/8
 class Regime:
  @staticmethod
  def analyze(df):
@@ -341,7 +348,7 @@ class Strategy:
   if p>=mid:return 100
   if p>=mid-atr:return 70
   return 35
-# SWING AI v12.1 ELITE TIER + VOL FIX - PART 5/8
+# SWING AI v12.2 ELITE TIER + VOL FIX + ERROR LOG - PART 5/8
 class Filters:
  @staticmethod
  def volatility(df):
@@ -350,7 +357,7 @@ class Filters:
   return math.isfinite(a) and Config.MIN_ATR_PCT<=a<=Config.MAX_ATR_PCT
  @staticmethod
  def volume(df,lookback=None):
-  # v12.1: son 5 şamın ƏN YÜKSƏK volume-unu yoxla
+  # v12.2: son 5 şamın ƏN YÜKSƏK volume-u
   lb=lookback or Config.VOLUME_WINDOW
   if not valid(df,Config.VOLUME_LOOKBACK+2):return False
   v=safe_float(df.volume_ratio.iloc[-lb:].max(),math.nan)
@@ -375,19 +382,24 @@ class Filters:
   except:return False
 
 class BTCFilter:
- """Yumşaldılmış: yalnız BTC açıq əksdirsə blok edir."""
+ """v12.2 FIX: Indicators.add() + try/except."""
  @staticmethod
  def allowed(direction):
-  if not Config.BTC_FILTER_ENABLED:return True
-  df=BYBIT.klines("BTCUSDT","240",250)
-  if not valid(df,220):return True
-  x=df.iloc[-1]
-  btc_bull=x.ema_fast>x.ema_slow and x.close>x.ema_slow
-  btc_bear=x.ema_fast<x.ema_slow and x.close<x.ema_slow
-  if not (btc_bull or btc_bear):return True
-  if direction=="long" and btc_bull:return True
-  if direction=="short" and btc_bear:return True
-  return False
+  try:
+   if not Config.BTC_FILTER_ENABLED:return True
+   df=BYBIT.klines("BTCUSDT","240",250)
+   if not valid(df,220):return True
+   df=Indicators.add(df)  # ← VACİB FIX
+   x=df.iloc[-1]
+   btc_bull=x.ema_fast>x.ema_slow and x.close>x.ema_slow
+   btc_bear=x.ema_fast<x.ema_slow and x.close<x.ema_slow
+   if not (btc_bull or btc_bear):return True
+   if direction=="long" and btc_bull:return True
+   if direction=="short" and btc_bear:return True
+   return False
+  except Exception as e:
+   log.warning("BTC filter error: %s",e)
+   return True
 
 class Correlation:
  @staticmethod
@@ -446,7 +458,7 @@ class Risk:
    if Config.MIN_RR<=rr<=Config.MAX_RR:
     return {"entry":e,"sl":sl,"tp":tp,"risk":risk,"rr":rr}
   return None
-# SWING AI v12.1 ELITE TIER + VOL FIX - PART 6/8
+# SWING AI v12.2 ELITE TIER + VOL FIX + ERROR LOG - PART 6/8
 class Scoring:
  @staticmethod
  def calculate(d4,d15,d,seq):
@@ -528,22 +540,26 @@ class Analyzer:
     "created_at":utc_iso(),"created_ts":time.time()}
 
 def analyze_symbol(s):
+ """v12.2: tam traceback ilə xəta log."""
  try:
   a=Analyzer(s);x=a.run();return x,("" if x else a.reject)
  except Exception as e:
-  log.warning("%s: %s",s,e);return None,"ERROR"
-# SWING AI v12.1 ELITE TIER + VOL FIX - PART 7/8
+  tb=traceback.format_exc()
+  log.error("ANALYZE ERROR [%s]:\n%s",s,tb)
+  STORE.add_error(s,str(e),short_tb(tb))
+  return None,"ERROR"
+# SWING AI v12.2 ELITE TIER + VOL FIX + ERROR LOG - PART 7/8
 class Store:
  def __init__(self):
   self.lock=threading.RLock();self.active=[];self.closed=[]
-  self.rejections={};self.stages={}
+  self.rejections={};self.stages={};self.errors=[]
   self.day=utc_now().date().isoformat();self.daily_count=0
  def reset_day(self):
   d=utc_now().date().isoformat()
   with self.lock:
    if d!=self.day:self.day=d;self.daily_count=0
  def reset_rejections(self):
-  with self.lock:self.rejections={};self.stages={}
+  with self.lock:self.rejections={};self.stages={};self.errors=[]
  def add_stage(self,name,ok):
   with self.lock:
    x=self.stages.setdefault(name,{"pass":0,"fail":0})
@@ -569,6 +585,19 @@ class Store:
    q={}
    for v in self.rejections.values():q[v]=q.get(v,0)+1
    return q
+ # === XƏTA SİSTEMİ ===
+ def add_error(self,s,err,detail=""):
+  with self.lock:
+   self.errors=(self.errors+[{"symbol":s,"error":err,"detail":detail,
+     "time":utc_iso()}])[-Config.MAX_ERRORS_KEPT:]
+ def error_report(self):
+  with self.lock:q=list(self.errors)
+  if not q:return "Xəta yoxdur."
+  lines=[]
+  for e in q[-5:]:
+   lines.append(f"❌ {e['symbol']}: {e['error']}\n   └ {e['detail']}")
+  return "\n".join(lines)
+ # === ƏSAS ===
  def active_symbols(self):
   with self.lock:return [x["symbol"] for x in self.active]
  def can_add(self):
@@ -666,6 +695,8 @@ class Telegram:
  def scan_done(n,found,sent,tier_a=0,tier_b=0,tier_c=0):
   q=STORE.rejection_stats()
   r=" | ".join(f"{k}: {v}" for k,v in sorted(q.items(),key=lambda z:-z[1])) if q else "Yoxdur"
+  errs=STORE.error_report()
+  err_block=f"\n\n⚠️ XƏTALAR\n{errs}" if "❌" in errs else ""
   return Telegram.send(f"✅ SCAN TAMAMLANDI\n\nAnaliz olunan: {n}\n"
     f"Uyğun setup: {len(found)}\n"
     f"🥇 Elite (A): {tier_a}\n"
@@ -674,7 +705,7 @@ class Telegram:
     f"Göndərilən: {sent}\n"
     f"Aktiv: {len(STORE.active)}\n\n📋 ŞƏRTLƏR\n{STORE.stage_report(n)}\n\n"
     f"🔎 BOS DETALLI\n{STORE.bos_report()}\n\n"
-    f"🚫 İLK UĞURSUZ ŞƏRT\n{r}")
+    f"🚫 İLK UĞURSUZ ŞƏRT\n{r}{err_block}")
  @staticmethod
  def handle(text):
   t=(text or "").strip().lower()
@@ -697,10 +728,12 @@ class Telegram:
    q=STORE.rejection_stats()
    body="\n".join(f"{k}: {v}" for k,v in sorted(q.items(),key=lambda z:-z[1])) if q else "Yoxdur."
    return f"🚫 REJECTIONS\n{body}"
+  if t=="/errors":
+   return f"⚠️ XƏTALAR\n{STORE.error_report()}"
   if t=="/help":
-   return "/status\n/signals\n/stats\n/scan\n/rejections\n/help"
+   return "/status\n/signals\n/stats\n/scan\n/rejections\n/errors\n/help"
   return None
-# SWING AI v12.1 ELITE TIER + VOL FIX - PART 8/8
+# SWING AI v12.2 ELITE TIER + VOL FIX + ERROR LOG - PART 8/8
 class PositionManager:
  def check(self,x):
   t=BYBIT.ticker(x["symbol"],fresh=True)
@@ -728,8 +761,10 @@ class PositionManager:
   while not STOP_EVENT.is_set():
    try:
     for x in list(STORE.active):self.check(x)
-   except Exception as e:log.warning("monitor: %s",e)
-   STOP_EVENT.wait(Config.MONITOR_INTERVAL)
+   except Exception as e:
+    tb=traceback.format_exc()
+    log.error("MONITOR ERROR:\n%s",tb)
+    STOP_EVENT.wait(Config.MONITOR_INTERVAL)
 
 MANAGER=PositionManager()
 
@@ -749,7 +784,11 @@ class Scanner:
         and i.get("quoteCoin")=="USDT" and i.get("settleCoin")=="USDT"):out.append(s)
     if len(out)>=Config.SCAN_TOP_N:break
    return out or Config.FALLBACK_COINS
-  except Exception as e:log.warning("symbols: %s",e);return Config.FALLBACK_COINS
+  except Exception as e:
+   tb=traceback.format_exc()
+   log.error("SYMBOLS ERROR:\n%s",tb)
+   STORE.add_error("SYMBOLS",str(e),short_tb(tb))
+   return Config.FALLBACK_COINS
  def scan(self):
   if not self.lock.acquire(False):return
   self.running=True;found=[];sent=0;symbols=[]
@@ -765,38 +804,35 @@ class Scanner:
     for f in as_completed(fs):
      s=fs[f]
      try:x,r=f.result()
-     except Exception:x,r=None,"ERROR"
+     except Exception as e:
+      tb=traceback.format_exc()
+      log.error("SCAN THREAD ERROR [%s]:\n%s",s,tb)
+      STORE.add_error(s,str(e),short_tb(tb))
+      x,r=None,"ERROR"
      if x:found.append(x)
      else:STORE.add_rejection(s,r)
    found.sort(key=lambda z:z["score"],reverse=True)
-
    # === TIER-Ə AYIR ===
-   for x in found:
-    x["tier"]=Scoring.tier(x["score"],x["rr"])
+   for x in found:x["tier"]=Scoring.tier(x["score"],x["rr"])
    t_a=[x for x in found if x["tier"]=="A"]
    t_b=[x for x in found if x["tier"]=="B"]
    t_c=[x for x in found if x["tier"]=="C"]
    tier_a=len(t_a);tier_b=len(t_b);tier_c=len(t_c)
    log.info("Tiers | A=%d B=%d C=%d",tier_a,tier_b,tier_c)
-
    # === SEÇİM ===
    to_send=[]
    if t_a:
     to_send=t_a[:2]
-    if len(to_send)<2 and t_b:
-     to_send.append(t_b[0])
+    if len(to_send)<2 and t_b:to_send.append(t_b[0])
    elif t_b:
     to_send=t_b[:1]
-   # C tier → göndərilmir
-
    for x in to_send:
     if sent>=Config.MAX_SIGNALS_TO_SEND:break
     if not STORE.can_add():break
     if not Correlation.allowed(x["symbol"],STORE.active_symbols()):
      STORE.add_rejection(x["symbol"],"CORRELATION");continue
     if STORE.add(x):
-     Telegram.signal(x)
-     sent+=1
+     Telegram.signal(x);sent+=1
    Telegram.scan_done(len(symbols),found,sent,tier_a,tier_b,tier_c)
    log.info("SCAN | %d | valid=%d | A=%d B=%d C=%d | sent=%d",
      len(symbols),len(found),tier_a,tier_b,tier_c,sent)
@@ -810,7 +846,11 @@ class ScannerWorker:
   STOP_EVENT.wait(15)
   while not STOP_EVENT.is_set():
    try:SCANNER.scan()
-   except Exception as e:log.exception("scanner: %s",e)
+   except Exception as e:
+    tb=traceback.format_exc()
+    log.error("SCANNER WORKER ERROR:\n%s",tb)
+    STORE.add_error("SCANNER",str(e),short_tb(tb))
+    Telegram.send(f"⚠️ SCANNER XƏTA\n{str(e)[:200]}\n\n{short_tb(tb,300)}")
    STOP_EVENT.wait(Config.CHECK_INTERVAL)
 
 class TelegramPoller:
@@ -833,7 +873,8 @@ class TelegramPoller:
      else:
       ans=Telegram.handle(text)
       if ans:Telegram.send(ans)
-   except Exception as e:log.warning("poller: %s",e)
+   except Exception as e:
+    log.warning("poller: %s",e)
    STOP_EVENT.wait(2)
 
 POLL=TelegramPoller()
@@ -851,6 +892,8 @@ def wsg():return jsonify({"active":STORE.active})
 def wst():return jsonify(Performance.stats())
 @app.get("/rejections")
 def wr():return jsonify(STORE.rejection_stats())
+@app.get("/errors")
+def werr():return jsonify({"errors":STORE.errors})
 
 def flask_worker():
  try:app.run(host="0.0.0.0",port=Config.FLASK_PORT,debug=False,use_reloader=False)
