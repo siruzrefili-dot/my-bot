@@ -1,11 +1,11 @@
-# SWING AI v12.0 ELITE TIER - PART 1/8
+# SWING AI v12.1 ELITE TIER + VOL FIX - PART 1/8
 import os,time,json,math,signal,logging,threading
 import requests,numpy as np,pandas as pd
 from datetime import datetime,timezone
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from flask import Flask,jsonify
 
-BOT_VERSION="12.0 ELITE TIER"
+BOT_VERSION="12.1 ELITE TIER + VOL FIX"
 
 class Config:
  BOT_TOKEN=os.getenv("BOT_TOKEN","");CHAT_ID=os.getenv("CHAT_ID","1121794078")
@@ -17,11 +17,12 @@ class Config:
  MIN_SCORE=60;MIN_RR=2.2;MAX_RR=3.5
  ACCOUNT_BALANCE=1000.0;RISK_PERCENT=1.0
  MAX_ACTIVE_SIGNALS=3;MAX_DAILY_SIGNALS=5;MAX_SIGNALS_TO_SEND=2
- # === TIER SİSTEMİ ===
+ # === TIER ===
  TIER_A_SCORE=72;TIER_B_SCORE=65;MIN_RR_ELITE=2.3
- # === VOLATİLİK ===
+ # === VOLATİLİK / VOLUME ===
  MIN_ATR_PCT=0.20;MAX_ATR_PCT=10.0
- MIN_VOLUME_RATIO=1.05;MIN_EMA_DISTANCE_PCT=0.09
+ MIN_VOLUME_RATIO=1.00;VOLUME_WINDOW=5
+ MIN_EMA_DISTANCE_PCT=0.09
  # === RSI ===
  LONG_RSI_MIN=42.0;LONG_RSI_MAX=68.0;SHORT_RSI_MIN=32.0;SHORT_RSI_MAX=58.0
  # === SL ===
@@ -75,7 +76,7 @@ class Cache:
    return x[0]
  def set(self,k,v):
   with self.lock:self.data[k]=(v,time.time())
-# SWING AI v12.0 ELITE TIER - PART 2/8
+# SWING AI v12.1 ELITE TIER + VOL FIX - PART 2/8
 class BybitClient:
  def __init__(self):
   self.base=Config.BASE_URL
@@ -85,7 +86,7 @@ class BybitClient:
   self.local=threading.local();self._lock=threading.Lock();self._last=0.0
  def session(self):
   if not hasattr(self.local,"session"):
-   s=requests.Session();s.headers.update({"User-Agent":"SwingAI/12.0"})
+   s=requests.Session();s.headers.update({"User-Agent":"SwingAI/12.1"})
    self.local.session=s
   return self.local.session
  def _rate(self):
@@ -178,7 +179,7 @@ def validate_config():
  if not (0<Config.MIN_SL_ATR<Config.MAX_SL_ATR):raise ValueError("sl_atr")
  if not (Config.TIER_A_SCORE>Config.TIER_B_SCORE>Config.MIN_SCORE):
   raise ValueError("tier hierarchy")
-# SWING AI v12.0 ELITE TIER - PART 3/8
+# SWING AI v12.1 ELITE TIER + VOL FIX - PART 3/8
 class Indicators:
  @staticmethod
  def ema(s,n):return s.ewm(span=n,adjust=False).mean()
@@ -231,7 +232,7 @@ class Structure:
   if sh[-1][1]>sh[-2][1] and sl[-1][1]>sl[-2][1]:return "bullish"
   if sh[-1][1]<sh[-2][1] and sl[-1][1]<sl[-2][1]:return "bearish"
   return "neutral"
-# SWING AI v12.0 ELITE TIER - PART 4/8
+# SWING AI v12.1 ELITE TIER + VOL FIX - PART 4/8
 class Regime:
  @staticmethod
  def analyze(df):
@@ -340,7 +341,7 @@ class Strategy:
   if p>=mid:return 100
   if p>=mid-atr:return 70
   return 35
-# SWING AI v12.0 ELITE TIER - PART 5/8
+# SWING AI v12.1 ELITE TIER + VOL FIX - PART 5/8
 class Filters:
  @staticmethod
  def volatility(df):
@@ -348,9 +349,11 @@ class Filters:
   a=safe_float(df.atr_pct.iloc[-1],math.nan)
   return math.isfinite(a) and Config.MIN_ATR_PCT<=a<=Config.MAX_ATR_PCT
  @staticmethod
- def volume(df):
+ def volume(df,lookback=None):
+  # v12.1: son 5 şamın ƏN YÜKSƏK volume-unu yoxla
+  lb=lookback or Config.VOLUME_WINDOW
   if not valid(df,Config.VOLUME_LOOKBACK+2):return False
-  v=safe_float(df.volume_ratio.iloc[-1],math.nan)
+  v=safe_float(df.volume_ratio.iloc[-lb:].max(),math.nan)
   return math.isfinite(v) and v>=Config.MIN_VOLUME_RATIO
  @staticmethod
  def funding(t):
@@ -372,7 +375,7 @@ class Filters:
   except:return False
 
 class BTCFilter:
- """Yumşaldılmış: yalnız BTC açıq şəkildə ƏKS istiqamətdədirsə blok edir."""
+ """Yumşaldılmış: yalnız BTC açıq əksdirsə blok edir."""
  @staticmethod
  def allowed(direction):
   if not Config.BTC_FILTER_ENABLED:return True
@@ -381,12 +384,9 @@ class BTCFilter:
   x=df.iloc[-1]
   btc_bull=x.ema_fast>x.ema_slow and x.close>x.ema_slow
   btc_bear=x.ema_fast<x.ema_slow and x.close<x.ema_slow
-  # BTC neutraldırsa → icazə
   if not (btc_bull or btc_bear):return True
-  # BTC siqnala uyğundursa → icazə
   if direction=="long" and btc_bull:return True
   if direction=="short" and btc_bear:return True
-  # BTC açıq əksdirsə → blok
   return False
 
 class Correlation:
@@ -446,29 +446,25 @@ class Risk:
    if Config.MIN_RR<=rr<=Config.MAX_RR:
     return {"entry":e,"sl":sl,"tp":tp,"risk":risk,"rr":rr}
   return None
-# SWING AI v12.0 ELITE TIER - PART 6/8
+# SWING AI v12.1 ELITE TIER + VOL FIX - PART 6/8
 class Scoring:
  @staticmethod
  def calculate(d4,d15,d,seq):
-  # 7 komponentli bal sistemi
-  rs=Strategy.rsi_score(d15,d)                          # 0-100
-  v=min(100,safe_float(d15.volume_ratio.iloc[-1])*60)   # volume bonus
+  rs=Strategy.rsi_score(d15,d)
+  v=min(100,safe_float(d15.volume_ratio.iloc[-Config.VOLUME_WINDOW:].max())*60)
   a=100 if safe_float(d15.atr_pct.iloc[-1])>=Config.MIN_ATR_PCT else 0
-  rq=Regime.analyze(d4)["quality"]                      # 4H keyfiyyət
-  z=Strategy.zone_score(d15,d)                          # struktur zona
-  seq_score=100 if seq else 0                           # BOS+retest təsdiqi
+  rq=Regime.analyze(d4)["quality"]
+  z=Strategy.zone_score(d15,d)
+  seq_score=100 if seq else 0
   setup_score=90
   score=(0.25*rq + 0.15*setup_score + 0.25*seq_score +
          0.15*rs + 0.10*z + 0.05*v + 0.05*a)
   return round(score,1),rs
  @staticmethod
  def tier(score,rr):
-  """Siqnal keyfiyyət səviyyəsi."""
-  if score>=Config.TIER_A_SCORE and rr>=Config.MIN_RR_ELITE:
-   return "A"  # Elite
-  if score>=Config.TIER_B_SCORE:
-   return "B"  # Good
-  return "C"     # Standart (göndərilmir)
+  if score>=Config.TIER_A_SCORE and rr>=Config.MIN_RR_ELITE:return "A"
+  if score>=Config.TIER_B_SCORE:return "B"
+  return "C"
 
 class Analyzer:
  def __init__(self,symbol):self.symbol=symbol;self.reject=""
@@ -527,7 +523,7 @@ class Analyzer:
   return {"symbol":s,"direction":d,"score":score,"rsi":safe_float(d15.rsi.iloc[-1]),
     "rsi_score":rs,"entry":lv["entry"],"sl":lv["sl"],"tp":lv["tp"],
     "rr":lv["rr"],"risk":lv["risk"],"atr_pct":safe_float(d15.atr_pct.iloc[-1]),
-    "volume_ratio":safe_float(d15.volume_ratio.iloc[-1]),
+    "volume_ratio":safe_float(d15.volume_ratio.iloc[-Config.VOLUME_WINDOW:].max()),
     "funding":safe_float(t.get("funding"),0),"oi":safe_float(t.get("oi"),0),
     "created_at":utc_iso(),"created_ts":time.time()}
 
@@ -536,7 +532,7 @@ def analyze_symbol(s):
   a=Analyzer(s);x=a.run();return x,("" if x else a.reject)
  except Exception as e:
   log.warning("%s: %s",s,e);return None,"ERROR"
-# SWING AI v12.0 ELITE TIER - PART 7/8
+# SWING AI v12.1 ELITE TIER + VOL FIX - PART 7/8
 class Store:
  def __init__(self):
   self.lock=threading.RLock();self.active=[];self.closed=[]
@@ -613,7 +609,6 @@ class Performance:
   c=STORE.closed;w=sum(x.get("result")=="TP" for x in c)
   l=sum(x.get("result")=="SL" for x in c);t=w+l
   pnl=sum(safe_float(x.get("pnl")) for x in c)
-  # Tier-ə görə statistika
   tier_stats={}
   for x in c:
    tr=x.get("tier","?")
@@ -639,7 +634,6 @@ class Telegram:
   d="🟢 LONG" if x["direction"]=="long" else "🔴 SHORT"
   tier=x.get("tier","C")
   tier_emoji={"A":"🥇 ELITE","B":"🥈 GOOD","C":"🥉 STANDARD"}.get(tier,"STANDARD")
-  # 1) ƏSAS SİQNAL MESAJI
   body=(f"🚨 YENİ SİQNAL #{STORE.daily_count}  {tier_emoji}\n"
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📌 {x['symbol']}  {d}\n"
@@ -655,13 +649,13 @@ class Telegram:
     f"━━━━━━━━━━━━━━━━━━\n"
     f"⚠️ Signal only — öz analizinlə")
   Telegram.send(body)
-  # 2) AVTOMATİK STATUS
   Telegram.send(Telegram.status())
   return True
  @staticmethod
  def status():
   if not STORE.active:return "📭 Aktiv siqnal yoxdur."
-  lines=[f"📌 AKTİV SIQNALLAR ({len(STORE.active)}) — {STORE.daily_count}/{Config.MAX_DAILY_SIGNALS} bu gün\n"]
+  lines=[f"📌 AKTİV SIQNALLAR ({len(STORE.active)}) — "
+    f"{STORE.daily_count}/{Config.MAX_DAILY_SIGNALS} bu gün\n"]
   for x in STORE.active:
    t=x.get("tier","C");emoji={"A":"🥇","B":"🥈","C":"🥉"}.get(t,"")
    lines.append(f"{emoji} {x['symbol']} {x['direction'].upper()}\n"
@@ -690,7 +684,6 @@ class Telegram:
    base=(f"📊 STATS\nClosed: {s['closed']}\nWins: {s['wins']}\n"
      f"Losses: {s['losses']}\nWinrate: {s['winrate']}%\n"
      f"PnL: {s['pnl']:.2f} USDT\nToday signals: {s['today_signals']}")
-   # Tier statistikası əlavə et
    ts=s.get("tier_stats",{})
    if ts:
     base+="\n\n🥇 TIER STATS"
@@ -707,7 +700,7 @@ class Telegram:
   if t=="/help":
    return "/status\n/signals\n/stats\n/scan\n/rejections\n/help"
   return None
-# SWING AI v12.0 ELITE TIER - PART 8/8
+# SWING AI v12.1 ELITE TIER + VOL FIX - PART 8/8
 class PositionManager:
  def check(self,x):
   t=BYBIT.ticker(x["symbol"],fresh=True)
@@ -786,10 +779,7 @@ class Scanner:
    tier_a=len(t_a);tier_b=len(t_b);tier_c=len(t_c)
    log.info("Tiers | A=%d B=%d C=%d",tier_a,tier_b,tier_c)
 
-   # === SEÇİM QAYDASI ===
-   # 1) A varsa → ən yaxşı 2 A, yanına ən yaxşı B (yer varsa)
-   # 2) Yalnız B varsa → yalnız ən yaxşı 1 B
-   # 3) Yalnız C varsa → HEÇ NƏ göndərmə
+   # === SEÇİM ===
    to_send=[]
    if t_a:
     to_send=t_a[:2]
@@ -879,6 +869,7 @@ def startup():
    f"RSI L {Config.LONG_RSI_MIN:.0f}-{Config.LONG_RSI_MAX:.0f} | "
    f"S {Config.SHORT_RSI_MIN:.0f}-{Config.SHORT_RSI_MAX:.0f}\n"
    f"RR {Config.MIN_RR:.1f}-{Config.MAX_RR:.1f} | "
+   f"Vol≥{Config.MIN_VOLUME_RATIO:.2f}x ({Config.VOLUME_WINDOW} şam)\n"
    f"MAX {Config.MAX_SIGNALS_TO_SEND} siqnal/scan")
 
 def start_threads():
