@@ -1,18 +1,18 @@
-# SWING AI v12.7 ALL FIXED - PART 1/8
+# SWING AI v13.0 REAL MONITOR + STATS - PART 1/8
 import os,time,json,math,signal,logging,threading,traceback
 import requests,numpy as np,pandas as pd
 from datetime import datetime,timezone
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from flask import Flask,jsonify
 
-BOT_VERSION="12.7 ALL FIXED"
+BOT_VERSION="13.0 REAL MONITOR + STATS"
 
 class Config:
  BOT_TOKEN=os.getenv("BOT_TOKEN","");CHAT_ID=os.getenv("CHAT_ID","1121794078")
  BASE_URL="https://api.bybit.com";CATEGORY="linear"
  SCAN_TOP_N=40;CANDIDATE_LIMIT=80;CHECK_INTERVAL=300;MONITOR_INTERVAL=5;PARALLEL_WORKERS=3
- TREND_TF="240";SETUP_TF="60";ENTRY_TF="15";EMA_FAST=50;EMA_SLOW=200
- RSI_PERIOD=14;ATR_PERIOD=14;VOLUME_LOOKBACK=20
+ TREND_TF="240";SETUP_TF="60";ENTRY_TF="15"
+ EMA_FAST=50;EMA_SLOW=200;RSI_PERIOD=14;ATR_PERIOD=14;VOLUME_LOOKBACK=20
  MIN_SCORE=60;MIN_RR=2.2;MAX_RR=3.5
  ACCOUNT_BALANCE=1000.0;RISK_PERCENT=1.0
  MAX_ACTIVE_SIGNALS=2;MAX_DAILY_SIGNALS=2;MAX_SIGNALS_TO_SEND=1
@@ -22,7 +22,8 @@ class Config:
  MIN_ATR_PCT=0.20;MAX_ATR_PCT=10.0
  MIN_VOLUME_RATIO=1.00;VOLUME_WINDOW=5
  MIN_EMA_DISTANCE_PCT=0.09
- LONG_RSI_MIN=42.0;LONG_RSI_MAX=68.0;SHORT_RSI_MIN=32.0;SHORT_RSI_MAX=58.0
+ LONG_RSI_MIN=42.0;LONG_RSI_MAX=68.0
+ SHORT_RSI_MIN=32.0;SHORT_RSI_MAX=58.0
  MIN_SL_ATR=0.80;MAX_SL_ATR=2.50;SL_BUFFER_ATR=0.15
  BOS_BUFFER_ATR=0.05;ALLOW_RECLAIM_BOS=True;BOS_LOOKBACK=100
  RETEST_MAX_BARS=15;RETEST_ATR_DISTANCE=0.90
@@ -38,8 +39,16 @@ class Config:
  MAX_HOLD_HOURS=96;DATA_DIR="swing_bot_data"
  FLASK_PORT=int(os.getenv("PORT","10000"))
  REQUEST_TIMEOUT=15;CACHE_TTL=10;TICKER_CACHE_TTL=30;INSTRUMENT_CACHE_TTL=3600
- MAX_CLOSED_SIGNALS_KEPT=200;MAX_ERRORS_KEPT=50
+ MAX_CLOSED_SIGNALS_KEPT=500;MAX_ERRORS_KEPT=50
  SIGNAL_FILE=os.path.join(DATA_DIR,"signals.json")
+ # v13.0 - NEW
+ TAKER_FEE_PCT=0.055    # Bybit taker fee (0.055%)
+ SLIPPAGE_PCT=0.02      # 0.02% per side
+ # Score components (real)
+ SCORE_W_REGIME=0.20;SCORE_W_SETUP=0.10;SCORE_W_PULLBACK=0.10
+ SCORE_W_BOS=0.12;SCORE_W_RETEST=0.10;SCORE_W_CONFIRM=0.12
+ SCORE_W_RSI=0.08;SCORE_W_VOLUME=0.06;SCORE_W_ZONE=0.05
+ SCORE_W_BTC=0.03;SCORE_W_RR=0.04
  FALLBACK_COINS=["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT",
                  "AVAXUSDT","DOGEUSDT","LINKUSDT","SUIUSDT","ARBUSDT","OPUSDT"]
  TRADFI={"XAU","XAG","CL","USOIL","UKOIL","SPX","NDX","DJI","US30","NAS100","US500",
@@ -79,22 +88,23 @@ class Cache:
    return x[0]
  def set(self,k,v):
   with self.lock:self.data[k]=(v,time.time())
-# SWING AI v12.7 ALL FIXED - PART 2/8
+ # SWING AI v13.0 - PART 2/8
 class BybitClient:
  def __init__(self):
   self.base=Config.BASE_URL
   self.cache=Cache(Config.CACHE_TTL)
   self.tcache=Cache(Config.TICKER_CACHE_TTL)
   self.icache=Cache(Config.INSTRUMENT_CACHE_TTL)
+  self.kcache=Cache(1)  # 1 saniyə — kline monitor
   self.local=threading.local();self._lock=threading.Lock();self._last=0.0
  def session(self):
   if not hasattr(self.local,"session"):
-   s=requests.Session();s.headers.update({"User-Agent":"SwingAI/12.7"})
+   s=requests.Session();s.headers.update({"User-Agent":"SwingAI/13.0"})
    self.local.session=s
   return self.local.session
  def _rate(self):
   with self._lock:
-   w=0.15-(time.time()-self._last)
+   w=0.10-(time.time()-self._last)
    if w>0:time.sleep(w)
    self._last=time.time()
  def get(self,path,params=None,key=None,cache=None,retries=3):
@@ -121,11 +131,26 @@ class BybitClient:
     "interval":interval,"limit":limit},f"k:{symbol}:{interval}:{limit}")
   rows=z.get("result",{}).get("list",[]) if z else []
   if not rows:return pd.DataFrame()
-  rows=list(reversed(rows));cols=["timestamp","open","high","low","close","volume","turnover"]
+  rows=list(reversed(rows))
+  cols=["timestamp","open","high","low","close","volume","turnover"]
   df=pd.DataFrame(rows,columns=cols)
   for c in cols:df[c]=pd.to_numeric(df[c],errors="coerce")
   df=df.dropna(subset=["open","high","low","close","volume"])
   return df.iloc[:-1].reset_index(drop=True) if len(df)>1 else df.reset_index(drop=True)
+ def kline_1m_live(self,symbol):
+  """v13.0: Canlı 1M candle — monitor üçün. Cache yox."""
+  z=self.get("/v5/market/kline",{"category":"linear","symbol":symbol,
+    "interval":"1","limit":2})
+  rows=z.get("result",{}).get("list",[]) if z else []
+  if not rows:return None
+  rows=list(reversed(rows))
+  if not rows:return None
+  # Son candle (hələ bağlanmamış ola bilər)
+  r=rows[-1]
+  return {"ts":int(safe_float(r[0])),
+          "open":safe_float(r[1]),"high":safe_float(r[2]),
+          "low":safe_float(r[3]),"close":safe_float(r[4]),
+          "volume":safe_float(r[5])}
  def ticker(self,symbol,fresh=False):
   c=None if fresh else self.tcache;k=None if fresh else f"t:{symbol}"
   z=self.get("/v5/market/tickers",{"category":"linear","symbol":symbol},k,c)
@@ -183,7 +208,7 @@ def validate_config():
  if not (Config.TIER_A_SCORE>Config.MIN_SCORE):raise ValueError("tier")
  if not (Config.FIRST_SIGNAL_SCORE>=Config.TIER_A_SCORE):raise ValueError("first")
  if not (Config.OVERRIDE_SCORE>=Config.FIRST_SIGNAL_SCORE):raise ValueError("override")
-# SWING AI v12.7 ALL FIXED - PART 3/8
+# SWING AI v13.0 - PART 3/8
 class Indicators:
  @staticmethod
  def ema(s,n):return s.ewm(span=n,adjust=False).mean()
@@ -236,7 +261,7 @@ class Structure:
   if sh[-1][1]>sh[-2][1] and sl[-1][1]>sl[-2][1]:return "bullish"
   if sh[-1][1]<sh[-2][1] and sl[-1][1]<sl[-2][1]:return "bearish"
   return "neutral"
-# SWING AI v12.7 ALL FIXED - PART 4/8
+# SWING AI v13.0 - PART 4/8
 class Regime:
  @staticmethod
  def analyze(df):
@@ -262,7 +287,8 @@ class Strategy:
  @staticmethod
  def pullback(df,d):
   if len(df)<8:return False
-  x=df.iloc[-7:-1];ema=safe_float(df.ema_fast.iloc[-1]);atr=safe_float(df.atr.iloc[-1])
+  x=df.iloc[-7:-1]
+  ema=safe_float(df.ema_fast.iloc[-1]);atr=safe_float(df.atr.iloc[-1])
   if atr<=0:return False
   if d=="long":return bool((x.low<=ema+atr*1.5).any())
   return bool((x.high>=ema-atr*1.5).any())
@@ -345,7 +371,7 @@ class Strategy:
   if p>=mid:return 100
   if p>=mid-atr:return 70
   return 35
-# SWING AI v12.7 ALL FIXED - PART 5/8
+# SWING AI v13.0 - PART 5/8
 class Filters:
  @staticmethod
  def volatility(df):
@@ -358,6 +384,16 @@ class Filters:
   if not valid(df,Config.VOLUME_LOOKBACK+2):return False
   v=safe_float(df.volume_ratio.iloc[-lb:].max(),math.nan)
   return math.isfinite(v) and v>=Config.MIN_VOLUME_RATIO
+ @staticmethod
+ def volume_score(df,confirm_idx=None):
+  """v13.0: Volume score — confirmation candle ətrafında."""
+  if not valid(df,Config.VOLUME_LOOKBACK+2):return 0
+  if confirm_idx is not None and 0<=confirm_idx<len(df):
+   vr=safe_float(df.volume_ratio.iloc[confirm_idx],math.nan)
+  else:
+   vr=safe_float(df.volume_ratio.iloc[-Config.VOLUME_WINDOW:].max(),math.nan)
+  if not math.isfinite(vr):return 0
+  return min(100,vr*60)
  @staticmethod
  def funding(t):
   if not t:return False
@@ -379,22 +415,35 @@ class Filters:
 
 class BTCFilter:
  @staticmethod
- def allowed(direction):
+ def evaluate(direction):
+  """v13.0: BTC filter — trend + EMA + direction. Score qaytarır (0-100)."""
   try:
-   if not Config.BTC_FILTER_ENABLED:return True
+   if not Config.BTC_FILTER_ENABLED:
+    return {"allowed":True,"score":50}
    df=BYBIT.klines("BTCUSDT","240",250)
-   if not valid(df,220):return True
+   if not valid(df,220):
+    return {"allowed":True,"score":50}
    df=Indicators.add(df)
    x=df.iloc[-1]
    btc_bull=x.ema_fast>x.ema_slow and x.close>x.ema_slow
    btc_bear=x.ema_fast<x.ema_slow and x.close<x.ema_slow
-   if not (btc_bull or btc_bear):return True
-   if direction=="long" and btc_bull:return True
-   if direction=="short" and btc_bear:return True
-   return False
+   st=Structure.trend(df)
+   # Yön uyğunluğu
+   if direction=="long":
+    if btc_bull and st=="bullish":return {"allowed":True,"score":100}
+    if btc_bull:return {"allowed":True,"score":80}
+    if not (btc_bull or btc_bear):return {"allowed":True,"score":55}
+    if btc_bear and st=="bearish":return {"allowed":False,"score":0}
+    return {"allowed":True,"score":40}  # zəif əks
+   else:
+    if btc_bear and st=="bearish":return {"allowed":True,"score":100}
+    if btc_bear:return {"allowed":True,"score":80}
+    if not (btc_bull or btc_bear):return {"allowed":True,"score":55}
+    if btc_bull and st=="bullish":return {"allowed":False,"score":0}
+    return {"allowed":True,"score":40}
   except Exception as e:
    log.warning("BTC filter error: %s",e)
-   return True
+   return {"allowed":True,"score":50}
 
 class Correlation:
  @staticmethod
@@ -453,20 +502,61 @@ class Risk:
    if Config.MIN_RR<=rr<=Config.MAX_RR:
     return {"entry":e,"sl":sl,"tp":tp,"risk":risk,"rr":rr}
   return None
-# SWING AI v12.7 ALL FIXED - PART 6/8
+# SWING AI v13.0 - PART 6/8
 class Scoring:
  @staticmethod
- def calculate(d4,d15,d,seq):
-  rs=Strategy.rsi_score(d15,d)
-  v=min(100,safe_float(d15.volume_ratio.iloc[-Config.VOLUME_WINDOW:].max())*60)
-  a=100 if safe_float(d15.atr_pct.iloc[-1])>=Config.MIN_ATR_PCT else 0
+ def calculate(d4,d15,d,seq,bos,btc_eval,confirm_idx=None):
+  """v13.0: Real score — hər komponent müstəqil qiymətləndirilir."""
+  # 1. Regime quality (0-100)
   rq=Regime.analyze(d4)["quality"]
-  z=Strategy.zone_score(d15,d)
-  seq_score=100 if seq else 0
-  setup_score=90
-  score=(0.25*rq + 0.15*setup_score + 0.25*seq_score +
-         0.15*rs + 0.10*z + 0.05*v + 0.05*a)
-  return round(score,1),rs
+  # 2. Setup score — 1H-də nə qədər güclü?
+  x1=d15.iloc[-1]
+  if d=="long":
+   setup_ok=bool(x1.ema_fast>x1.ema_slow and x1.close>x1.ema_slow)
+  else:
+   setup_ok=bool(x1.ema_fast<x1.ema_slow and x1.close<x1.ema_slow)
+  setup_score=100 if setup_ok else 60
+  # 3. Pullback score
+  pb_score=80 if Strategy.pullback(d15,d) else 0
+  # 4. BOS score
+  if bos:
+   bos_score=100 if bos.get("type")=="CLOSE_BOS" else 75
+  else:
+   bos_score=0
+  # 5. Retest score
+  retest_score=100 if seq else 0
+  # 6. Confirmation score
+  if seq:
+   confirm_score=100 if Strategy.strong(d15,seq["confirm"],d) else 60
+  else:
+   confirm_score=0
+  # 7. RSI score
+  rsi_s=Strategy.rsi_score(d15,d)
+  # 8. Volume score
+  vol_s=Filters.volume_score(d15,confirm_idx)
+  # 9. Zone score
+  zone=Strategy.zone_score(d15,d)
+  # 10. BTC score
+  btc_s=btc_eval.get("score",50)
+  # 11. RR score
+  rr_s=0
+  # 12. Weighted sum
+  score=(Config.SCORE_W_REGIME*rq + Config.SCORE_W_SETUP*setup_score +
+         Config.SCORE_W_PULLBACK*pb_score + Config.SCORE_W_BOS*bos_score +
+         Config.SCORE_W_RETEST*retest_score + Config.SCORE_W_CONFIRM*confirm_score +
+         Config.SCORE_W_RSI*rsi_s + Config.SCORE_W_VOLUME*vol_s +
+         Config.SCORE_W_ZONE*zone + Config.SCORE_W_BTC*btc_s +
+         Config.SCORE_W_RR*rr_s)
+  return round(score,1),rsi_s
+ @staticmethod
+ def add_rr_to_score(base_score,rr):
+  """RR komponentini əlavə et."""
+  if rr>=2.8:rr_s=100
+  elif rr>=2.5:rr_s=80
+  elif rr>=2.3:rr_s=60
+  elif rr>=2.2:rr_s=40
+  else:rr_s=0
+  return round(base_score+Config.SCORE_W_RR*rr_s,1)
  @staticmethod
  def tier(score,rr):
   if score>=Config.TIER_A_SCORE and rr>=Config.MIN_RR_ELITE:return "A"
@@ -502,7 +592,8 @@ class Analyzer:
   seq=Strategy.sequence(d15,bos,d)
   STORE.add_stage("RETEST_CONFIRM",bool(seq))
   if not seq:self.reject="RETEST_CONFIRM";return None
-  age=len(d15)-1-seq["confirm"];ok=age<=Config.MAX_CONFIRM_AGE
+  age=len(d15)-1-seq["confirm"]
+  ok=age<=Config.MAX_CONFIRM_AGE
   STORE.add_stage("CONFIRM_AGE",ok)
   if not ok:self.reject="CONFIRM_AGE";return None
   atr_now=safe_float(d15.atr.iloc[-1])
@@ -520,11 +611,15 @@ class Analyzer:
   if not ok:self.reject="OI";return None
   ok=Filters.spread(BYBIT.book(s));STORE.add_stage("SPREAD",ok)
   if not ok:self.reject="SPREAD";return None
-  ok=BTCFilter.allowed(d);STORE.add_stage("BTC_FILTER",ok)
+  btc_eval=BTCFilter.evaluate(d)
+  ok=btc_eval.get("allowed",True)
+  STORE.add_stage("BTC_FILTER",ok)
   if not ok:self.reject="BTC_FILTER";return None
   lv=Risk.levels(d15,d1,d4,d);ok=bool(lv);STORE.add_stage("TARGET_RISK",ok)
   if not ok:self.reject="TARGET_RISK";return None
-  score,rs=Scoring.calculate(d4,d15,d,seq)
+  # Real score
+  score,rs=Scoring.calculate(d4,d15,d,seq,bos,btc_eval,seq["confirm"])
+  score=Scoring.add_rr_to_score(score,lv["rr"])
   ok=score>=Config.MIN_SCORE;STORE.add_stage("SCORE",ok)
   if not ok:self.reject="SCORE";return None
   return {"symbol":s,"direction":d,"score":score,"rsi":safe_float(d15.rsi.iloc[-1]),
@@ -532,7 +627,11 @@ class Analyzer:
     "rr":lv["rr"],"risk":lv["risk"],"atr_pct":safe_float(d15.atr_pct.iloc[-1]),
     "volume_ratio":safe_float(d15.volume_ratio.iloc[-Config.VOLUME_WINDOW:].max()),
     "funding":safe_float(t.get("funding"),0),"oi":safe_float(t.get("oi"),0),
-    "created_at":utc_iso(),"created_ts":time.time()}
+    "regime_4h":d,"setup_1h":"ok","confirm_15m":bool(seq),
+    "btc_score":btc_eval.get("score",50),
+    "created_at":utc_iso(),"created_ts":time.time(),
+    "start_ts":int(time.time()*1000),
+    "last_checked_candle":0}
 
 def analyze_symbol(s):
  try:
@@ -542,13 +641,17 @@ def analyze_symbol(s):
   log.error("ANALYZE ERROR [%s]:\n%s",s,tb)
   STORE.add_error(s,str(e),short_tb(tb))
   return None,"ERROR"
-# SWING AI v12.7 ALL FIXED - PART 7/8
+# SWING AI v13.0 - PART 7/8
 class Store:
  def __init__(self):
-  self.lock=threading.RLock();self.active=[];self.closed=[]
+  self.lock=threading.RLock()
+  self.active=[];self.closed=[]
   self.rejections={};self.stages={};self.errors=[]
-  self.day=utc_now().date().isoformat();self.daily_count=0
-  self.override_count=0
+  self.day=utc_now().date().isoformat()
+  self.daily_count=0;self.override_count=0
+  # v13.0 - Virtual balance
+  self.start_balance=Config.ACCOUNT_BALANCE
+  self.balance=Config.ACCOUNT_BALANCE
  def reset_day(self):
   d=utc_now().date().isoformat()
   with self.lock:
@@ -594,6 +697,12 @@ class Store:
   return "\n".join(lines)
  def active_symbols(self):
   with self.lock:return [x["symbol"] for x in self.active]
+ def has_active(self,symbol,direction=None):
+  with self.lock:
+   for a in self.active:
+    if a["symbol"]==symbol:
+     if direction is None or a["direction"]==direction:return True
+   return False
  def can_add(self,score=0):
   self.reset_day()
   with self.lock:
@@ -605,24 +714,48 @@ class Store:
  def add(self,x):
   with self.lock:
    if len(self.active)>=Config.MAX_ACTIVE_SIGNALS:return False
-   if any(a["symbol"]==x["symbol"] for a in self.active):return False
+   if self.has_active(x["symbol"],x["direction"]):return False
    is_override=x.get("override",False)
    if self.daily_count>=Config.MAX_DAILY_SIGNALS:
     if is_override and self.override_count<Config.MAX_OVERRIDE_DAILY:
      self.override_count+=1
     else:return False
+   # v13.0: Risk amount cari balansdan
+   risk_amount=self.balance*Config.RISK_PERCENT/100
+   x["risk_amount"]=risk_amount
    self.active.append(x);self.daily_count+=1;self.save();return True
- def remove(self,s,x):
+ def close_position(self,symbol,x,result,exit_price,result_r):
+  """v13.0: Dinamik balans + komissiya."""
   with self.lock:
-   self.active=[a for a in self.active if a["symbol"]!=s]
+   self.active=[a for a in self.active if a["symbol"]!=symbol]
    y=dict(x);y["closed_at"]=utc_iso()
-   self.closed=(self.closed+[y])[-Config.MAX_CLOSED_SIGNALS_KEPT:];self.save()
+   y["result"]=result;y["exit_price"]=exit_price;y["result_r"]=result_r
+   # Gross PnL (R-based)
+   risk_amount=y.get("risk_amount",self.balance*Config.RISK_PERCENT/100)
+   gross_pnl=result_r*risk_amount
+   # Komissiya (entry+exit, ~0.055% x 2)
+   entry=y.get("entry",0)
+   notional=risk_amount*abs(exit_price-entry)/abs(entry-y.get("sl",entry))+risk_amount if entry>0 and y.get("sl") else risk_amount
+   # Sadə model: risk_amount notional əsasında
+   commission=risk_amount*Config.TAKER_FEE_PCT/100*2
+   slippage=risk_amount*Config.SLIPPAGE_PCT/100*2
+   net_pnl=gross_pnl-commission-slippage
+   y["gross_pnl"]=round(gross_pnl,4)
+   y["commission"]=round(commission,4)
+   y["slippage"]=round(slippage,4)
+   y["pnl"]=round(net_pnl,4)
+   y["duration_h"]=round((time.time()-x.get("created_ts",time.time()))/3600,2)
+   self.balance+=net_pnl
+   self.closed=(self.closed+[y])[-Config.MAX_CLOSED_SIGNALS_KEPT:]
+   self.save()
+   return y
  def save(self):
   try:
    with open(Config.SIGNAL_FILE,"w",encoding="utf8") as f:
     json.dump({"active":self.active,"closed":self.closed,
       "day":self.day,"daily_count":self.daily_count,
-      "override_count":self.override_count},f,indent=2)
+      "override_count":self.override_count,
+      "balance":self.balance,"start_balance":self.start_balance},f,indent=2)
   except Exception as e:log.warning("save: %s",e)
  def load(self):
   try:
@@ -630,27 +763,45 @@ class Store:
    self.active=x.get("active",[]);self.closed=x.get("closed",[])
    self.day=x.get("day",self.day);self.daily_count=x.get("daily_count",0)
    self.override_count=x.get("override_count",0)
+   self.balance=x.get("balance",Config.ACCOUNT_BALANCE)
+   self.start_balance=x.get("start_balance",Config.ACCOUNT_BALANCE)
    self.reset_day()
-  except:pass
+  except Exception as e:
+   log.warning("load state: %s",e)
 
 STORE=Store();STORE.load()
 
 class Performance:
  @staticmethod
  def stats():
-  c=STORE.closed;w=sum(x.get("result")=="TP" for x in c)
-  l=sum(x.get("result")=="SL" for x in c);t=w+l
-  pnl=sum(safe_float(x.get("pnl")) for x in c)
+  c=STORE.closed
+  tp=sum(1 for x in c if x.get("result")=="TP")
+  sl=sum(1 for x in c if x.get("result")=="SL")
+  tm=sum(1 for x in c if x.get("result")=="TIME")
+  closed=tp+sl+tm
+  decisive=tp+sl
+  winrate=round(tp/decisive*100,2) if decisive>0 else 0.0
+  tprate=round(tp/closed*100,2) if closed>0 else 0.0
+  net_r=round(sum(safe_float(x.get("result_r")) for x in c),2)
+  net_pnl=round(sum(safe_float(x.get("pnl")) for x in c),2)
+  avg_r=round(net_r/decisive,2) if decisive>0 else 0.0
   tier_stats={}
   for x in c:
    tr=x.get("tier","?")
-   if tr not in tier_stats:tier_stats[tr]={"w":0,"l":0,"pnl":0.0}
+   if tr not in tier_stats:tier_stats[tr]={"w":0,"l":0,"t":0,"pnl":0.0}
    if x.get("result")=="TP":tier_stats[tr]["w"]+=1
    elif x.get("result")=="SL":tier_stats[tr]["l"]+=1
+   elif x.get("result")=="TIME":tier_stats[tr]["t"]+=1
    tier_stats[tr]["pnl"]+=safe_float(x.get("pnl"))
-  return {"closed":t,"wins":w,"losses":l,
-    "winrate":round(w/t*100,2) if t else 0,"pnl":round(pnl,2),
-    "today_signals":STORE.daily_count,"tier_stats":tier_stats}
+  return {"start_balance":round(STORE.start_balance,2),
+          "balance":round(STORE.balance,2),
+          "closed":closed,"tp":tp,"sl":sl,"time":tm,
+          "wins":tp,"losses":sl,
+          "winrate":winrate,"tprate":tprate,
+          "net_r":net_r,"pnl":net_pnl,"avg_r":avg_r,
+          "today_signals":STORE.daily_count,
+          "active":len(STORE.active),
+          "tier_stats":tier_stats}
 
 class Telegram:
  @staticmethod
@@ -665,25 +816,44 @@ class Telegram:
  def signal(x):
   d="🟢 LONG" if x["direction"]=="long" else "🔴 SHORT"
   tier=x.get("tier","C")
-  tier_emoji={"A":"🥇 ELITE","B":"🥈 GOOD","C":"🥉 STANDARD"}.get(tier,"STANDARD")
-  if x.get("override"):tier_emoji="⚡ OVERRIDE ELITE"
+  tier_emoji={"A":"🥇 ELITE","B":"🥈 GOOD","C":"🥉 STD"}.get(tier,"STD")
+  if x.get("override"):tier_emoji="⚡ OVERRIDE"
+  risk_amount=x.get("risk_amount",0)
   body=(f"🚨 YENİ SİQNAL #{STORE.daily_count}  {tier_emoji}\n"
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📌 {x['symbol']}  {d}\n"
     f"━━━━━━━━━━━━━━━━━━\n"
     f"🎯 Score: {x['score']}/100\n"
     f"📊 RSI: {x['rsi']:.1f}\n"
+    f"🏛 4H: {x.get('regime_4h','?').upper()}\n"
+    f"⏱ Setup: {x.get('setup_1h','ok')}  |  15M: {x.get('confirm_15m',False)}\n"
     f"💰 Entry: {x['entry']:.8g}\n"
     f"🛑 SL: {x['sl']:.8g}\n"
     f"✅ TP: {x['tp']:.8g}\n"
     f"⚖️ RR: 1:{x['rr']:.2f}\n"
-    f"📈 ATR: {x['atr_pct']:.2f}%\n"
-    f"🔊 Volume: {x['volume_ratio']:.2f}x\n"
+    f"📈 ATR: {x['atr_pct']:.2f}%  🔊 Vol: {x['volume_ratio']:.2f}x\n"
+    f"🪙 BTC: {x.get('btc_score',50)}/100\n"
+    f"💵 Risk: {risk_amount:.2f} USDT\n"
     f"━━━━━━━━━━━━━━━━━━\n"
     f"⚠️ Signal only — öz analizinlə")
   Telegram.send(body)
   Telegram.send(Telegram.status())
   return True
+ @staticmethod
+ def closed(y):
+  d="🟢 LONG" if y["direction"]=="long" else "🔴 SHORT"
+  emoji={"TP":"✅","SL":"🔴","TIME":"⏱"}.get(y.get("result"),"❓")
+  return Telegram.send(f"{emoji} CLOSED [{y.get('tier','?')}]\n"
+    f"{y['symbol']} {d}\n"
+    f"Result: {y.get('result')}\n"
+    f"Entry: {y.get('entry',0):.8g}\n"
+    f"Exit: {y.get('exit_price',0):.8g}\n"
+    f"R: {y.get('result_r',0):.2f}\n"
+    f"Gross: {y.get('gross_pnl',0):.2f} USDT\n"
+    f"Comm: -{y.get('commission',0):.2f} | Slip: -{y.get('slippage',0):.2f}\n"
+    f"Net PnL: {y.get('pnl',0):.2f} USDT\n"
+    f"Balance: {STORE.balance:.2f} USDT\n"
+    f"Duration: {y.get('duration_h',0):.1f}h")
  @staticmethod
  def status():
   if not STORE.active:return "📭 Aktiv siqnal yoxdur."
@@ -704,9 +874,7 @@ class Telegram:
   err_block=f"\n\n⚠️ XƏTALAR\n{errs}" if "❌" in errs else ""
   return Telegram.send(f"✅ SCAN TAMAMLANDI\n\nAnaliz olunan: {n}\n"
     f"Uyğun setup: {len(found)}\n"
-    f"🥇 Elite (A): {tier_a}\n"
-    f"🥈 Good (B): {tier_b}\n"
-    f"🥉 Standart (C): {tier_c}\n"
+    f"🥇 Elite: {tier_a} | 🥈 Good: {tier_b} | 🥉 Std: {tier_c}\n"
     f"Göndərilən: {sent}\n"
     f"Aktiv: {len(STORE.active)}/{Config.MAX_ACTIVE_SIGNALS}\n"
     f"Bugün: {STORE.daily_count}/{Config.MAX_DAILY_SIGNALS} "
@@ -720,9 +888,18 @@ class Telegram:
   if t in ("/status","/signals"):return Telegram.status()
   if t=="/stats":
    s=Performance.stats()
-   base=(f"📊 STATS\nClosed: {s['closed']}\nWins: {s['wins']}\n"
-     f"Losses: {s['losses']}\nWinrate: {s['winrate']}%\n"
-     f"PnL: {s['pnl']:.2f} USDT\nToday signals: {s['today_signals']}")
+   base=(f"📊 STATS\n"
+     f"💰 Balance: {s['balance']:.2f} (start {s['start_balance']:.2f})\n"
+     f"📦 Closed: {s['closed']}\n"
+     f"✅ TP: {s['tp']}\n"
+     f"🔴 SL: {s['sl']}\n"
+     f"⏱ TIME: {s['time']}\n"
+     f"📈 Win Rate: {s['winrate']:.2f}% (TP/(TP+SL))\n"
+     f"🎯 TP Rate: {s['tprate']:.2f}% (TP/Closed)\n"
+     f"💵 Net R: {s['net_r']:.2f}R\n"
+     f"💵 Net PnL: {s['pnl']:.2f} USDT\n"
+     f"⚖️ Avg R: {s['avg_r']:.2f}\n"
+     f"📌 Aktiv: {s['active']} | Bugün: {s['today_signals']}")
    ts=s.get("tier_stats",{})
    if ts:
     base+="\n\n🥇 TIER STATS"
@@ -730,7 +907,7 @@ class Telegram:
      if tr in ts:
       x=ts[tr];tot=x["w"]+x["l"]
       wr=round(x["w"]/tot*100,1) if tot else 0
-      base+=f"\n{tr}: {x['w']}W/{x['l']}L ({wr}%) | {x['pnl']:.2f} USDT"
+      base+=f"\n{tr}: {x['w']}W/{x['l']}L/{x['t']}T ({wr}%) | {x['pnl']:.2f} USDT"
    return base
   if t=="/rejections":
    q=STORE.rejection_stats()
@@ -746,31 +923,61 @@ class Telegram:
      "/errors — xətalar\n"
      "/help — bu mesaj")
   return None
-# SWING AI v12.7 ALL FIXED - PART 8/8
+# SWING AI v13.0 - PART 8/8
 class PositionManager:
  def check(self,x):
-  t=BYBIT.ticker(x["symbol"],fresh=True)
-  if not t:return
-  p=safe_float(t.get("last_price"),math.nan)
-  if not math.isfinite(p):return
-  e=x["entry"];sl=x["sl"];tp=x["tp"];d=x["direction"]
-  created=x.get("created_ts",time.time())
-  age=(time.time()-created)/3600;result=None
-  if age>=Config.MAX_HOLD_HOURS:result="TIME"
-  elif d=="long" and p<=sl:result="SL"
-  elif d=="long" and p>=tp:result="TP"
-  elif d=="short" and p>=sl:result="SL"
-  elif d=="short" and p<=tp:result="TP"
+  """v13.0: 1M kline monitor — wick-ləri də tutur."""
+  symbol=x["symbol"];d=x["direction"]
+  entry=safe_float(x.get("entry"),math.nan)
+  sl=safe_float(x.get("sl"),math.nan)
+  tp=safe_float(x.get("tp"),math.nan)
+  if not all(math.isfinite(v) for v in [entry,sl,tp]):return
+  created_ts=x.get("created_ts",time.time())
+  age=(time.time()-created_ts)/3600
+  # 1M live candle
+  k=BYBIT.kline_1m_live(symbol)
+  if not k:return
+  k_ts_sec=k.get("ts",0)/1000.0 if k.get("ts",0)>1e11 else k.get("ts",0)
+  hi=safe_float(k.get("high"),math.nan)
+  lo=safe_float(k.get("low"),math.nan)
+  close=safe_float(k.get("close"),math.nan)
+  if not (math.isfinite(hi) and math.isfinite(lo) and math.isfinite(close)):return
+  # Signal-həmin candle-dən əvvəl yaranıbsa → tam izlə
+  # Signal-həmin candle içində yaranıbsa → yalnız sonrakı candle-lar
+  last_checked=x.get("last_checked_candle",0)
+  # Bu candle artıq yoxlanılıb?
+  if k_ts_sec<=last_checked:
+   # Eyni candle-i yenə yoxlama
+   return
+  x["last_checked_candle"]=k_ts_sec
+  # === SL/TP yoxla ===
+  result=None;exit_price=None;result_r=None
+  if d=="long":
+   sl_hit=lo<=sl
+   tp_hit=hi>=tp
+   if sl_hit and tp_hit:
+    result="SL";exit_price=sl;result_r=-1.0
+   elif sl_hit:
+    result="SL";exit_price=sl;result_r=-1.0
+   elif tp_hit:
+    result="TP";exit_price=tp;result_r=x["rr"]
+  else:
+   sl_hit=hi>=sl
+   tp_hit=lo<=tp
+   if sl_hit and tp_hit:
+    result="SL";exit_price=sl;result_r=-1.0
+   elif sl_hit:
+    result="SL";exit_price=sl;result_r=-1.0
+   elif tp_hit:
+    result="TP";exit_price=tp;result_r=x["rr"]
+  # TIME (96h)
+  if not result and age>=Config.MAX_HOLD_HOURS:
+   result="TIME";exit_price=close
+   if d=="long":result_r=(close-entry)/(entry-sl) if entry!=sl else 0
+   else:result_r=(entry-close)/(sl-entry) if sl!=entry else 0
   if result:
-   if result=="TP":rr=x["rr"]
-   elif result=="SL":rr=-1.0
-   else:rr=(p-e)/(e-sl) if d=="long" else (e-p)/(sl-e)
-   x["result"]=result;x["result_r"]=rr;x["exit_price"]=p
-   x["pnl"]=rr*(Config.ACCOUNT_BALANCE*Config.RISK_PERCENT/100)
-   STORE.remove(x["symbol"],x)
-   tr=x.get("tier","?")
-   Telegram.send(f"🔔 CLOSED [{tr}]\n{x['symbol']} {d.upper()}\n"
-     f"Result: {result}\nExit: {p:.8g}\nR: {rr:.2f}\nPnL: {x['pnl']:.2f} USDT")
+   y=STORE.close_position(symbol,x,result,exit_price,result_r)
+   Telegram.closed(y)
  def run(self):
   while not STOP_EVENT.is_set():
    try:
@@ -778,7 +985,7 @@ class PositionManager:
    except Exception as e:
     tb=traceback.format_exc()
     log.error("MONITOR ERROR:\n%s",tb)
-    STOP_EVENT.wait(Config.MONITOR_INTERVAL)
+   STOP_EVENT.wait(Config.MONITOR_INTERVAL)
 
 MANAGER=PositionManager()
 
@@ -787,14 +994,6 @@ class Scanner:
  def symbols(self):
   try:
    tickers=BYBIT.all_tickers()
-   log.info("DEBUG: all_tickers=%d",len(tickers))
-   if tickers:
-    sample=tickers[0]
-    sample_line=(f"symbol={sample.get('symbol')} | "
-      f"turnover24h={sample.get('turnover24h')} | "
-      f"lastPrice={sample.get('lastPrice')}")
-   else:
-    sample_line="NO SAMPLE"
    usdt_end=0;turn_pos=0;not_tradfi=0
    c=[]
    for x in tickers:
@@ -804,46 +1003,28 @@ class Scanner:
     if s.endswith("USDT") and turn>0:turn_pos+=1
     if s.endswith("USDT") and turn>0 and base not in Config.TRADFI:
      not_tradfi+=1;c.append((s,turn))
-   log.info("DEBUG filter: usdt_end=%d turn_pos=%d not_tradfi=%d",
-     usdt_end,turn_pos,not_tradfi)
    c.sort(key=lambda z:z[1],reverse=True);out=[]
-   rejected={"status":0,"type":0,"quote":0,"settle":0,"no_instr":0}
    for s,_ in c[:Config.CANDIDATE_LIMIT]:
     i=BYBIT.instrument(s)
-    if not i:
-     rejected["no_instr"]+=1;continue
-    if i.get("status")!="Trading":rejected["status"]+=1;continue
-    if i.get("contractType")!="LinearPerpetual":rejected["type"]+=1;continue
-    if i.get("quoteCoin")!="USDT":rejected["quote"]+=1;continue
-    if i.get("settleCoin")!="USDT":rejected["settle"]+=1;continue
+    if not i:continue
+    if i.get("status")!="Trading":continue
+    if i.get("contractType")!="LinearPerpetual":continue
+    if i.get("quoteCoin")!="USDT":continue
+    if i.get("settleCoin")!="USDT":continue
     out.append(s)
     if len(out)>=Config.SCAN_TOP_N:break
-   log.info("DEBUG: final=%d | rejected=%s",len(out),rejected)
-   # Yalnız DEBUG aktivdirsə Telegram-a göndər
+   log.info("Symbols: %d / %d (after filter)",len(out),len(c))
    if Config.DEBUG_SYMBOLS_ENABLED:
-    Telegram.send(f"🔎 DEBUG SYMBOLS\n"
-      f"━━━━━━━━━━━━━━━━━━\n"
-      f"all_tickers: {len(tickers)}\n"
-      f"━━━ Filter addımları ━━━\n"
-      f"USDT ilə bitən: {usdt_end}\n"
-      f"+turnover>0: {turn_pos}\n"
-      f"+TRADFI deyil: {not_tradfi}\n"
-      f"━━━━━━━━━━━━━━━━━━\n"
-      f"final: {len(out)}\n"
-      f"rejected: {rejected}\n"
-      f"fallback: {'BƏLİ' if not out else 'XEYR'}\n"
-      f"━━━ Sample ━━━\n"
-      f"{sample_line[:300]}")
+    Telegram.send(f"🔎 SYMBOLS: {len(out)} coin\n"
+      f"all={len(tickers)} usdt={usdt_end} turn>0={turn_pos} trad={not_tradfi}")
    return out or Config.FALLBACK_COINS
   except Exception as e:
    tb=traceback.format_exc()
    log.error("SYMBOLS ERROR:\n%s",tb)
    STORE.add_error("SYMBOLS",str(e),short_tb(tb))
-   Telegram.send(f"⚠️ SYMBOLS XƏTA\n{str(e)[:200]}\n{short_tb(tb,300)}")
    return Config.FALLBACK_COINS
  def scan(self,force=False):
   if not self.lock.acquire(False):return
-  # VAXT YOXLAMASI
   if Config.SCAN_HOURS_ENABLED and not force:
    h=utc_now().hour
    if not (Config.SCAN_HOUR_START<=h<Config.SCAN_HOUR_END):
@@ -853,22 +1034,16 @@ class Scanner:
   tier_a=tier_b=tier_c=0
   try:
    STORE.reset_day();STORE.reset_rejections()
-   # === OVERRIDE-AWARE LIMIT CHECK ===
    active_full=len(STORE.active)>=Config.MAX_ACTIVE_SIGNALS
    daily_full=STORE.daily_count>=Config.MAX_DAILY_SIGNALS
    override_full=STORE.override_count>=Config.MAX_OVERRIDE_DAILY
    if active_full:
-    Telegram.send(f"⏸ SCAN LIMIT — aktiv siqnal doldu\n"
-      f"Active: {len(STORE.active)}/{Config.MAX_ACTIVE_SIGNALS}\n"
-      f"Gözlə: mövqe bağlanana qədər")
+    log.info("Active limit doldu")
     return
    if daily_full and override_full:
-    Telegram.send(f"⏸ SCAN LIMIT — gündəlik doldu\n"
-      f"Today: {STORE.daily_count}/{Config.MAX_DAILY_SIGNALS} "
-      f"(override: {STORE.override_count}/{Config.MAX_OVERRIDE_DAILY})\n"
-      f"Sabah yenidən başlayır")
+    log.info("Daily+override doldu")
     return
-   symbols=self.symbols();log.info("Scanning %d symbols",len(symbols))
+   symbols=self.symbols()
    with ThreadPoolExecutor(max_workers=Config.PARALLEL_WORKERS) as ex:
     fs={ex.submit(analyze_symbol,s):s for s in symbols}
     for f in as_completed(fs):
@@ -888,7 +1063,6 @@ class Scanner:
    t_c=[x for x in found if x["tier"]=="C"]
    tier_a=len(t_a);tier_b=len(t_b);tier_c=len(t_c)
    log.info("Tiers | A=%d B=%d C=%d",tier_a,tier_b,tier_c)
-
    # === SEÇİM: 1-ci 80+, 2-ci 80+, 3-cü 90+ ===
    to_send=[]
    for x in t_a:
@@ -908,7 +1082,6 @@ class Scanner:
      if STORE.override_count<Config.MAX_OVERRIDE_DAILY:
       x["override"]=True
       to_send.append(x);break
-
    for x in to_send:
     if not Correlation.allowed(x["symbol"],STORE.active_symbols()):
      STORE.add_rejection(x["symbol"],"CORRELATION");continue
@@ -917,7 +1090,7 @@ class Scanner:
      if x.get("override"):
       Telegram.send(f"⚡ OVERRIDE SİQNAL\n"
         f"Score {x['score']} ≥ {Config.OVERRIDE_SCORE}\n"
-        f"Gündəlik limit artırıldı → 3-cü siqnal")
+        f"Gündəlik limit artırıldı")
    Telegram.scan_done(len(symbols),found,sent,tier_a,tier_b,tier_c)
    log.info("SCAN | %d | valid=%d | A=%d | sent=%d",
      len(symbols),len(found),tier_a,sent)
@@ -953,7 +1126,7 @@ class TelegramPoller:
      if text.strip().lower()=="/scan":
       if SCANNER.running:Telegram.send("⏳ Scan artıq işləyir.")
       else:
-       Telegram.send("🔎 Scan başladıldı... (manual override)")
+       Telegram.send("🔎 Scan başladıldı... (manual)")
        threading.Thread(target=SCANNER.scan,
          kwargs={"force":True},daemon=True).start()
      else:
@@ -967,11 +1140,12 @@ app=Flask(__name__)
 
 @app.get("/")
 def home():return jsonify({"bot":BOT_VERSION,"status":"running",
-  "active":len(STORE.active),"today":STORE.daily_count})
+  "active":len(STORE.active),"today":STORE.daily_count,
+  "balance":round(STORE.balance,2)})
 @app.get("/status")
 def ws():return jsonify({"version":BOT_VERSION,"active":STORE.active,
   "daily_count":STORE.daily_count,"override_count":STORE.override_count,
-  "stats":Performance.stats()})
+  "balance":round(STORE.balance,2),"stats":Performance.stats()})
 @app.get("/signals")
 def wsg():return jsonify({"active":STORE.active})
 @app.get("/stats")
@@ -995,20 +1169,16 @@ def startup():
  baku_end=(Config.SCAN_HOUR_END+4)%24
  Telegram.send(f"🤖 SWING AI {BOT_VERSION}\n4H → 1H → 15M\n"
    f"━━━━━━━━━━━━━━━━━━\n"
-   f"🥇 SİQNAL QAYDALARI:\n"
-   f"1-ci: Score ≥ {Config.FIRST_SIGNAL_SCORE}\n"
-   f"2-ci: Score ≥ {Config.SECOND_SIGNAL_SCORE}\n"
-   f"3-cü: Score ≥ {Config.OVERRIDE_SCORE} (OVERRIDE)\n"
+   f"🥇 1-ci: Score ≥ {Config.FIRST_SIGNAL_SCORE}\n"
+   f"🥈 2-ci: Score ≥ {Config.SECOND_SIGNAL_SCORE}\n"
+   f"⚡ 3-cü: Score ≥ {Config.OVERRIDE_SCORE} (OVERRIDE)\n"
    f"━━━━━━━━━━━━━━━━━━\n"
-   f"⏰ SKAN PƏNCƏRƏSİ:\n"
-   f"UTC: {Config.SCAN_HOUR_START:02d}:00-{Config.SCAN_HOUR_END:02d}:00\n"
-   f"Bakı: {baku_start:02d}:00-{baku_end:02d}:00\n"
-   f"Həftə sonu: ✅ AKTİV\n"
-   f"Manual: /scan (hər zaman)\n"
+   f"⏰ UTC: {Config.SCAN_HOUR_START:02d}-{Config.SCAN_HOUR_END:02d} | "
+   f"Bakı: {baku_start:02d}-{baku_end:02d}\n"
+   f"Həftə sonu: ✅ | Manual: /scan\n"
    f"━━━━━━━━━━━━━━━━━━\n"
-   f"RSI L {Config.LONG_RSI_MIN:.0f}-{Config.LONG_RSI_MAX:.0f} | "
-   f"S {Config.SHORT_RSI_MIN:.0f}-{Config.SHORT_RSI_MAX:.0f}\n"
-   f"RR {Config.MIN_RR:.1f}-{Config.MAX_RR:.1f}")
+   f"💰 Balance: {STORE.balance:.2f} USDT\n"
+   f"📊 Monitor: 1M kline (wick-safe)")
 
 def start_threads():
  threading.Thread(target=flask_worker,daemon=True).start()
