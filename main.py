@@ -1,11 +1,11 @@
-# SWING AI v12.5 DEEP DEBUG - PART 1/8
+# SWING AI v12.6 FINAL FIXED - PART 1/8
 import os,time,json,math,signal,logging,threading,traceback
 import requests,numpy as np,pandas as pd
 from datetime import datetime,timezone
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from flask import Flask,jsonify
 
-BOT_VERSION="12.5 DEEP DEBUG"
+BOT_VERSION="12.6 FINAL FIXED"
 
 class Config:
  BOT_TOKEN=os.getenv("BOT_TOKEN","");CHAT_ID=os.getenv("CHAT_ID","1121794078")
@@ -53,9 +53,12 @@ logging.basicConfig(level=logging.INFO,format="%(asctime)s | %(levelname)s | %(m
 log=logging.getLogger("SWING_AI");STOP_EVENT=threading.Event()
 
 def safe_float(v,d=0.0):
+ """BUG FIX v12.6: else x (əvvəl else d səhv idi)."""
  try:
-  x=float(v);return d if not math.isfinite(x) else d
+  x=float(v)
+  return d if not math.isfinite(x) else x
  except:return d
+
 def utc_now():return datetime.now(timezone.utc)
 def utc_iso():return utc_now().isoformat()
 def valid(df,n):return isinstance(df,pd.DataFrame) and len(df)>=n
@@ -76,7 +79,7 @@ class Cache:
    return x[0]
  def set(self,k,v):
   with self.lock:self.data[k]=(v,time.time())
-# SWING AI v12.5 DEEP DEBUG - PART 2/8
+ # SWING AI v12.6 FINAL FIXED - PART 2/8
 class BybitClient:
  def __init__(self):
   self.base=Config.BASE_URL
@@ -86,7 +89,7 @@ class BybitClient:
   self.local=threading.local();self._lock=threading.Lock();self._last=0.0
  def session(self):
   if not hasattr(self.local,"session"):
-   s=requests.Session();s.headers.update({"User-Agent":"SwingAI/12.5"})
+   s=requests.Session();s.headers.update({"User-Agent":"SwingAI/12.6"})
    self.local.session=s
   return self.local.session
  def _rate(self):
@@ -180,7 +183,7 @@ def validate_config():
  if not (Config.TIER_A_SCORE>Config.MIN_SCORE):raise ValueError("tier")
  if not (Config.FIRST_SIGNAL_SCORE>=Config.TIER_A_SCORE):raise ValueError("first")
  if not (Config.OVERRIDE_SCORE>=Config.FIRST_SIGNAL_SCORE):raise ValueError("override")
-# SWING AI v12.5 DEEP DEBUG - PART 3/8
+# SWING AI v12.6 FINAL FIXED - PART 3/8
 class Indicators:
  @staticmethod
  def ema(s,n):return s.ewm(span=n,adjust=False).mean()
@@ -233,7 +236,7 @@ class Structure:
   if sh[-1][1]>sh[-2][1] and sl[-1][1]>sl[-2][1]:return "bullish"
   if sh[-1][1]<sh[-2][1] and sl[-1][1]<sl[-2][1]:return "bearish"
   return "neutral"
-# SWING AI v12.5 DEEP DEBUG - PART 4/8
+# SWING AI v12.6 FINAL FIXED - PART 4/8
 class Regime:
  @staticmethod
  def analyze(df):
@@ -342,7 +345,7 @@ class Strategy:
   if p>=mid:return 100
   if p>=mid-atr:return 70
   return 35
- # SWING AI v12.5 DEEP DEBUG - PART 5/8
+# SWING AI v12.6 FINAL FIXED - PART 5/8
 class Filters:
  @staticmethod
  def volatility(df):
@@ -450,7 +453,7 @@ class Risk:
    if Config.MIN_RR<=rr<=Config.MAX_RR:
     return {"entry":e,"sl":sl,"tp":tp,"risk":risk,"rr":rr}
   return None
-# SWING AI v12.5 DEEP DEBUG - PART 6/8
+# SWING AI v12.6 FINAL FIXED - PART 6/8
 class Scoring:
  @staticmethod
  def calculate(d4,d15,d,seq):
@@ -539,7 +542,7 @@ def analyze_symbol(s):
   log.error("ANALYZE ERROR [%s]:\n%s",s,tb)
   STORE.add_error(s,str(e),short_tb(tb))
   return None,"ERROR"
- # SWING AI v12.5 DEEP DEBUG - PART 7/8
+# SWING AI v12.6 FINAL FIXED - PART 7/8
 class Store:
  def __init__(self):
   self.lock=threading.RLock();self.active=[];self.closed=[]
@@ -743,7 +746,7 @@ class Telegram:
      "/errors — xətalar\n"
      "/help — bu mesaj")
   return None
- # SWING AI v12.5 DEEP DEBUG - PART 8/8
+# SWING AI v12.6 FINAL FIXED - PART 8/8
 class PositionManager:
  def check(self,x):
   t=BYBIT.ticker(x["symbol"],fresh=True)
@@ -781,22 +784,17 @@ MANAGER=PositionManager()
 class Scanner:
  def __init__(self):self.lock=threading.Lock();self.running=False
  def symbols(self):
-  """v12.5: DƏRİN DEBUG — filter addımlarını ayrı-ayrı say."""
   try:
    tickers=BYBIT.all_tickers()
    log.info("DEBUG: all_tickers=%d",len(tickers))
-   # Sample yoxla
    if tickers:
     sample=tickers[0]
-    sample_keys=list(sample.keys())
     sample_line=(f"symbol={sample.get('symbol')}\n"
       f"turnover24h={sample.get('turnover24h')}\n"
-      f"volume24h={sample.get('volume24h')}\n"
       f"lastPrice={sample.get('lastPrice')}")
     log.info("DEBUG sample: %s",sample_line.replace(chr(10)," | "))
    else:
     sample_line="NO SAMPLE"
-   # Filter addımlarını ayrı-ayrı say
    usdt_end=0;turn_pos=0;not_tradfi=0
    c=[]
    for x in tickers:
@@ -843,7 +841,6 @@ class Scanner:
    return Config.FALLBACK_COINS
  def scan(self,force=False):
   if not self.lock.acquire(False):return
-  # VAXT YOXLAMASI
   if Config.SCAN_HOURS_ENABLED and not force:
    h=utc_now().hour
    if not (Config.SCAN_HOUR_START<=h<Config.SCAN_HOUR_END):
@@ -872,7 +869,6 @@ class Scanner:
      if x:found.append(x)
      else:STORE.add_rejection(s,r)
    found.sort(key=lambda z:z["score"],reverse=True)
-   # TIER
    for x in found:x["tier"]=Scoring.tier(x["score"],x["rr"])
    t_a=[x for x in found if x["tier"]=="A"]
    t_b=[x for x in found if x["tier"]=="B"]
@@ -880,7 +876,6 @@ class Scanner:
    tier_a=len(t_a);tier_b=len(t_b);tier_c=len(t_c)
    log.info("Tiers | A=%d B=%d C=%d",tier_a,tier_b,tier_c)
 
-   # === SEÇİM: 1-ci 80+, 2-ci 80+, 3-cü 90+ ===
    to_send=[]
    for x in t_a:
     score=x["score"];dc=STORE.daily_count
