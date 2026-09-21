@@ -1,11 +1,11 @@
-# SWING AI v12.6 FINAL FIXED - PART 1/8
+# SWING AI v12.7 ALL FIXED - PART 1/8
 import os,time,json,math,signal,logging,threading,traceback
 import requests,numpy as np,pandas as pd
 from datetime import datetime,timezone
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from flask import Flask,jsonify
 
-BOT_VERSION="12.6 FINAL FIXED"
+BOT_VERSION="12.7 ALL FIXED"
 
 class Config:
  BOT_TOKEN=os.getenv("BOT_TOKEN","");CHAT_ID=os.getenv("CHAT_ID","1121794078")
@@ -34,6 +34,7 @@ class Config:
  BTC_FILTER_ENABLED=True;CORRELATION_FILTER_ENABLED=False
  MAX_CORRELATED_ACTIVE=2;CORRELATION_THRESHOLD=0.85
  SCAN_HOUR_START=9;SCAN_HOUR_END=20;SCAN_HOURS_ENABLED=True
+ DEBUG_SYMBOLS_ENABLED=False
  MAX_HOLD_HOURS=96;DATA_DIR="swing_bot_data"
  FLASK_PORT=int(os.getenv("PORT","10000"))
  REQUEST_TIMEOUT=15;CACHE_TTL=10;TICKER_CACHE_TTL=30;INSTRUMENT_CACHE_TTL=3600
@@ -53,7 +54,6 @@ logging.basicConfig(level=logging.INFO,format="%(asctime)s | %(levelname)s | %(m
 log=logging.getLogger("SWING_AI");STOP_EVENT=threading.Event()
 
 def safe_float(v,d=0.0):
- """BUG FIX v12.6: else x (əvvəl else d səhv idi)."""
  try:
   x=float(v)
   return d if not math.isfinite(x) else x
@@ -79,7 +79,7 @@ class Cache:
    return x[0]
  def set(self,k,v):
   with self.lock:self.data[k]=(v,time.time())
- # SWING AI v12.6 FINAL FIXED - PART 2/8
+# SWING AI v12.7 ALL FIXED - PART 2/8
 class BybitClient:
  def __init__(self):
   self.base=Config.BASE_URL
@@ -89,7 +89,7 @@ class BybitClient:
   self.local=threading.local();self._lock=threading.Lock();self._last=0.0
  def session(self):
   if not hasattr(self.local,"session"):
-   s=requests.Session();s.headers.update({"User-Agent":"SwingAI/12.6"})
+   s=requests.Session();s.headers.update({"User-Agent":"SwingAI/12.7"})
    self.local.session=s
   return self.local.session
  def _rate(self):
@@ -183,7 +183,7 @@ def validate_config():
  if not (Config.TIER_A_SCORE>Config.MIN_SCORE):raise ValueError("tier")
  if not (Config.FIRST_SIGNAL_SCORE>=Config.TIER_A_SCORE):raise ValueError("first")
  if not (Config.OVERRIDE_SCORE>=Config.FIRST_SIGNAL_SCORE):raise ValueError("override")
-# SWING AI v12.6 FINAL FIXED - PART 3/8
+# SWING AI v12.7 ALL FIXED - PART 3/8
 class Indicators:
  @staticmethod
  def ema(s,n):return s.ewm(span=n,adjust=False).mean()
@@ -236,7 +236,7 @@ class Structure:
   if sh[-1][1]>sh[-2][1] and sl[-1][1]>sl[-2][1]:return "bullish"
   if sh[-1][1]<sh[-2][1] and sl[-1][1]<sl[-2][1]:return "bearish"
   return "neutral"
-# SWING AI v12.6 FINAL FIXED - PART 4/8
+# SWING AI v12.7 ALL FIXED - PART 4/8
 class Regime:
  @staticmethod
  def analyze(df):
@@ -345,7 +345,7 @@ class Strategy:
   if p>=mid:return 100
   if p>=mid-atr:return 70
   return 35
-# SWING AI v12.6 FINAL FIXED - PART 5/8
+# SWING AI v12.7 ALL FIXED - PART 5/8
 class Filters:
  @staticmethod
  def volatility(df):
@@ -453,7 +453,7 @@ class Risk:
    if Config.MIN_RR<=rr<=Config.MAX_RR:
     return {"entry":e,"sl":sl,"tp":tp,"risk":risk,"rr":rr}
   return None
-# SWING AI v12.6 FINAL FIXED - PART 6/8
+# SWING AI v12.7 ALL FIXED - PART 6/8
 class Scoring:
  @staticmethod
  def calculate(d4,d15,d,seq):
@@ -542,7 +542,7 @@ def analyze_symbol(s):
   log.error("ANALYZE ERROR [%s]:\n%s",s,tb)
   STORE.add_error(s,str(e),short_tb(tb))
   return None,"ERROR"
-# SWING AI v12.6 FINAL FIXED - PART 7/8
+# SWING AI v12.7 ALL FIXED - PART 7/8
 class Store:
  def __init__(self):
   self.lock=threading.RLock();self.active=[];self.closed=[]
@@ -746,7 +746,7 @@ class Telegram:
      "/errors — xətalar\n"
      "/help — bu mesaj")
   return None
-# SWING AI v12.6 FINAL FIXED - PART 8/8
+# SWING AI v12.7 ALL FIXED - PART 8/8
 class PositionManager:
  def check(self,x):
   t=BYBIT.ticker(x["symbol"],fresh=True)
@@ -754,7 +754,8 @@ class PositionManager:
   p=safe_float(t.get("last_price"),math.nan)
   if not math.isfinite(p):return
   e=x["entry"];sl=x["sl"];tp=x["tp"];d=x["direction"]
-  age=(time.time()-x["created_ts"])/3600;result=None
+  created=x.get("created_ts",time.time())
+  age=(time.time()-created)/3600;result=None
   if age>=Config.MAX_HOLD_HOURS:result="TIME"
   elif d=="long" and p<=sl:result="SL"
   elif d=="long" and p>=tp:result="TP"
@@ -789,10 +790,9 @@ class Scanner:
    log.info("DEBUG: all_tickers=%d",len(tickers))
    if tickers:
     sample=tickers[0]
-    sample_line=(f"symbol={sample.get('symbol')}\n"
-      f"turnover24h={sample.get('turnover24h')}\n"
+    sample_line=(f"symbol={sample.get('symbol')} | "
+      f"turnover24h={sample.get('turnover24h')} | "
       f"lastPrice={sample.get('lastPrice')}")
-    log.info("DEBUG sample: %s",sample_line.replace(chr(10)," | "))
    else:
     sample_line="NO SAMPLE"
    usdt_end=0;turn_pos=0;not_tradfi=0
@@ -819,19 +819,21 @@ class Scanner:
     out.append(s)
     if len(out)>=Config.SCAN_TOP_N:break
    log.info("DEBUG: final=%d | rejected=%s",len(out),rejected)
-   Telegram.send(f"🔎 DEBUG SYMBOLS\n"
-     f"━━━━━━━━━━━━━━━━━━\n"
-     f"all_tickers: {len(tickers)}\n"
-     f"━━━ Filter addımları ━━━\n"
-     f"USDT ilə bitən: {usdt_end}\n"
-     f"+turnover>0: {turn_pos}\n"
-     f"+TRADFI deyil: {not_tradfi}\n"
-     f"━━━━━━━━━━━━━━━━━━\n"
-     f"final: {len(out)}\n"
-     f"rejected: {rejected}\n"
-     f"fallback: {'BƏLİ' if not out else 'XEYR'}\n"
-     f"━━━ Sample ━━━\n"
-     f"{sample_line[:300]}")
+   # Yalnız DEBUG aktivdirsə Telegram-a göndər
+   if Config.DEBUG_SYMBOLS_ENABLED:
+    Telegram.send(f"🔎 DEBUG SYMBOLS\n"
+      f"━━━━━━━━━━━━━━━━━━\n"
+      f"all_tickers: {len(tickers)}\n"
+      f"━━━ Filter addımları ━━━\n"
+      f"USDT ilə bitən: {usdt_end}\n"
+      f"+turnover>0: {turn_pos}\n"
+      f"+TRADFI deyil: {not_tradfi}\n"
+      f"━━━━━━━━━━━━━━━━━━\n"
+      f"final: {len(out)}\n"
+      f"rejected: {rejected}\n"
+      f"fallback: {'BƏLİ' if not out else 'XEYR'}\n"
+      f"━━━ Sample ━━━\n"
+      f"{sample_line[:300]}")
    return out or Config.FALLBACK_COINS
   except Exception as e:
    tb=traceback.format_exc()
@@ -841,6 +843,7 @@ class Scanner:
    return Config.FALLBACK_COINS
  def scan(self,force=False):
   if not self.lock.acquire(False):return
+  # VAXT YOXLAMASI
   if Config.SCAN_HOURS_ENABLED and not force:
    h=utc_now().hour
    if not (Config.SCAN_HOUR_START<=h<Config.SCAN_HOUR_END):
@@ -850,10 +853,20 @@ class Scanner:
   tier_a=tier_b=tier_c=0
   try:
    STORE.reset_day();STORE.reset_rejections()
-   if not STORE.can_add(0):
-    Telegram.send(f"⏸ SCAN DAY LIMIT\nActive: {len(STORE.active)}\n"
+   # === OVERRIDE-AWARE LIMIT CHECK ===
+   active_full=len(STORE.active)>=Config.MAX_ACTIVE_SIGNALS
+   daily_full=STORE.daily_count>=Config.MAX_DAILY_SIGNALS
+   override_full=STORE.override_count>=Config.MAX_OVERRIDE_DAILY
+   if active_full:
+    Telegram.send(f"⏸ SCAN LIMIT — aktiv siqnal doldu\n"
+      f"Active: {len(STORE.active)}/{Config.MAX_ACTIVE_SIGNALS}\n"
+      f"Gözlə: mövqe bağlanana qədər")
+    return
+   if daily_full and override_full:
+    Telegram.send(f"⏸ SCAN LIMIT — gündəlik doldu\n"
       f"Today: {STORE.daily_count}/{Config.MAX_DAILY_SIGNALS} "
-      f"(override: {STORE.override_count}/{Config.MAX_OVERRIDE_DAILY})")
+      f"(override: {STORE.override_count}/{Config.MAX_OVERRIDE_DAILY})\n"
+      f"Sabah yenidən başlayır")
     return
    symbols=self.symbols();log.info("Scanning %d symbols",len(symbols))
    with ThreadPoolExecutor(max_workers=Config.PARALLEL_WORKERS) as ex:
@@ -876,6 +889,7 @@ class Scanner:
    tier_a=len(t_a);tier_b=len(t_b);tier_c=len(t_c)
    log.info("Tiers | A=%d B=%d C=%d",tier_a,tier_b,tier_c)
 
+   # === SEÇİM: 1-ci 80+, 2-ci 80+, 3-cü 90+ ===
    to_send=[]
    for x in t_a:
     score=x["score"];dc=STORE.daily_count
