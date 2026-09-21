@@ -1,11 +1,11 @@
-# SWING AI v12.3 ELITE STRICT - PART 1/8
+# SWING AI v12.4 SYMBOLS DEBUG - PART 1/8
 import os,time,json,math,signal,logging,threading,traceback
 import requests,numpy as np,pandas as pd
 from datetime import datetime,timezone
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from flask import Flask,jsonify
 
-BOT_VERSION="12.3 ELITE STRICT"
+BOT_VERSION="12.4 SYMBOLS DEBUG"
 
 class Config:
  BOT_TOKEN=os.getenv("BOT_TOKEN","");CHAT_ID=os.getenv("CHAT_ID","1121794078")
@@ -13,37 +13,27 @@ class Config:
  SCAN_TOP_N=40;CANDIDATE_LIMIT=80;CHECK_INTERVAL=300;MONITOR_INTERVAL=5;PARALLEL_WORKERS=3
  TREND_TF="240";SETUP_TF="60";ENTRY_TF="15";EMA_FAST=50;EMA_SLOW=200
  RSI_PERIOD=14;ATR_PERIOD=14;VOLUME_LOOKBACK=20
- # === CORE ===
  MIN_SCORE=60;MIN_RR=2.2;MAX_RR=3.5
  ACCOUNT_BALANCE=1000.0;RISK_PERCENT=1.0
- # === v12.3 SİQNAL LİMİTLƏRİ ===
  MAX_ACTIVE_SIGNALS=2;MAX_DAILY_SIGNALS=2;MAX_SIGNALS_TO_SEND=1
  FIRST_SIGNAL_SCORE=80;SECOND_SIGNAL_SCORE=80
  OVERRIDE_SCORE=90;MAX_OVERRIDE_DAILY=1
  TIER_A_SCORE=72;TIER_B_SCORE=999;MIN_RR_ELITE=2.4
- # === VOLATILIK / VOLUME ===
  MIN_ATR_PCT=0.20;MAX_ATR_PCT=10.0
  MIN_VOLUME_RATIO=1.00;VOLUME_WINDOW=5
  MIN_EMA_DISTANCE_PCT=0.09
- # === RSI ===
  LONG_RSI_MIN=42.0;LONG_RSI_MAX=68.0;SHORT_RSI_MIN=32.0;SHORT_RSI_MAX=58.0
- # === SL ===
  MIN_SL_ATR=0.80;MAX_SL_ATR=2.50;SL_BUFFER_ATR=0.15
- # === BOS / RETEST ===
  BOS_BUFFER_ATR=0.05;ALLOW_RECLAIM_BOS=True;BOS_LOOKBACK=100
  RETEST_MAX_BARS=15;RETEST_ATR_DISTANCE=0.90
  CONFIRMATION_MAX_BARS_AFTER_RETEST=5;MAX_CONFIRM_AGE=10
  MAX_ENTRY_EXTENSION_ATR=3.5
- # === TARGETS ===
  TARGET_LOOKBACK_15=80;TARGET_LOOKBACK_1H=80;TARGET_LOOKBACK_4H=80
  TARGET_BUFFER_ATR=0.10
- # === FİLTRLƏR ===
  MAX_ABS_FUNDING=0.003;MIN_OI_CHANGE_PCT=-10.0;OI_LOOKBACK=5;MAX_SPREAD_PCT=0.20
  BTC_FILTER_ENABLED=True;CORRELATION_FILTER_ENABLED=False
  MAX_CORRELATED_ACTIVE=2;CORRELATION_THRESHOLD=0.85
- # === VAXT MƏHDUDİYYƏTİ (UTC) ===
  SCAN_HOUR_START=9;SCAN_HOUR_END=20;SCAN_HOURS_ENABLED=True
- # === RUNTIME ===
  MAX_HOLD_HOURS=96;DATA_DIR="swing_bot_data"
  FLASK_PORT=int(os.getenv("PORT","10000"))
  REQUEST_TIMEOUT=15;CACHE_TTL=10;TICKER_CACHE_TTL=30;INSTRUMENT_CACHE_TTL=3600
@@ -86,7 +76,7 @@ class Cache:
    return x[0]
  def set(self,k,v):
   with self.lock:self.data[k]=(v,time.time())
-# SWING AI v12.3 ELITE STRICT - PART 2/8
+# SWING AI v12.4 SYMBOLS DEBUG - PART 2/8
 class BybitClient:
  def __init__(self):
   self.base=Config.BASE_URL
@@ -96,7 +86,7 @@ class BybitClient:
   self.local=threading.local();self._lock=threading.Lock();self._last=0.0
  def session(self):
   if not hasattr(self.local,"session"):
-   s=requests.Session();s.headers.update({"User-Agent":"SwingAI/12.3"})
+   s=requests.Session();s.headers.update({"User-Agent":"SwingAI/12.4"})
    self.local.session=s
   return self.local.session
  def _rate(self):
@@ -188,11 +178,9 @@ def validate_config():
   raise ValueError("rsi")
  if not (0<Config.MIN_SL_ATR<Config.MAX_SL_ATR):raise ValueError("sl_atr")
  if not (Config.TIER_A_SCORE>Config.MIN_SCORE):raise ValueError("tier")
- if not (Config.FIRST_SIGNAL_SCORE>=Config.TIER_A_SCORE):
-  raise ValueError("first_signal≥tier_a")
- if not (Config.OVERRIDE_SCORE>=Config.FIRST_SIGNAL_SCORE):
-  raise ValueError("override≥first")
-# SWING AI v12.3 ELITE STRICT - PART 3/8
+ if not (Config.FIRST_SIGNAL_SCORE>=Config.TIER_A_SCORE):raise ValueError("first")
+ if not (Config.OVERRIDE_SCORE>=Config.FIRST_SIGNAL_SCORE):raise ValueError("override")
+# SWING AI v12.4 SYMBOLS DEBUG - PART 3/8
 class Indicators:
  @staticmethod
  def ema(s,n):return s.ewm(span=n,adjust=False).mean()
@@ -245,7 +233,7 @@ class Structure:
   if sh[-1][1]>sh[-2][1] and sl[-1][1]>sl[-2][1]:return "bullish"
   if sh[-1][1]<sh[-2][1] and sl[-1][1]<sl[-2][1]:return "bearish"
   return "neutral"
-# SWING AI v12.3 ELITE STRICT - PART 4/8
+# SWING AI v12.4 SYMBOLS DEBUG - PART 4/8
 class Regime:
  @staticmethod
  def analyze(df):
@@ -354,7 +342,7 @@ class Strategy:
   if p>=mid:return 100
   if p>=mid-atr:return 70
   return 35
-# SWING AI v12.3 ELITE STRICT - PART 5/8
+# SWING AI v12.4 SYMBOLS DEBUG - PART 5/8
 class Filters:
  @staticmethod
  def volatility(df):
@@ -462,7 +450,7 @@ class Risk:
    if Config.MIN_RR<=rr<=Config.MAX_RR:
     return {"entry":e,"sl":sl,"tp":tp,"risk":risk,"rr":rr}
   return None
-# SWING AI v12.3 ELITE STRICT - PART 6/8
+# SWING AI v12.4 SYMBOLS DEBUG - PART 6/8
 class Scoring:
  @staticmethod
  def calculate(d4,d15,d,seq):
@@ -551,7 +539,7 @@ def analyze_symbol(s):
   log.error("ANALYZE ERROR [%s]:\n%s",s,tb)
   STORE.add_error(s,str(e),short_tb(tb))
   return None,"ERROR"
-# SWING AI v12.3 ELITE STRICT - PART 7/8
+# SWING AI v12.4 SYMBOLS DEBUG - PART 7/8
 class Store:
  def __init__(self):
   self.lock=threading.RLock();self.active=[];self.closed=[]
@@ -750,12 +738,12 @@ class Telegram:
   if t=="/help":
    return ("/status — aktiv siqnallar\n"
      "/stats — statistika\n"
-     "/scan — manual skan (vaxt məhdudiyyəti keçilir)\n"
+     "/scan — manual skan\n"
      "/rejections — rədd səbəbləri\n"
      "/errors — xətalar\n"
      "/help — bu mesaj")
   return None
-# SWING AI v12.3 ELITE STRICT - PART 8/8
+# SWING AI v12.4 SYMBOLS DEBUG - PART 8/8
 class PositionManager:
  def check(self,x):
   t=BYBIT.ticker(x["symbol"],fresh=True)
@@ -793,32 +781,50 @@ MANAGER=PositionManager()
 class Scanner:
  def __init__(self):self.lock=threading.Lock();self.running=False
  def symbols(self):
+  """v12.4: DEBUG ilə birlikdə."""
   try:
+   tickers=BYBIT.all_tickers()
+   log.info("DEBUG: all_tickers=%d",len(tickers))
    c=[]
-   for x in BYBIT.all_tickers():
+   for x in tickers:
     s=x.get("symbol","");turn=safe_float(x.get("turnover24h"))
     base=s[:-4] if s.endswith("USDT") else ""
-    if s.endswith("USDT") and turn>0 and base not in Config.TRADFI:c.append((s,turn))
+    if s.endswith("USDT") and turn>0 and base not in Config.TRADFI:
+     c.append((s,turn))
+   log.info("DEBUG: after filter=%d",len(c))
    c.sort(key=lambda z:z[1],reverse=True);out=[]
+   rejected={"status":0,"type":0,"quote":0,"settle":0,"no_instr":0}
    for s,_ in c[:Config.CANDIDATE_LIMIT]:
     i=BYBIT.instrument(s)
-    if (i and i.get("status")=="Trading" and i.get("contractType")=="LinearPerpetual"
-        and i.get("quoteCoin")=="USDT" and i.get("settleCoin")=="USDT"):out.append(s)
+    if not i:
+     rejected["no_instr"]+=1;continue
+    if i.get("status")!="Trading":rejected["status"]+=1;continue
+    if i.get("contractType")!="LinearPerpetual":rejected["type"]+=1;continue
+    if i.get("quoteCoin")!="USDT":rejected["quote"]+=1;continue
+    if i.get("settleCoin")!="USDT":rejected["settle"]+=1;continue
+    out.append(s)
     if len(out)>=Config.SCAN_TOP_N:break
+   log.info("DEBUG: final=%d | rejected=%s",len(out),rejected)
+   Telegram.send(f"🔎 DEBUG SYMBOLS\n"
+     f"all_tickers: {len(tickers)}\n"
+     f"after filter: {len(c)}\n"
+     f"final: {len(out)}\n"
+     f"rejected: {rejected}\n"
+     f"fallback: {'BƏLİ' if not out else 'XEYR'}")
    return out or Config.FALLBACK_COINS
   except Exception as e:
    tb=traceback.format_exc()
    log.error("SYMBOLS ERROR:\n%s",tb)
    STORE.add_error("SYMBOLS",str(e),short_tb(tb))
+   Telegram.send(f"⚠️ SYMBOLS XƏTA\n{str(e)[:200]}\n{short_tb(tb,300)}")
    return Config.FALLBACK_COINS
  def scan(self,force=False):
   if not self.lock.acquire(False):return
-  # === VAXT YOXLAMASI (həftə sonu aktiv, saat məhdudiyyəti) ===
+  # VAXT YOXLAMASI
   if Config.SCAN_HOURS_ENABLED and not force:
    h=utc_now().hour
    if not (Config.SCAN_HOUR_START<=h<Config.SCAN_HOUR_END):
-    log.info("Skan vaxtı deyil (%02d:00 UTC). Pəncərə: %02d:00-%02d:00",
-      h,Config.SCAN_HOUR_START,Config.SCAN_HOUR_END)
+    log.info("Skan vaxtı deyil (%02d:00 UTC)",h)
     self.lock.release();return
   self.running=True;found=[];sent=0;symbols=[]
   tier_a=tier_b=tier_c=0
@@ -843,7 +849,7 @@ class Scanner:
      if x:found.append(x)
      else:STORE.add_rejection(s,r)
    found.sort(key=lambda z:z["score"],reverse=True)
-   # === TIER-Ə AYIR ===
+   # TIER
    for x in found:x["tier"]=Scoring.tier(x["score"],x["rr"])
    t_a=[x for x in found if x["tier"]=="A"]
    t_b=[x for x in found if x["tier"]=="B"]
@@ -851,28 +857,22 @@ class Scanner:
    tier_a=len(t_a);tier_b=len(t_b);tier_c=len(t_c)
    log.info("Tiers | A=%d B=%d C=%d",tier_a,tier_b,tier_c)
 
-   # === v12.3 SEÇİM: 1-ci 80+, 2-ci 80+, 3-cü 90+ (OVERRIDE) ===
+   # === SEÇİM: 1-ci 80+, 2-ci 80+, 3-cü 90+ ===
    to_send=[]
    for x in t_a:
     score=x["score"];dc=STORE.daily_count
-    # 1-ci siqnal: 80+
     if dc==0:
      if score<Config.FIRST_SIGNAL_SCORE:
-      STORE.add_rejection(x["symbol"],"FIRST_LOW")
-      continue
+      STORE.add_rejection(x["symbol"],"FIRST_LOW");continue
      to_send.append(x);break
-    # 2-ci siqnal: 80+
     elif dc==1:
      if score<Config.SECOND_SIGNAL_SCORE:
-      STORE.add_rejection(x["symbol"],"SECOND_LOW")
-      continue
+      STORE.add_rejection(x["symbol"],"SECOND_LOW");continue
      if len(STORE.active)<Config.MAX_ACTIVE_SIGNALS:
       to_send.append(x);break
-    # 3-cü siqnal: OVERRIDE 90+
     elif dc>=Config.MAX_DAILY_SIGNALS:
      if score<Config.OVERRIDE_SCORE:
-      STORE.add_rejection(x["symbol"],"OVERRIDE_LOW")
-      continue
+      STORE.add_rejection(x["symbol"],"OVERRIDE_LOW");continue
      if STORE.override_count<Config.MAX_OVERRIDE_DAILY:
       x["override"]=True
       to_send.append(x);break
