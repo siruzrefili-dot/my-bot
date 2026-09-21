@@ -1,11 +1,11 @@
-# SWING AI v12.4 SYMBOLS DEBUG - PART 1/8
+# SWING AI v12.5 DEEP DEBUG - PART 1/8
 import os,time,json,math,signal,logging,threading,traceback
 import requests,numpy as np,pandas as pd
 from datetime import datetime,timezone
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from flask import Flask,jsonify
 
-BOT_VERSION="12.4 SYMBOLS DEBUG"
+BOT_VERSION="12.5 DEEP DEBUG"
 
 class Config:
  BOT_TOKEN=os.getenv("BOT_TOKEN","");CHAT_ID=os.getenv("CHAT_ID","1121794078")
@@ -76,7 +76,7 @@ class Cache:
    return x[0]
  def set(self,k,v):
   with self.lock:self.data[k]=(v,time.time())
-# SWING AI v12.4 SYMBOLS DEBUG - PART 2/8
+# SWING AI v12.5 DEEP DEBUG - PART 2/8
 class BybitClient:
  def __init__(self):
   self.base=Config.BASE_URL
@@ -86,7 +86,7 @@ class BybitClient:
   self.local=threading.local();self._lock=threading.Lock();self._last=0.0
  def session(self):
   if not hasattr(self.local,"session"):
-   s=requests.Session();s.headers.update({"User-Agent":"SwingAI/12.4"})
+   s=requests.Session();s.headers.update({"User-Agent":"SwingAI/12.5"})
    self.local.session=s
   return self.local.session
  def _rate(self):
@@ -180,7 +180,7 @@ def validate_config():
  if not (Config.TIER_A_SCORE>Config.MIN_SCORE):raise ValueError("tier")
  if not (Config.FIRST_SIGNAL_SCORE>=Config.TIER_A_SCORE):raise ValueError("first")
  if not (Config.OVERRIDE_SCORE>=Config.FIRST_SIGNAL_SCORE):raise ValueError("override")
-# SWING AI v12.4 SYMBOLS DEBUG - PART 3/8
+# SWING AI v12.5 DEEP DEBUG - PART 3/8
 class Indicators:
  @staticmethod
  def ema(s,n):return s.ewm(span=n,adjust=False).mean()
@@ -233,7 +233,7 @@ class Structure:
   if sh[-1][1]>sh[-2][1] and sl[-1][1]>sl[-2][1]:return "bullish"
   if sh[-1][1]<sh[-2][1] and sl[-1][1]<sl[-2][1]:return "bearish"
   return "neutral"
-# SWING AI v12.4 SYMBOLS DEBUG - PART 4/8
+# SWING AI v12.5 DEEP DEBUG - PART 4/8
 class Regime:
  @staticmethod
  def analyze(df):
@@ -342,7 +342,7 @@ class Strategy:
   if p>=mid:return 100
   if p>=mid-atr:return 70
   return 35
-# SWING AI v12.4 SYMBOLS DEBUG - PART 5/8
+ # SWING AI v12.5 DEEP DEBUG - PART 5/8
 class Filters:
  @staticmethod
  def volatility(df):
@@ -450,7 +450,7 @@ class Risk:
    if Config.MIN_RR<=rr<=Config.MAX_RR:
     return {"entry":e,"sl":sl,"tp":tp,"risk":risk,"rr":rr}
   return None
-# SWING AI v12.4 SYMBOLS DEBUG - PART 6/8
+# SWING AI v12.5 DEEP DEBUG - PART 6/8
 class Scoring:
  @staticmethod
  def calculate(d4,d15,d,seq):
@@ -539,7 +539,7 @@ def analyze_symbol(s):
   log.error("ANALYZE ERROR [%s]:\n%s",s,tb)
   STORE.add_error(s,str(e),short_tb(tb))
   return None,"ERROR"
-# SWING AI v12.4 SYMBOLS DEBUG - PART 7/8
+ # SWING AI v12.5 DEEP DEBUG - PART 7/8
 class Store:
  def __init__(self):
   self.lock=threading.RLock();self.active=[];self.closed=[]
@@ -743,7 +743,7 @@ class Telegram:
      "/errors — xətalar\n"
      "/help — bu mesaj")
   return None
-# SWING AI v12.4 SYMBOLS DEBUG - PART 8/8
+ # SWING AI v12.5 DEEP DEBUG - PART 8/8
 class PositionManager:
  def check(self,x):
   t=BYBIT.ticker(x["symbol"],fresh=True)
@@ -781,17 +781,33 @@ MANAGER=PositionManager()
 class Scanner:
  def __init__(self):self.lock=threading.Lock();self.running=False
  def symbols(self):
-  """v12.4: DEBUG ilə birlikdə."""
+  """v12.5: DƏRİN DEBUG — filter addımlarını ayrı-ayrı say."""
   try:
    tickers=BYBIT.all_tickers()
    log.info("DEBUG: all_tickers=%d",len(tickers))
+   # Sample yoxla
+   if tickers:
+    sample=tickers[0]
+    sample_keys=list(sample.keys())
+    sample_line=(f"symbol={sample.get('symbol')}\n"
+      f"turnover24h={sample.get('turnover24h')}\n"
+      f"volume24h={sample.get('volume24h')}\n"
+      f"lastPrice={sample.get('lastPrice')}")
+    log.info("DEBUG sample: %s",sample_line.replace(chr(10)," | "))
+   else:
+    sample_line="NO SAMPLE"
+   # Filter addımlarını ayrı-ayrı say
+   usdt_end=0;turn_pos=0;not_tradfi=0
    c=[]
    for x in tickers:
     s=x.get("symbol","");turn=safe_float(x.get("turnover24h"))
     base=s[:-4] if s.endswith("USDT") else ""
+    if s.endswith("USDT"):usdt_end+=1
+    if s.endswith("USDT") and turn>0:turn_pos+=1
     if s.endswith("USDT") and turn>0 and base not in Config.TRADFI:
-     c.append((s,turn))
-   log.info("DEBUG: after filter=%d",len(c))
+     not_tradfi+=1;c.append((s,turn))
+   log.info("DEBUG filter: usdt_end=%d turn_pos=%d not_tradfi=%d",
+     usdt_end,turn_pos,not_tradfi)
    c.sort(key=lambda z:z[1],reverse=True);out=[]
    rejected={"status":0,"type":0,"quote":0,"settle":0,"no_instr":0}
    for s,_ in c[:Config.CANDIDATE_LIMIT]:
@@ -806,11 +822,18 @@ class Scanner:
     if len(out)>=Config.SCAN_TOP_N:break
    log.info("DEBUG: final=%d | rejected=%s",len(out),rejected)
    Telegram.send(f"🔎 DEBUG SYMBOLS\n"
+     f"━━━━━━━━━━━━━━━━━━\n"
      f"all_tickers: {len(tickers)}\n"
-     f"after filter: {len(c)}\n"
+     f"━━━ Filter addımları ━━━\n"
+     f"USDT ilə bitən: {usdt_end}\n"
+     f"+turnover>0: {turn_pos}\n"
+     f"+TRADFI deyil: {not_tradfi}\n"
+     f"━━━━━━━━━━━━━━━━━━\n"
      f"final: {len(out)}\n"
      f"rejected: {rejected}\n"
-     f"fallback: {'BƏLİ' if not out else 'XEYR'}")
+     f"fallback: {'BƏLİ' if not out else 'XEYR'}\n"
+     f"━━━ Sample ━━━\n"
+     f"{sample_line[:300]}")
    return out or Config.FALLBACK_COINS
   except Exception as e:
    tb=traceback.format_exc()
