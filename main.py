@@ -1,11 +1,11 @@
-# SWING AI v12.2 ELITE TIER + VOL FIX + ERROR LOG - PART 1/8
+# SWING AI v12.3 ELITE STRICT - PART 1/8
 import os,time,json,math,signal,logging,threading,traceback
 import requests,numpy as np,pandas as pd
 from datetime import datetime,timezone
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from flask import Flask,jsonify
 
-BOT_VERSION="12.2 ELITE + VOL + ERR"
+BOT_VERSION="12.3 ELITE STRICT"
 
 class Config:
  BOT_TOKEN=os.getenv("BOT_TOKEN","");CHAT_ID=os.getenv("CHAT_ID","1121794078")
@@ -16,9 +16,11 @@ class Config:
  # === CORE ===
  MIN_SCORE=60;MIN_RR=2.2;MAX_RR=3.5
  ACCOUNT_BALANCE=1000.0;RISK_PERCENT=1.0
- MAX_ACTIVE_SIGNALS=3;MAX_DAILY_SIGNALS=5;MAX_SIGNALS_TO_SEND=2
- # === TIER ===
- TIER_A_SCORE=72;TIER_B_SCORE=65;MIN_RR_ELITE=2.3
+ # === v12.3 SİQNAL LİMİTLƏRİ ===
+ MAX_ACTIVE_SIGNALS=2;MAX_DAILY_SIGNALS=2;MAX_SIGNALS_TO_SEND=1
+ FIRST_SIGNAL_SCORE=80;SECOND_SIGNAL_SCORE=80
+ OVERRIDE_SCORE=90;MAX_OVERRIDE_DAILY=1
+ TIER_A_SCORE=72;TIER_B_SCORE=999;MIN_RR_ELITE=2.4
  # === VOLATILIK / VOLUME ===
  MIN_ATR_PCT=0.20;MAX_ATR_PCT=10.0
  MIN_VOLUME_RATIO=1.00;VOLUME_WINDOW=5
@@ -35,10 +37,12 @@ class Config:
  # === TARGETS ===
  TARGET_LOOKBACK_15=80;TARGET_LOOKBACK_1H=80;TARGET_LOOKBACK_4H=80
  TARGET_BUFFER_ATR=0.10
- # === FILTRLER ===
+ # === FİLTRLƏR ===
  MAX_ABS_FUNDING=0.003;MIN_OI_CHANGE_PCT=-10.0;OI_LOOKBACK=5;MAX_SPREAD_PCT=0.20
  BTC_FILTER_ENABLED=True;CORRELATION_FILTER_ENABLED=False
  MAX_CORRELATED_ACTIVE=2;CORRELATION_THRESHOLD=0.85
+ # === VAXT MƏHDUDİYYƏTİ (UTC) ===
+ SCAN_HOUR_START=9;SCAN_HOUR_END=20;SCAN_HOURS_ENABLED=True
  # === RUNTIME ===
  MAX_HOLD_HOURS=96;DATA_DIR="swing_bot_data"
  FLASK_PORT=int(os.getenv("PORT","10000"))
@@ -60,14 +64,13 @@ log=logging.getLogger("SWING_AI");STOP_EVENT=threading.Event()
 
 def safe_float(v,d=0.0):
  try:
-  x=float(v);return d if not math.isfinite(x) else x
+  x=float(v);return d if not math.isfinite(x) else d
  except:return d
 def utc_now():return datetime.now(timezone.utc)
 def utc_iso():return utc_now().isoformat()
 def valid(df,n):return isinstance(df,pd.DataFrame) and len(df)>=n
 
 def short_tb(tb,maxlen=200):
- """Traceback-dan son 2 sətri götür."""
  try:
   lines=[l.strip() for l in tb.strip().split("\n") if l.strip()]
   return " | ".join(lines[-2:])[:maxlen]
@@ -83,7 +86,7 @@ class Cache:
    return x[0]
  def set(self,k,v):
   with self.lock:self.data[k]=(v,time.time())
- # SWING AI v12.2 ELITE TIER + VOL FIX + ERROR LOG - PART 2/8
+# SWING AI v12.3 ELITE STRICT - PART 2/8
 class BybitClient:
  def __init__(self):
   self.base=Config.BASE_URL
@@ -93,7 +96,7 @@ class BybitClient:
   self.local=threading.local();self._lock=threading.Lock();self._last=0.0
  def session(self):
   if not hasattr(self.local,"session"):
-   s=requests.Session();s.headers.update({"User-Agent":"SwingAI/12.2"})
+   s=requests.Session();s.headers.update({"User-Agent":"SwingAI/12.3"})
    self.local.session=s
   return self.local.session
  def _rate(self):
@@ -184,9 +187,12 @@ def validate_config():
  if not (Config.LONG_RSI_MIN<Config.LONG_RSI_MAX and Config.SHORT_RSI_MIN<Config.SHORT_RSI_MAX):
   raise ValueError("rsi")
  if not (0<Config.MIN_SL_ATR<Config.MAX_SL_ATR):raise ValueError("sl_atr")
- if not (Config.TIER_A_SCORE>Config.TIER_B_SCORE>Config.MIN_SCORE):
-  raise ValueError("tier hierarchy")
-# SWING AI v12.2 ELITE TIER + VOL FIX + ERROR LOG - PART 3/8
+ if not (Config.TIER_A_SCORE>Config.MIN_SCORE):raise ValueError("tier")
+ if not (Config.FIRST_SIGNAL_SCORE>=Config.TIER_A_SCORE):
+  raise ValueError("first_signal≥tier_a")
+ if not (Config.OVERRIDE_SCORE>=Config.FIRST_SIGNAL_SCORE):
+  raise ValueError("override≥first")
+# SWING AI v12.3 ELITE STRICT - PART 3/8
 class Indicators:
  @staticmethod
  def ema(s,n):return s.ewm(span=n,adjust=False).mean()
@@ -239,7 +245,7 @@ class Structure:
   if sh[-1][1]>sh[-2][1] and sl[-1][1]>sl[-2][1]:return "bullish"
   if sh[-1][1]<sh[-2][1] and sl[-1][1]<sl[-2][1]:return "bearish"
   return "neutral"
-# SWING AI v12.2 ELITE TIER + VOL FIX + ERROR LOG - PART 4/8
+# SWING AI v12.3 ELITE STRICT - PART 4/8
 class Regime:
  @staticmethod
  def analyze(df):
@@ -348,7 +354,7 @@ class Strategy:
   if p>=mid:return 100
   if p>=mid-atr:return 70
   return 35
-# SWING AI v12.2 ELITE TIER + VOL FIX + ERROR LOG - PART 5/8
+# SWING AI v12.3 ELITE STRICT - PART 5/8
 class Filters:
  @staticmethod
  def volatility(df):
@@ -357,7 +363,6 @@ class Filters:
   return math.isfinite(a) and Config.MIN_ATR_PCT<=a<=Config.MAX_ATR_PCT
  @staticmethod
  def volume(df,lookback=None):
-  # v12.2: son 5 şamın ƏN YÜKSƏK volume-u
   lb=lookback or Config.VOLUME_WINDOW
   if not valid(df,Config.VOLUME_LOOKBACK+2):return False
   v=safe_float(df.volume_ratio.iloc[-lb:].max(),math.nan)
@@ -382,14 +387,13 @@ class Filters:
   except:return False
 
 class BTCFilter:
- """v12.2 FIX: Indicators.add() + try/except."""
  @staticmethod
  def allowed(direction):
   try:
    if not Config.BTC_FILTER_ENABLED:return True
    df=BYBIT.klines("BTCUSDT","240",250)
    if not valid(df,220):return True
-   df=Indicators.add(df)  # ← VACİB FIX
+   df=Indicators.add(df)
    x=df.iloc[-1]
    btc_bull=x.ema_fast>x.ema_slow and x.close>x.ema_slow
    btc_bear=x.ema_fast<x.ema_slow and x.close<x.ema_slow
@@ -458,7 +462,7 @@ class Risk:
    if Config.MIN_RR<=rr<=Config.MAX_RR:
     return {"entry":e,"sl":sl,"tp":tp,"risk":risk,"rr":rr}
   return None
-# SWING AI v12.2 ELITE TIER + VOL FIX + ERROR LOG - PART 6/8
+# SWING AI v12.3 ELITE STRICT - PART 6/8
 class Scoring:
  @staticmethod
  def calculate(d4,d15,d,seq):
@@ -540,7 +544,6 @@ class Analyzer:
     "created_at":utc_iso(),"created_ts":time.time()}
 
 def analyze_symbol(s):
- """v12.2: tam traceback ilə xəta log."""
  try:
   a=Analyzer(s);x=a.run();return x,("" if x else a.reject)
  except Exception as e:
@@ -548,16 +551,18 @@ def analyze_symbol(s):
   log.error("ANALYZE ERROR [%s]:\n%s",s,tb)
   STORE.add_error(s,str(e),short_tb(tb))
   return None,"ERROR"
-# SWING AI v12.2 ELITE TIER + VOL FIX + ERROR LOG - PART 7/8
+# SWING AI v12.3 ELITE STRICT - PART 7/8
 class Store:
  def __init__(self):
   self.lock=threading.RLock();self.active=[];self.closed=[]
   self.rejections={};self.stages={};self.errors=[]
   self.day=utc_now().date().isoformat();self.daily_count=0
+  self.override_count=0
  def reset_day(self):
   d=utc_now().date().isoformat()
   with self.lock:
-   if d!=self.day:self.day=d;self.daily_count=0
+   if d!=self.day:
+    self.day=d;self.daily_count=0;self.override_count=0
  def reset_rejections(self):
   with self.lock:self.rejections={};self.stages={};self.errors=[]
  def add_stage(self,name,ok):
@@ -585,7 +590,6 @@ class Store:
    q={}
    for v in self.rejections.values():q[v]=q.get(v,0)+1
    return q
- # === XƏTA SİSTEMİ ===
  def add_error(self,s,err,detail=""):
   with self.lock:
    self.errors=(self.errors+[{"symbol":s,"error":err,"detail":detail,
@@ -597,19 +601,25 @@ class Store:
   for e in q[-5:]:
    lines.append(f"❌ {e['symbol']}: {e['error']}\n   └ {e['detail']}")
   return "\n".join(lines)
- # === ƏSAS ===
  def active_symbols(self):
   with self.lock:return [x["symbol"] for x in self.active]
- def can_add(self):
+ def can_add(self,score=0):
   self.reset_day()
   with self.lock:
-   return (len(self.active)<Config.MAX_ACTIVE_SIGNALS and
-           self.daily_count<Config.MAX_DAILY_SIGNALS)
+   if len(self.active)>=Config.MAX_ACTIVE_SIGNALS:return False
+   if self.daily_count<Config.MAX_DAILY_SIGNALS:return True
+   if (score>=Config.OVERRIDE_SCORE and
+       self.override_count<Config.MAX_OVERRIDE_DAILY):return True
+   return False
  def add(self,x):
   with self.lock:
    if len(self.active)>=Config.MAX_ACTIVE_SIGNALS:return False
-   if self.daily_count>=Config.MAX_DAILY_SIGNALS:return False
    if any(a["symbol"]==x["symbol"] for a in self.active):return False
+   is_override=x.get("override",False)
+   if self.daily_count>=Config.MAX_DAILY_SIGNALS:
+    if is_override and self.override_count<Config.MAX_OVERRIDE_DAILY:
+     self.override_count+=1
+    else:return False
    self.active.append(x);self.daily_count+=1;self.save();return True
  def remove(self,s,x):
   with self.lock:
@@ -620,13 +630,15 @@ class Store:
   try:
    with open(Config.SIGNAL_FILE,"w",encoding="utf8") as f:
     json.dump({"active":self.active,"closed":self.closed,
-      "day":self.day,"daily_count":self.daily_count},f,indent=2)
+      "day":self.day,"daily_count":self.daily_count,
+      "override_count":self.override_count},f,indent=2)
   except Exception as e:log.warning("save: %s",e)
  def load(self):
   try:
    with open(Config.SIGNAL_FILE,encoding="utf8") as f:x=json.load(f)
    self.active=x.get("active",[]);self.closed=x.get("closed",[])
    self.day=x.get("day",self.day);self.daily_count=x.get("daily_count",0)
+   self.override_count=x.get("override_count",0)
    self.reset_day()
   except:pass
 
@@ -663,6 +675,7 @@ class Telegram:
   d="🟢 LONG" if x["direction"]=="long" else "🔴 SHORT"
   tier=x.get("tier","C")
   tier_emoji={"A":"🥇 ELITE","B":"🥈 GOOD","C":"🥉 STANDARD"}.get(tier,"STANDARD")
+  if x.get("override"):tier_emoji="⚡ OVERRIDE ELITE"
   body=(f"🚨 YENİ SİQNAL #{STORE.daily_count}  {tier_emoji}\n"
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📌 {x['symbol']}  {d}\n"
@@ -687,6 +700,7 @@ class Telegram:
     f"{STORE.daily_count}/{Config.MAX_DAILY_SIGNALS} bu gün\n"]
   for x in STORE.active:
    t=x.get("tier","C");emoji={"A":"🥇","B":"🥈","C":"🥉"}.get(t,"")
+   if x.get("override"):emoji="⚡"
    lines.append(f"{emoji} {x['symbol']} {x['direction'].upper()}\n"
      f"Score: {x['score']} | Entry: {x['entry']:.8g}\n"
      f"SL: {x['sl']:.8g} | TP: {x['tp']:.8g} | RR: 1:{x['rr']:.2f}")
@@ -703,7 +717,10 @@ class Telegram:
     f"🥈 Good (B): {tier_b}\n"
     f"🥉 Standart (C): {tier_c}\n"
     f"Göndərilən: {sent}\n"
-    f"Aktiv: {len(STORE.active)}\n\n📋 ŞƏRTLƏR\n{STORE.stage_report(n)}\n\n"
+    f"Aktiv: {len(STORE.active)}/{Config.MAX_ACTIVE_SIGNALS}\n"
+    f"Bugün: {STORE.daily_count}/{Config.MAX_DAILY_SIGNALS} "
+    f"(override: {STORE.override_count}/{Config.MAX_OVERRIDE_DAILY})\n\n"
+    f"📋 ŞƏRTLƏR\n{STORE.stage_report(n)}\n\n"
     f"🔎 BOS DETALLI\n{STORE.bos_report()}\n\n"
     f"🚫 İLK UĞURSUZ ŞƏRT\n{r}{err_block}")
  @staticmethod
@@ -731,9 +748,14 @@ class Telegram:
   if t=="/errors":
    return f"⚠️ XƏTALAR\n{STORE.error_report()}"
   if t=="/help":
-   return "/status\n/signals\n/stats\n/scan\n/rejections\n/errors\n/help"
+   return ("/status — aktiv siqnallar\n"
+     "/stats — statistika\n"
+     "/scan — manual skan (vaxt məhdudiyyəti keçilir)\n"
+     "/rejections — rədd səbəbləri\n"
+     "/errors — xətalar\n"
+     "/help — bu mesaj")
   return None
-# SWING AI v12.2 ELITE TIER + VOL FIX + ERROR LOG - PART 8/8
+# SWING AI v12.3 ELITE STRICT - PART 8/8
 class PositionManager:
  def check(self,x):
   t=BYBIT.ticker(x["symbol"],fresh=True)
@@ -789,15 +811,24 @@ class Scanner:
    log.error("SYMBOLS ERROR:\n%s",tb)
    STORE.add_error("SYMBOLS",str(e),short_tb(tb))
    return Config.FALLBACK_COINS
- def scan(self):
+ def scan(self,force=False):
   if not self.lock.acquire(False):return
+  # === VAXT YOXLAMASI (həftə sonu aktiv, saat məhdudiyyəti) ===
+  if Config.SCAN_HOURS_ENABLED and not force:
+   h=utc_now().hour
+   if not (Config.SCAN_HOUR_START<=h<Config.SCAN_HOUR_END):
+    log.info("Skan vaxtı deyil (%02d:00 UTC). Pəncərə: %02d:00-%02d:00",
+      h,Config.SCAN_HOUR_START,Config.SCAN_HOUR_END)
+    self.lock.release();return
   self.running=True;found=[];sent=0;symbols=[]
   tier_a=tier_b=tier_c=0
   try:
    STORE.reset_day();STORE.reset_rejections()
-   if not STORE.can_add():
+   if not STORE.can_add(0):
     Telegram.send(f"⏸ SCAN DAY LIMIT\nActive: {len(STORE.active)}\n"
-      f"Today: {STORE.daily_count}/{Config.MAX_DAILY_SIGNALS}");return
+      f"Today: {STORE.daily_count}/{Config.MAX_DAILY_SIGNALS} "
+      f"(override: {STORE.override_count}/{Config.MAX_OVERRIDE_DAILY})")
+    return
    symbols=self.symbols();log.info("Scanning %d symbols",len(symbols))
    with ThreadPoolExecutor(max_workers=Config.PARALLEL_WORKERS) as ex:
     fs={ex.submit(analyze_symbol,s):s for s in symbols}
@@ -819,23 +850,45 @@ class Scanner:
    t_c=[x for x in found if x["tier"]=="C"]
    tier_a=len(t_a);tier_b=len(t_b);tier_c=len(t_c)
    log.info("Tiers | A=%d B=%d C=%d",tier_a,tier_b,tier_c)
-   # === SEÇİM ===
+
+   # === v12.3 SEÇİM: 1-ci 80+, 2-ci 80+, 3-cü 90+ (OVERRIDE) ===
    to_send=[]
-   if t_a:
-    to_send=t_a[:2]
-    if len(to_send)<2 and t_b:to_send.append(t_b[0])
-   elif t_b:
-    to_send=t_b[:1]
+   for x in t_a:
+    score=x["score"];dc=STORE.daily_count
+    # 1-ci siqnal: 80+
+    if dc==0:
+     if score<Config.FIRST_SIGNAL_SCORE:
+      STORE.add_rejection(x["symbol"],"FIRST_LOW")
+      continue
+     to_send.append(x);break
+    # 2-ci siqnal: 80+
+    elif dc==1:
+     if score<Config.SECOND_SIGNAL_SCORE:
+      STORE.add_rejection(x["symbol"],"SECOND_LOW")
+      continue
+     if len(STORE.active)<Config.MAX_ACTIVE_SIGNALS:
+      to_send.append(x);break
+    # 3-cü siqnal: OVERRIDE 90+
+    elif dc>=Config.MAX_DAILY_SIGNALS:
+     if score<Config.OVERRIDE_SCORE:
+      STORE.add_rejection(x["symbol"],"OVERRIDE_LOW")
+      continue
+     if STORE.override_count<Config.MAX_OVERRIDE_DAILY:
+      x["override"]=True
+      to_send.append(x);break
+
    for x in to_send:
-    if sent>=Config.MAX_SIGNALS_TO_SEND:break
-    if not STORE.can_add():break
     if not Correlation.allowed(x["symbol"],STORE.active_symbols()):
      STORE.add_rejection(x["symbol"],"CORRELATION");continue
     if STORE.add(x):
      Telegram.signal(x);sent+=1
+     if x.get("override"):
+      Telegram.send(f"⚡ OVERRIDE SİQNAL\n"
+        f"Score {x['score']} ≥ {Config.OVERRIDE_SCORE}\n"
+        f"Gündəlik limit artırıldı → 3-cü siqnal")
    Telegram.scan_done(len(symbols),found,sent,tier_a,tier_b,tier_c)
-   log.info("SCAN | %d | valid=%d | A=%d B=%d C=%d | sent=%d",
-     len(symbols),len(found),tier_a,tier_b,tier_c,sent)
+   log.info("SCAN | %d | valid=%d | A=%d | sent=%d",
+     len(symbols),len(found),tier_a,sent)
   finally:
    self.running=False;self.lock.release()
 
@@ -868,13 +921,13 @@ class TelegramPoller:
      if text.strip().lower()=="/scan":
       if SCANNER.running:Telegram.send("⏳ Scan artıq işləyir.")
       else:
-       Telegram.send("🔎 Scan başladıldı...")
-       threading.Thread(target=SCANNER.scan,daemon=True).start()
+       Telegram.send("🔎 Scan başladıldı... (manual override)")
+       threading.Thread(target=SCANNER.scan,
+         kwargs={"force":True},daemon=True).start()
      else:
       ans=Telegram.handle(text)
       if ans:Telegram.send(ans)
-   except Exception as e:
-    log.warning("poller: %s",e)
+   except Exception as e:log.warning("poller: %s",e)
    STOP_EVENT.wait(2)
 
 POLL=TelegramPoller()
@@ -885,7 +938,8 @@ def home():return jsonify({"bot":BOT_VERSION,"status":"running",
   "active":len(STORE.active),"today":STORE.daily_count})
 @app.get("/status")
 def ws():return jsonify({"version":BOT_VERSION,"active":STORE.active,
-  "daily_count":STORE.daily_count,"stats":Performance.stats()})
+  "daily_count":STORE.daily_count,"override_count":STORE.override_count,
+  "stats":Performance.stats()})
 @app.get("/signals")
 def wsg():return jsonify({"active":STORE.active})
 @app.get("/stats")
@@ -905,15 +959,24 @@ signal.signal(signal.SIGTERM,stop_handler)
 
 def startup():
  validate_config()
+ baku_start=(Config.SCAN_HOUR_START+4)%24
+ baku_end=(Config.SCAN_HOUR_END+4)%24
  Telegram.send(f"🤖 SWING AI {BOT_VERSION}\n4H → 1H → 15M\n"
-   f"🥇 A: Score≥{Config.TIER_A_SCORE} və RR≥{Config.MIN_RR_ELITE}\n"
-   f"🥈 B: Score≥{Config.TIER_B_SCORE}\n"
-   f"🥉 C: Score≥{Config.MIN_SCORE} (göndərilmir)\n"
+   f"━━━━━━━━━━━━━━━━━━\n"
+   f"🥇 SİQNAL QAYDALARI:\n"
+   f"1-ci: Score ≥ {Config.FIRST_SIGNAL_SCORE}\n"
+   f"2-ci: Score ≥ {Config.SECOND_SIGNAL_SCORE}\n"
+   f"3-cü: Score ≥ {Config.OVERRIDE_SCORE} (OVERRIDE)\n"
+   f"━━━━━━━━━━━━━━━━━━\n"
+   f"⏰ SKAN PƏNCƏRƏSİ:\n"
+   f"UTC: {Config.SCAN_HOUR_START:02d}:00-{Config.SCAN_HOUR_END:02d}:00\n"
+   f"Bakı: {baku_start:02d}:00-{baku_end:02d}:00\n"
+   f"Həftə sonu: ✅ AKTİV\n"
+   f"Manual: /scan (hər zaman)\n"
+   f"━━━━━━━━━━━━━━━━━━\n"
    f"RSI L {Config.LONG_RSI_MIN:.0f}-{Config.LONG_RSI_MAX:.0f} | "
    f"S {Config.SHORT_RSI_MIN:.0f}-{Config.SHORT_RSI_MAX:.0f}\n"
-   f"RR {Config.MIN_RR:.1f}-{Config.MAX_RR:.1f} | "
-   f"Vol≥{Config.MIN_VOLUME_RATIO:.2f}x ({Config.VOLUME_WINDOW} şam)\n"
-   f"MAX {Config.MAX_SIGNALS_TO_SEND} siqnal/scan")
+   f"RR {Config.MIN_RR:.1f}-{Config.MAX_RR:.1f}")
 
 def start_threads():
  threading.Thread(target=flask_worker,daemon=True).start()
