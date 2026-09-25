@@ -41,7 +41,14 @@ class Config:
  RETEST_MAX_BARS=15;RETEST_ATR_DISTANCE=0.90
  CONFIRMATION_MAX_BARS_AFTER_RETEST=5;MAX_CONFIRM_AGE=10
  MAX_ENTRY_EXTENSION_ATR=3.5
- TARGET_LOOKBACK_15=80;TARGET_LOOKBACK_1H=80;TARGET_LOOKBACK_4H=80
+ # FIX (TARGET_RISK darboğazı): 80 sam geriyə baxma menceresi cox dar idi --
+ # BOS bas verende qiymet elə ELE ən yaxın maneə seviyyelerini artiq qirib
+ # kecdiyi ucun, "son 80 sam" pencinde hele qirilmamis hedef seviyyesi tapmaq
+ # cetinlesirdi (namized siyahisi bos qalirdi). Genisləndirilmis pəncərə
+ # daha kohne, hele test olunmamis muqavimet/destek zonalarini da gorunmesine
+ # imkan verir. MIN_RR/MAX_RR ve RISK_PERCENT kimi risk parametrlərinə
+ # TOXUNULMAYIB -- yalniz axtaris menceresi genislendi.
+ TARGET_LOOKBACK_15=150;TARGET_LOOKBACK_1H=150;TARGET_LOOKBACK_4H=150
  TARGET_BUFFER_ATR=0.10
  MAX_ABS_FUNDING=0.003;MIN_OI_CHANGE_PCT=-10.0;OI_LOOKBACK=5;MAX_SPREAD_PCT=0.20
  BTC_FILTER_ENABLED=True;CORRELATION_FILTER_ENABLED=False
@@ -1289,4 +1296,4 @@ def main():
  while not STOP_EVENT.is_set():time.sleep(1)
 
 if __name__=="__main__":main()
-   
+             
