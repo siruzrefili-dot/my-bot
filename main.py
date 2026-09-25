@@ -378,22 +378,32 @@ class Strategy:
  def sequence(df,bos,d):
   if not bos:return None
   lv=bos["level"];start=bos["bar"]+1
-  for i in range(start,min(len(df),start+Config.RETEST_MAX_BARS+1)):
+  end=min(len(df),start+Config.RETEST_MAX_BARS+1)
+  # FIX (RETEST_CONFIRM darboğazı): evvelki versiyada "toxunma" (touch) ve
+  # "geri tutma" (hold) EYNI sam daxilinde bas vermeli idi. Real bazarda
+  # retest cox vaxt bir nece sam erzinde formalasir (bir sam asagi enib
+  # bagliyir, sonraki sam geri qayidir). Indi touch herhansi bir samda bas
+  # verende yadda saxlanilir, hold ise HERHANSI SONRAKI samda (eyni ve ya
+  # daha sonraki) yoxlanilir -- RETEST_ATR_DISTANCE ve RETEST_MAX_BARS
+  # deyerlerine toxunulmayib, yalniz iki serti eyni sama baglayan qeyd goturulub.
+  touch_idx=None
+  for i in range(start,end):
    x=df.iloc[i];atr=safe_float(x.atr)
    if atr<=0:continue
    if d=="long":
-    touch=x.low<=lv+atr*Config.RETEST_ATR_DISTANCE
-    hold=x.close>=lv
+    touched=x.low<=lv+atr*Config.RETEST_ATR_DISTANCE
+    held=x.close>=lv
    else:
-    touch=x.high>=lv-atr*Config.RETEST_ATR_DISTANCE
-    hold=x.close<=lv
-   if not (touch and hold):continue
+    touched=x.high>=lv-atr*Config.RETEST_ATR_DISTANCE
+    held=x.close<=lv
+   if touched:touch_idx=i
+   if touch_idx is None or not held:continue
    for j in range(i+1,min(len(df),i+1+Config.CONFIRMATION_MAX_BARS_AFTER_RETEST+1)):
     if Strategy.strong(df,j,d):
      if d=="long" and df.close.iloc[j]>lv:
-      return {"bos":bos["bar"],"retest":i,"confirm":j,"level":lv}
+      return {"bos":bos["bar"],"retest":touch_idx,"confirm":j,"level":lv}
      if d=="short" and df.close.iloc[j]<lv:
-      return {"bos":bos["bar"],"retest":i,"confirm":j,"level":lv}
+      return {"bos":bos["bar"],"retest":touch_idx,"confirm":j,"level":lv}
   return None
  @staticmethod
  def zone_score(df,d):
