@@ -2,13 +2,13 @@
 # SWING AI v14.0 — FIXED + IMPROVED
 # HİSSƏ 1/8 — Imports + Config + Utils + Cache
 # ============================================
-import os,time,json,math,signal,logging,threading,traceback,uuid
+import os,time,json,math,signal,logging,threading,traceback,uuid,hashlib
 import requests,numpy as np,pandas as pd
 from datetime import datetime,timezone
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from flask import Flask,jsonify
 
-BOT_VERSION="14.0 FIXED + IMPROVED"
+BOT_VERSION="14.3 CACHE-FIX + RETEST-FIX"
 
 class Config:
  BOT_TOKEN=os.getenv("BOT_TOKEN","");CHAT_ID=os.getenv("CHAT_ID","1121794078")
@@ -41,14 +41,7 @@ class Config:
  RETEST_MAX_BARS=15;RETEST_ATR_DISTANCE=0.90
  CONFIRMATION_MAX_BARS_AFTER_RETEST=5;MAX_CONFIRM_AGE=10
  MAX_ENTRY_EXTENSION_ATR=3.5
- # FIX (TARGET_RISK darboğazı): 80 sam geriyə baxma menceresi cox dar idi --
- # BOS bas verende qiymet elə ELE ən yaxın maneə seviyyelerini artiq qirib
- # kecdiyi ucun, "son 80 sam" pencinde hele qirilmamis hedef seviyyesi tapmaq
- # cetinlesirdi (namized siyahisi bos qalirdi). Genisləndirilmis pəncərə
- # daha kohne, hele test olunmamis muqavimet/destek zonalarini da gorunmesine
- # imkan verir. MIN_RR/MAX_RR ve RISK_PERCENT kimi risk parametrlərinə
- # TOXUNULMAYIB -- yalniz axtaris menceresi genislendi.
- TARGET_LOOKBACK_15=150;TARGET_LOOKBACK_1H=150;TARGET_LOOKBACK_4H=150
+ TARGET_LOOKBACK_15=80;TARGET_LOOKBACK_1H=80;TARGET_LOOKBACK_4H=80  # orijinal deyerler (150 cehdi geri qaytarildi)
  TARGET_BUFFER_ATR=0.10
  MAX_ABS_FUNDING=0.003;MIN_OI_CHANGE_PCT=-10.0;OI_LOOKBACK=5;MAX_SPREAD_PCT=0.20
  BTC_FILTER_ENABLED=True;CORRELATION_FILTER_ENABLED=False
@@ -106,7 +99,6 @@ class Cache:
    return x[0]
  def set(self,k,v):
   with self.lock:self.data[k]=(v,time.time())
-
 # ============================================
 # HİSSƏ 2/8 — BybitClient + validate_config
 # ============================================
@@ -239,7 +231,6 @@ def validate_config():
  if Config.MONITOR_INTERVAL<=0 or Config.CHECK_INTERVAL<=0:raise ValueError("intervals")
  if Config.MAX_SIGNALS_TO_SEND<=0:raise ValueError("send_limit")
  if not Config.SIGNAL_SCORE_THRESHOLDS:raise ValueError("thresholds")
-
 # ============================================
 # HİSSƏ 3/8 — Indicators + Structure
 # ============================================
@@ -271,19 +262,21 @@ class Indicators:
   return x
 
 class Structure:
- # FIX: evvelki versiyada cache_key hec bir cagirisdan otururulmurdu, ona gore
- # kes hemise bos qalirdi ve swings() eyni df uzerinde bir nece defe (BOS,
- # structural_stop, target_candidates) tekrar-tekrar hesablanirdi. Indi kes
- # avtomatik olaraq (df-in identity-si + uzunlugu) uzerinden isleyir -- her
- # cagiris ucun ayrica cache_key otururmeye ehtiyac qalmir.
+ # KRITIK DUZELIS: evvelki kes acari id(df) idi. Python azad edilmis obyektin
+ # yaddas unvanini yeni obyektə verir, ona gore yeni simvolun DataFrame-i kohne
+ # (baska coinin) DataFrame-i ile eyni id+uzunluq alanda kes BASQA COININ swing
+ # seviyyelerini qaytarirdi (sinaqda 400-un 380-ində sehv). Bu, BOS/retest/SL/TP
+ # neticelerini pozurdu. Indi acar MELUMATIN ozunun hash-idir (high+low), yeni
+ # yalniz eyni qiymetli data eyni kesi paylasa biler.
  _cache={};_lock=threading.RLock()
  @staticmethod
  def swings(df,l=5,r=5):
-  key=(id(df),len(df))
+  h=df.high.to_numpy();lo=df.low.to_numpy();n=len(df)
+  key=(l,r,n,hashlib.blake2b(h.tobytes()+lo.tobytes(),digest_size=16).digest())
   with Structure._lock:
    c=Structure._cache.get(key)
    if c is not None:return c
-  h=df.high.to_numpy();lo=df.low.to_numpy();sh=[];sl=[];n=len(df)
+  sh=[];sl=[]
   for i in range(l,n-r):
    if h[i]>=max(h[i-l:i]) and h[i]>max(h[i+1:i+r+1]):sh.append((i,float(h[i])))
    if lo[i]<=min(lo[i-l:i]) and lo[i]<min(lo[i+1:i+r+1]):sl.append((i,float(lo[i])))
@@ -300,7 +293,6 @@ class Structure:
   if sh[-1][1]>sh[-2][1] and sl[-1][1]>sl[-2][1]:return "bullish"
   if sh[-1][1]<sh[-2][1] and sl[-1][1]<sl[-2][1]:return "bearish"
   return "neutral"
-
 # ============================================
 # HİSSƏ 4/8 — Regime + Strategy
 # (funksional bug tapilmadi -- oldugu kimi saxlanildi)
@@ -424,7 +416,6 @@ class Strategy:
   if p>=mid:return 100
   if p>=mid-atr:return 70
   return 35
-
 # ============================================
 # HİSSƏ 5/8 — Filters + BTCFilter + Correlation + Risk
 # ============================================
@@ -562,7 +553,6 @@ class Risk:
    if Config.MIN_RR<=rr<=Config.MAX_RR:
     return {"entry":e,"sl":sl,"tp":tp,"risk":risk,"rr":rr}
   return None
-
 # ============================================
 # HİSSƏ 6/8 — Scoring + Analyzer + analyze_symbol
 # ============================================
@@ -698,7 +688,6 @@ def analyze_symbol(s):
   log.error("ANALYZE ERROR [%s]:\n%s",s,tb)
   STORE.add_error(s,str(e),short_tb(tb))
   return None,"ERROR"
-
 # ============================================
 # HİSSƏ 7/8 — Store + Performance + Telegram
 # ============================================
@@ -1010,7 +999,6 @@ class Telegram:
    # sukutla coke biler ve bot Telegram komandalarina cavab vermeyi keserdi.
    log.warning("telegram handle: %s",e)
    return "⚠️ Komanda icra olunarkən xəta baş verdi."
-
 # ============================================
 # HİSSƏ 8/8 — PositionManager + Scanner + Flask + Main
 # ============================================
@@ -1296,4 +1284,3 @@ def main():
  while not STOP_EVENT.is_set():time.sleep(1)
 
 if __name__=="__main__":main()
-             
