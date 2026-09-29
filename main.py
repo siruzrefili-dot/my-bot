@@ -8,7 +8,7 @@ from datetime import datetime,timezone
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from flask import Flask,jsonify
 
-BOT_VERSION="14.3 CACHE-FIX + RETEST-FIX"
+BOT_VERSION="14.4 SCAN-SCORE-VISIBILITY"
 
 class Config:
  BOT_TOKEN=os.getenv("BOT_TOKEN","");CHAT_ID=os.getenv("CHAT_ID","1121794078")
@@ -666,6 +666,9 @@ class Analyzer:
   if not ok:self.reject="TARGET_RISK";return None
   score,rs=Scoring.calculate(reg["quality"],d15,d,seq,bos,btc_eval,seq["confirm"])
   score=Scoring.add_rr_to_score(score,lv["rr"])
+  # YENI: score MIN_SCORE-dan asagi olsa da qeyd olunur -- hesabatda "en
+  # yaxin namized nece idi" gorunmesi ucun (asagida reject olsa bele buraxilmir)
+  STORE.add_scan_score(s,score,Scoring.tier(score,lv["rr"]))
   ok=score>=Config.MIN_SCORE;STORE.add_stage("SCORE",ok)
   if not ok:self.reject="SCORE";return None
   return {"id":str(uuid.uuid4()),  # FIX: her siqnala unikal id -- baglanma zamani simvol ile deyil, id ile uygunlasdirilir
@@ -695,7 +698,7 @@ class Store:
  def __init__(self):
   self.lock=threading.RLock()
   self.active=[];self.closed=[]
-  self.rejections={};self.stages={};self.errors=[]
+  self.rejections={};self.stages={};self.errors=[];self.scan_scores=[]
   self.day=utc_now().date().isoformat()
   self.daily_count=0;self.override_count=0
   self.start_balance=Config.ACCOUNT_BALANCE
@@ -710,7 +713,21 @@ class Store:
   # basinda evvelki xetalarin tarixcesi itirdi (halbuki add_error() 50-ye
   # qeder saxlamaq ucun yazilmisdi -- meqsedle ziddiyyet idi). Indi yalniz
   # scan-spesifik statistika (rejections, stages) sifirlanir, xeta tarixcesi qalir.
-  with self.lock:self.rejections={};self.stages={}
+  with self.lock:self.rejections={};self.stages={};self.scan_scores=[]
+ def add_scan_score(self,symbol,score,tier):
+  # YENI: TARGET_RISK-i keçib score hesablanan HER namized (MIN_SCORE-dan
+  # asagi qalsa belə) burda qeyd olunur ki, hesabatda "en yaxin nece idi"
+  # gorunsun -- evvelki versiyada MIN_SCORE-dan asagi score-lar sadece
+  # itirilirdi, hec yerde gorunmurdu.
+  with self.lock:self.scan_scores.append((symbol,score,tier))
+ def scan_score_report(self):
+  with self.lock:s=list(self.scan_scores)
+  if not s:return "Bu skanda TARGET_RISK mərhələsinə çatan (score hesablanan) namizəd olmadı."
+  s.sort(key=lambda x:-x[1])
+  top=s[:5]
+  lines="\n".join(f"{i+1}. {sym}: {sc}/100 [{tr}]" for i,(sym,sc,tr) in enumerate(top))
+  avg=round(sum(x[1] for x in s)/len(s),1)
+  return f"Ən yüksək: {top[0][0]} — {top[0][1]}/100\nOrta: {avg} (n={len(s)})\n{lines}"
  def add_stage(self,name,ok):
   with self.lock:
    x=self.stages.setdefault(name,{"pass":0,"fail":0})
@@ -949,6 +966,7 @@ class Telegram:
     f"Bugün: {STORE.daily_count}/{Config.MAX_DAILY_SIGNALS} "
     f"(override: {STORE.override_count}/{Config.MAX_OVERRIDE_DAILY})\n\n"
     f"📋 ŞƏRTLƏR\n{STORE.stage_report(n)}\n\n"
+    f"📈 SCORE-LAR (bu skan)\n{STORE.scan_score_report()}\n\n"
     f"🔎 BOS DETALLI\n{STORE.bos_report()}\n\n"
     f"🚫 İLK UĞURSUZ ŞƏRT\n{r}{err_block}")
  @staticmethod
