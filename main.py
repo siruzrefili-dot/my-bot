@@ -8,7 +8,7 @@ from datetime import datetime,timezone
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from flask import Flask,jsonify
 
-BOT_VERSION="14.4 SCAN-SCORE-VISIBILITY"
+BOT_VERSION="14.5 STRICTER-FILTERS"
 
 class Config:
  BOT_TOKEN=os.getenv("BOT_TOKEN","");CHAT_ID=os.getenv("CHAT_ID","1121794078")
@@ -32,12 +32,12 @@ class Config:
  # hesabat/stat meqsedlidir.
  TIER_A_SCORE=72;TIER_B_SCORE=66;MIN_RR_ELITE=2.4
  MIN_ATR_PCT=0.20;MAX_ATR_PCT=10.0
- MIN_VOLUME_RATIO=1.00;VOLUME_WINDOW=5
+ MIN_VOLUME_RATIO=1.30;VOLUME_WINDOW=5  # SƏRTLƏŞDİRMƏ: 1.00 -> 1.30 (real həcm artımı tələb olunur)
  MIN_EMA_DISTANCE_PCT=0.09
  LONG_RSI_MIN=42.0;LONG_RSI_MAX=68.0
  SHORT_RSI_MIN=32.0;SHORT_RSI_MAX=58.0
  MIN_SL_ATR=0.80;MAX_SL_ATR=2.50;SL_BUFFER_ATR=0.15
- BOS_BUFFER_ATR=0.05;ALLOW_RECLAIM_BOS=True;BOS_LOOKBACK=100
+ BOS_BUFFER_ATR=0.15;ALLOW_RECLAIM_BOS=True;BOS_LOOKBACK=100  # SƏRTLƏŞDİRMƏ: 0.05 -> 0.15 (daha qəti qırılma)
  RETEST_MAX_BARS=15;RETEST_ATR_DISTANCE=0.90
  CONFIRMATION_MAX_BARS_AFTER_RETEST=5;MAX_CONFIRM_AGE=10
  MAX_ENTRY_EXTENSION_ATR=3.5
@@ -317,8 +317,10 @@ class Strategy:
  def setup(df,d):
   if len(df)<100:return False
   x=df.iloc[-1]
-  if d=="long":return bool(x.ema_fast>x.ema_slow or x.close>x.ema_slow)
-  return bool(x.ema_fast<x.ema_slow or x.close<x.ema_slow)
+  # SƏRTLƏŞDİRMƏ: evvelki "OR" (istənilən biri kifayət) "AND"-ə çevrildi —
+  # 1H trend təsdiqi indi hər iki şərti EYNİ VAXTDA tələb edir.
+  if d=="long":return bool(x.ema_fast>x.ema_slow and x.close>x.ema_slow)
+  return bool(x.ema_fast<x.ema_slow and x.close<x.ema_slow)
  @staticmethod
  def pullback(df,d):
   if len(df)<8:return False
