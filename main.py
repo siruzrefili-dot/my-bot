@@ -8,7 +8,7 @@ from datetime import datetime,timezone
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from flask import Flask,jsonify
 
-BOT_VERSION="14.5 STRICTER-FILTERS"
+BOT_VERSION="14.6 SCORE-VISIBILITY-FIX"
 
 class Config:
  BOT_TOKEN=os.getenv("BOT_TOKEN","");CHAT_ID=os.getenv("CHAT_ID","1121794078")
@@ -664,13 +664,19 @@ class Analyzer:
   ok=btc_eval.get("allowed",True)
   STORE.add_stage("BTC_FILTER",ok)
   if not ok:self.reject="BTC_FILTER";return None
+  # FIX: score-un RR-siz esas hissesi artiq TARGET_RISK-den ONCE hesablanir,
+  # cunki Scoring.calculate() elave RR bonusu ucun lazim olan "lv"-ye
+  # ehtiyac duymur. Evvelki versiyada TARGET_RISK ugursuz olan namized
+  # score bolmesinde HEC gorunmurdu (score hec hesablanmirdi), halbuki
+  # "TARGET_RISK: 0/1 keçdi" hesabatda onun DEYERLENDIRILDIYINI gosterirdi --
+  # bu ziddiyyet aradan qaldirildi.
+  base_score,rs=Scoring.calculate(reg["quality"],d15,d,seq,bos,btc_eval,seq["confirm"])
   lv=Risk.levels(d15,d1,d4,d);ok=bool(lv);STORE.add_stage("TARGET_RISK",ok)
-  if not ok:self.reject="TARGET_RISK";return None
-  score,rs=Scoring.calculate(reg["quality"],d15,d,seq,bos,btc_eval,seq["confirm"])
-  score=Scoring.add_rr_to_score(score,lv["rr"])
-  # YENI: score MIN_SCORE-dan asagi olsa da qeyd olunur -- hesabatda "en
-  # yaxin namized nece idi" gorunmesi ucun (asagida reject olsa bele buraxilmir)
-  STORE.add_scan_score(s,score,Scoring.tier(score,lv["rr"]))
+  if not ok:
+   STORE.add_scan_score(s,base_score,"–",rr_included=False)
+   self.reject="TARGET_RISK";return None
+  score=Scoring.add_rr_to_score(base_score,lv["rr"])
+  STORE.add_scan_score(s,score,Scoring.tier(score,lv["rr"]),rr_included=True)
   ok=score>=Config.MIN_SCORE;STORE.add_stage("SCORE",ok)
   if not ok:self.reject="SCORE";return None
   return {"id":str(uuid.uuid4()),  # FIX: her siqnala unikal id -- baglanma zamani simvol ile deyil, id ile uygunlasdirilir
@@ -716,20 +722,23 @@ class Store:
   # qeder saxlamaq ucun yazilmisdi -- meqsedle ziddiyyet idi). Indi yalniz
   # scan-spesifik statistika (rejections, stages) sifirlanir, xeta tarixcesi qalir.
   with self.lock:self.rejections={};self.stages={};self.scan_scores=[]
- def add_scan_score(self,symbol,score,tier):
-  # YENI: TARGET_RISK-i keçib score hesablanan HER namized (MIN_SCORE-dan
-  # asagi qalsa belə) burda qeyd olunur ki, hesabatda "en yaxin nece idi"
-  # gorunsun -- evvelki versiyada MIN_SCORE-dan asagi score-lar sadece
-  # itirilirdi, hec yerde gorunmurdu.
-  with self.lock:self.scan_scores.append((symbol,score,tier))
+ def add_scan_score(self,symbol,score,tier,rr_included=True):
+  # FIX: BTC_FILTER-i keçən HER namized burda qeyd olunur — TARGET_RISK
+  # uğursuz olsa belə (rr_included=False), çünki Scoring.calculate() RR-dan
+  # asılı deyil. MIN_SCORE-dan asagi qalanlar da qeyd olunur ki, hesabatda
+  # "en yaxin nece idi" hec vaxt itirilmesin.
+  with self.lock:self.scan_scores.append((symbol,score,tier,rr_included))
  def scan_score_report(self):
   with self.lock:s=list(self.scan_scores)
-  if not s:return "Bu skanda TARGET_RISK mərhələsinə çatan (score hesablanan) namizəd olmadı."
+  if not s:return "Bu skanda BTC_FILTER-i keçən (score hesablanan) namizəd olmadı."
   s.sort(key=lambda x:-x[1])
   top=s[:5]
-  lines="\n".join(f"{i+1}. {sym}: {sc}/100 [{tr}]" for i,(sym,sc,tr) in enumerate(top))
+  def fmt(sym,sc,tr,rr_ok):
+   tag=f"[{tr}]" if rr_ok else "[RR tapılmadı]"
+   return f"{sym}: {sc}/100 {tag}"
+  lines="\n".join(f"{i+1}. {fmt(*row)}" for i,row in enumerate(top))
   avg=round(sum(x[1] for x in s)/len(s),1)
-  return f"Ən yüksək: {top[0][0]} — {top[0][1]}/100\nOrta: {avg} (n={len(s)})\n{lines}"
+  return f"Ən yüksək: {fmt(*top[0])}\nOrta: {avg} (n={len(s)})\n{lines}"
  def add_stage(self,name,ok):
   with self.lock:
    x=self.stages.setdefault(name,{"pass":0,"fail":0})
