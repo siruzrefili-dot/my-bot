@@ -8,7 +8,7 @@ from datetime import datetime,timezone
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from flask import Flask,jsonify
 
-BOT_VERSION="14.6 SCORE-VISIBILITY-FIX"
+BOT_VERSION="14.8 SCORE-THRESHOLD-EASED"
 
 class Config:
  BOT_TOKEN=os.getenv("BOT_TOKEN","");CHAT_ID=os.getenv("CHAT_ID","1121794078")
@@ -23,7 +23,10 @@ class Config:
  MAX_ACTIVE_SIGNALS=2;MAX_DAILY_SIGNALS=3;MAX_SIGNALS_TO_SEND=1
  # GÜNCƏLLƏMƏ: ardıcıl artan eşik — 1-ci ≥85, 2-ci ≥90, 3-cü ≥92 (90-dan da
  # yuxarı). Gün ərzində növbəti hər siqnal əvvəlkindən güclü olmalıdır.
- FIRST_SIGNAL_SCORE=85;SECOND_SIGNAL_SCORE=90;THIRD_SIGNAL_SCORE=92
+ # GÜNCƏLLƏMƏ: giriş filtrləri (RSI/SL/retest/entry-chase) artıq sərtləşdiyi
+ # üçün göndərmə həddi bir az aşağı çəkildi (85/90/92 -> 80/85/88) ki, siqnal
+ # sayı tamam sıfıra enməsin.
+ FIRST_SIGNAL_SCORE=80;SECOND_SIGNAL_SCORE=85;THIRD_SIGNAL_SCORE=88
  SIGNAL_SCORE_THRESHOLDS=[FIRST_SIGNAL_SCORE,SECOND_SIGNAL_SCORE,THIRD_SIGNAL_SCORE]
  OVERRIDE_SCORE=95;MAX_OVERRIDE_DAILY=0  # 0 = override sondurulub
  # FIX: TIER_B_SCORE=999 tier B-ni statistik olaraq mumkunsuz edirdi (hec vaxt
@@ -34,13 +37,18 @@ class Config:
  MIN_ATR_PCT=0.20;MAX_ATR_PCT=10.0
  MIN_VOLUME_RATIO=1.30;VOLUME_WINDOW=5  # SƏRTLƏŞDİRMƏ: 1.00 -> 1.30 (real həcm artımı tələb olunur)
  MIN_EMA_DISTANCE_PCT=0.09
- LONG_RSI_MIN=42.0;LONG_RSI_MAX=68.0
- SHORT_RSI_MIN=32.0;SHORT_RSI_MAX=58.0
- MIN_SL_ATR=0.80;MAX_SL_ATR=2.50;SL_BUFFER_ATR=0.15
- BOS_BUFFER_ATR=0.15;ALLOW_RECLAIM_BOS=True;BOS_LOOKBACK=100  # SƏRTLƏŞDİRMƏ: 0.05 -> 0.15 (daha qəti qırılma)
- RETEST_MAX_BARS=15;RETEST_ATR_DISTANCE=0.90
- CONFIRMATION_MAX_BARS_AFTER_RETEST=5;MAX_CONFIRM_AGE=10
- MAX_ENTRY_EXTENSION_ATR=3.5
+ # SƏRTLƏŞDİRMƏ (round 2): 9 trade-dən 8 SL olduğu üçün vahid fərziyyə ilə
+ # 5 parametr birgə dəyişdi -- "girişlər gecikmiş/uzanmış, stop-lar isə
+ # normal bazar küyünə qarşı çox dar" fərziyyəsi. RSI bandları daralıb
+ # (artıq-uzanmış zonalara giriş yoxdur), SL bir az genişlənib (wick-lə
+ # vaxtından əvvəl çıxarılma azalsın).
+ LONG_RSI_MIN=42.0;LONG_RSI_MAX=62.0
+ SHORT_RSI_MIN=38.0;SHORT_RSI_MAX=58.0
+ MIN_SL_ATR=1.10;MAX_SL_ATR=2.50;SL_BUFFER_ATR=0.15
+ BOS_BUFFER_ATR=0.15;ALLOW_RECLAIM_BOS=True;BOS_LOOKBACK=100
+ RETEST_MAX_BARS=15;RETEST_ATR_DISTANCE=0.60
+ CONFIRMATION_MAX_BARS_AFTER_RETEST=5;MAX_CONFIRM_AGE=6
+ MAX_ENTRY_EXTENSION_ATR=2.0
  TARGET_LOOKBACK_15=80;TARGET_LOOKBACK_1H=80;TARGET_LOOKBACK_4H=80  # orijinal deyerler (150 cehdi geri qaytarildi)
  TARGET_BUFFER_ATR=0.10
  MAX_ABS_FUNDING=0.003;MIN_OI_CHANGE_PCT=-10.0;OI_LOOKBACK=5;MAX_SPREAD_PCT=0.20
