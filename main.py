@@ -14,13 +14,13 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, jsonify
 
-BOT_VERSION = "17.1 SMC-ULTRA-CLEAN"
+BOT_VERSION = "17.2 SMC-ULTRA-FIXED"
 
 class Config:
     BASE_URL = "https://bybit.com"
     CATEGORY = "linear"
     BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-    CHAT_ID = os.getenv("CHAT_ID", "1121794078")  # Teleqram ID qorundu
+    CHAT_ID = os.getenv("CHAT_ID", "1121794078")
     
     # Skan Parametrləri (Bütün Bybit coinləri üçün genişləndirilmiş struktur)
     SCAN_TOP_N = 300           
@@ -94,10 +94,10 @@ class Cache:
         with self.lock:
             x = self.data.get(k)
             if x is None: return None
-            if time.time() - x[1] > self.ttl:
+            if time.time() - x > self.ttl:
                 self.data.pop(k, None)
                 return None
-            return x[0]
+            return x
             
     def set(self, k, v):
         with self.lock:
@@ -120,13 +120,13 @@ class BybitClient:
     def session(self):
         if not hasattr(self.local, "session"):
             s = requests.Session()
-            s.headers.update({"User-Agent": "SMCAI/17.1"})
+            s.headers.update({"User-Agent": "SMCAI/17.2"})
             self.local.session = s
         return self.local.session
         
     def _rate(self):
         with self._lock:
-            w = 0.02 - (time.time() - self._last)  # Bütün coinlər üçün optimallaşdırılmış rate
+            w = 0.02 - (time.time() - self._last)  
             if w > 0: time.sleep(w)
             self._last = time.time()
             
@@ -169,8 +169,8 @@ class BybitClient:
         if not rows or len(rows) == 0: return None
         r = list(reversed(rows))[-1]
         return {
-            "ts": int(safe_float(r[0])), "open": safe_float(r[1]), "high": safe_float(r[2]), 
-            "low": safe_float(r[3]), "close": safe_float(r[4]), "volume": safe_float(r[5])
+            "ts": int(safe_float(r)), "open": safe_float(r), "high": safe_float(r), 
+            "low": safe_float(r), "close": safe_float(r), "volume": safe_float(r)
         }
         
     def ticker(self, symbol, fresh=False):
@@ -179,7 +179,7 @@ class BybitClient:
         z = self.get("/v5/market/tickers", {"category": "linear", "symbol": symbol}, k, c)
         a = z.get("result", {}).get("list", []) if z else []
         if not a or len(a) == 0: return {}
-        tick = a[0]
+        tick = a
         return {"symbol": tick.get("symbol", ""), "last_price": safe_float(tick.get("lastPrice")), "funding": safe_float(tick.get("fundingRate"), 0.), "turnover24h": safe_float(tick.get("turnover24h"))}
         
     def all_tickers(self):
@@ -191,7 +191,7 @@ class BybitClient:
         rows = z.get("result", {}).get("list", []) if z else []
         if len(rows) < 2: return 0.
         try:
-            current_oi = safe_float(rows[0].get("openInterest"))
+            current_oi = safe_float(rows.get("openInterest"))
             past_oi = safe_float(rows[-1].get("openInterest"))
             if past_oi > 0: return ((current_oi - past_oi) / past_oi) * 100
         except: pass
@@ -207,7 +207,7 @@ class BybitClient:
         x = self.get("/v5/market/instruments-info", {"category": "linear", "symbol": symbol}, f"i:{symbol}")
         a = x.get("result", {}).get("list", []) if x else []
         if not a or len(a) == 0: return {}
-        inst = a[0]; p = inst.get("priceFilter", {}); q = inst.get("lotSizeFilter", {})
+        inst = a; p = inst.get("priceFilter", {}); q = inst.get("lotSizeFilter", {})
         z = {"tick": safe_float(p.get("tickSize")), "step": safe_float(q.get("qtyStep")), "min": safe_float(q.get("minOrderQty")), "status": inst.get("status", ""), "symbol": inst.get("symbol", "")}
         self.icache.set(symbol, z); return z
 
@@ -226,8 +226,8 @@ class SMC:
     def analyze_structure(df, sh, sl):
         if not sh or not sl: return {"type": "None", "direction": "neutral", "level": 0., "index": 0}
         lc = df.iloc[-1]; po = df.iloc[-2]
-        latest_sh = sh[-1][1]  # List indeks və tip xətaları tamamilə aradan qaldırıldı
-        latest_sl = sl[-1][1]  
+        latest_sh = sh[-1]  
+        latest_sl = sl[-1]  
         if lc.close > latest_sh:
             t = "CHoCH" if po.close <= latest_sh else "BOS"
             return {"type": t, "direction": "long", "level": latest_sh, "index": len(df)-1}
@@ -428,15 +428,16 @@ def analyze_symbol(s):
     try: return Analyzer(s).run()
     except Exception as e:
         tb = traceback.format_exc(); STORE.add_error(s, str(e), short_tb(tb)); return None
- class Scanner:
-    def __init__(self): self.lock = threading.Lock(); self.running = False
+class Scanner:
+    def __init__(self): 
+        self.lock = threading.Lock()
+        self.running = False
     def scan(self, force=False):
         if not self.lock.acquire(False): return
         self.running = True
         try:
             if not STORE.can_add(): return
             tickers = BYBIT.all_tickers()
-            # 40 coin limiti qaldırıldı: Bütün USDT perp cütlükləri avtomatik skan olunur
             symbols = [x["symbol"] for x in tickers if x.get("symbol", "").endswith("USDT") and x.get("symbol", "")[:-4] not in Config.TRADFI][:Config.SCAN_TOP_N]
             if not symbols: symbols = Config.FALLBACK_COINS
             
@@ -506,7 +507,7 @@ class PositionManager:
                 for x in list(STORE.active): self.check(x)
             except Exception: pass
             STOP_EVENT.wait(Config.MONITOR_INTERVAL)
- class TelegramPoller:
+class TelegramPoller:
     def run(self):
         if not Config.BOT_TOKEN: return
         url = f"https://telegram.org{Config.BOT_TOKEN}/getUpdates"
@@ -542,4 +543,3 @@ def main():
 
 if __name__ == "__main__":
     main()
- 
