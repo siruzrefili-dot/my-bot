@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, jsonify
 
-BOT_VERSION = "17.2 SMC-ULTRA-FIXED"
+BOT_VERSION = "17.3 SMC-ULTRA-FINAL-FIXED"
 
 class Config:
     BASE_URL = "https://bybit.com"
@@ -22,34 +22,30 @@ class Config:
     BOT_TOKEN = os.getenv("BOT_TOKEN", "")
     CHAT_ID = os.getenv("CHAT_ID", "1121794078")
     
-    # Skan Parametrləri (Bütün Bybit coinləri üçün genişləndirilmiş struktur)
     SCAN_TOP_N = 300           
     CANDIDATE_LIMIT = 300
-    CHECK_INTERVAL = 300       # Hər 5 dəqiqədən bir tam skan dövrü
-    MONITOR_INTERVAL = 2       # Pozisiyaları hər 2 saniyədən bir yoxlayır
-    PARALLEL_WORKERS = 10      # Sürətli skan üçün paralel işçi sayı
+    CHECK_INTERVAL = 300       
+    MONITOR_INTERVAL = 2       
+    PARALLEL_WORKERS = 10      
     
-    # SMC Zaman İntervalları
-    TREND_TF = "240"           # 4H Struktur (HTF Trend)
-    LIQ_TF = "60"              # 1H Likvidlik (ITF Liquidity Sweep)
-    ENTRY_TF = "15"            # 15M Dəqiq Giriş (LTF CHoCH/BOS + OB + FVG)
+    TREND_TF = "240"           
+    LIQ_TF = "60"              
+    ENTRY_TF = "15"            
     
-    # SMC Risk və Strategiya Hədəfləri
     MIN_SCORE = 70
-    MIN_RR = 3.0               # Professional SMC üçün minimum R:R
+    MIN_RR = 3.0               
     MAX_RR = 6.5
-    ACCOUNT_BALANCE = 1132.54  # Cari uğurlu balans
-    RISK_PERCENT = 1.          # Hər trade-də maksimum 1% risk
+    ACCOUNT_BALANCE = 1132.54  
+    RISK_PERCENT = 1.          
     
-    MAX_ACTIVE_SIGNALS = 3     # Eyni anda maksimum 3 aktiv əməliyyat
+    MAX_ACTIVE_SIGNALS = 3     
     MAX_DAILY_SIGNALS = 5
     MAX_SIGNALS_TO_SEND = 2
     
-    # Fundamental və Bazar Gücü Filtrləri
     MIN_ATR_PCT = .20          
     MAX_ATR_PCT = 12.
     MAX_ABS_FUNDING = .0020    
-    MIN_OI_CHANGE_PCT = 6.0    # Open Interest həqiqi pul süzgəci
+    MIN_OI_CHANGE_PCT = 6.0    
     MAX_SPREAD_PCT = .10       
     MAX_HOLD_HOURS = 48
     
@@ -64,6 +60,9 @@ class Config:
     
     TAKER_FEE_PCT = .055
     SLIPPAGE_PCT = .02
+    
+    # Render xətasına səbəb olan çatışmayan dəyişən bərpa edildi:
+    FALLBACK_COINS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "AVAXUSDT", "SUIUSDT", "LINKUSDT"]
     TRADFI = {"XAU", "XAG", "SPX", "NDX"}
 
 os.makedirs(Config.DATA_DIR, exist_ok=True)
@@ -120,7 +119,7 @@ class BybitClient:
     def session(self):
         if not hasattr(self.local, "session"):
             s = requests.Session()
-            s.headers.update({"User-Agent": "SMCAI/17.2"})
+            s.headers.update({"User-Agent": "SMCAI/17.3"})
             self.local.session = s
         return self.local.session
         
@@ -543,3 +542,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+                                                                 
