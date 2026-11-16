@@ -21,6 +21,16 @@ logging.basicConfig(
 logger = logging.getLogger("BybitSMCBot")
 
 
+def safe_float(val, default: float = 0.0) -> float:
+    """Bybit boş string ('') və ya None qaytardıqda xətanın qarşısını alır."""
+    try:
+        if val is None or val == "":
+            return default
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
 class Config:
     BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "")
     BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
@@ -56,7 +66,7 @@ class BybitClient:
             for item in resp["result"]["list"]:
                 self.instruments[item["symbol"]] = {
                     "qtyStep": item["lotSizeFilter"]["qtyStep"],
-                    "minOrderQty": float(item["lotSizeFilter"]["minOrderQty"]),
+                    "minOrderQty": safe_float(item["lotSizeFilter"]["minOrderQty"]),
                     "tickSize": item["priceFilter"]["tickSize"],
                 }
         logger.info(f"{len(self.instruments)} fyuçers instrumenti yükləndi.")
@@ -72,9 +82,9 @@ class BybitClient:
         tickers = [
             t for t in resp["result"]["list"]
             if t["symbol"].endswith("USDT")
-            and float(t.get("turnover24h", 0)) >= Config.MIN_24H_VOLUME_USDT
+            and safe_float(t.get("turnover24h")) >= Config.MIN_24H_VOLUME_USDT
         ]
-        tickers.sort(key=lambda x: float(x["turnover24h"]), reverse=True)
+        tickers.sort(key=lambda x: safe_float(x.get("turnover24h")), reverse=True)
         return tickers[: Config.TOP_COINS_LIMIT]
 
     def get_klines(self, symbol: str, interval: str, limit: int = 100) -> pd.DataFrame:
@@ -96,7 +106,7 @@ class BybitClient:
         try:
             resp = self.session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
             if resp.get("retCode") == 0:
-                return float(resp["result"]["list"][0].get("totalEquity", 0))
+                return safe_float(resp["result"]["list"][0].get("totalEquity"))
         except Exception as e:
             logger.error(f"Balans xətası: {e}")
         return 0.0
@@ -105,7 +115,7 @@ class BybitClient:
         try:
             resp = self.session.get_positions(category="linear", settleCoin="USDT")
             if resp.get("retCode") == 0:
-                return [p for p in resp["result"]["list"] if float(p.get("size", 0)) > 0]
+                return [p for p in resp["result"]["list"] if safe_float(p.get("size")) > 0]
         except Exception as e:
             logger.error(f"Pozisiya oxuma xətası: {e}")
         return []
@@ -179,7 +189,7 @@ class TechnicalSMCAgent:
         return {"score": score, "signal": signal, "entry": entry, "sl": sl, "reasons": reasons}
 class DerivativesAgent:
     def analyze(self, ticker: dict, signal: str) -> dict:
-        funding = float(ticker.get("fundingRate", 0))
+        funding = safe_float(ticker.get("fundingRate"))
         if signal == "Buy":
             if funding > 0.0003:
                 return {"score": -100, "reasons": [f"VETO: Yüksək Funding ({funding:.4%})"]}
@@ -220,20 +230,27 @@ class RiskManagerAgent:
     def execute_trade(self, setup: dict) -> dict:
         symbol, side, entry, sl = setup["symbol"], setup["signal"], setup["entry"], setup["sl"]
         risk_unit = abs(entry - sl)
-        if risk_unit <= 0:
-            return {"status": "rejected", "reason": "SL məsafəsi 0"}
+        if risk_unit <= 0 or entry <= 0:
+            return {"status": "rejected", "reason": "SL və ya qiymət məsafəsi 0-dır"}
 
         tp = entry + (risk_unit * Config.MIN_RR_RATIO) if side == "Buy" else entry - (risk_unit * Config.MIN_RR_RATIO)
         balance = self.client.get_usdt_balance()
+        if balance <= 0:
+            return {"status": "rejected", "reason": "Balans 0-dır"}
+
         risk_usdt = balance * Config.RISK_PER_TRADE_PCT
         raw_qty = risk_usdt / risk_unit
+
+        # Marja Aşımı Qoruması (Max mövqe = Balans * Leverage * 90%)
+        max_qty = (balance * Config.LEVERAGE * 0.90) / entry
+        final_qty = min(raw_qty, max_qty)
 
         inst = self.client.instruments.get(symbol)
         if not inst:
             return {"status": "rejected", "reason": "Instrument tapılmadı"}
 
-        qty_str = self.client.format_step(raw_qty, inst["qtyStep"])
-        if float(qty_str) < inst["minOrderQty"]:
+        qty_str = self.client.format_step(final_qty, inst["qtyStep"])
+        if safe_float(qty_str) < inst["minOrderQty"]:
             return {"status": "rejected", "reason": "Miqdar minimumdan azdır"}
 
         sl_str = self.client.format_step(sl, inst["tickSize"])
@@ -270,6 +287,7 @@ class TradingOrchestrator:
         self.risk_agent = RiskManagerAgent(self.client)
 
         self.is_paused = False
+        self.scan_lock = asyncio.Lock()
         self.daily_start_balance = 0.0
         self.last_reset_day = datetime.now(timezone.utc).day
         self.tg_app: Application | None = None
@@ -284,88 +302,103 @@ class TradingOrchestrator:
                 logger.error(f"Telegram göndərmə xətası: {e}")
 
     async def run_scan_cycle(self) -> str:
-        today = datetime.now(timezone.utc).day
-        balance = await asyncio.to_thread(self.client.get_usdt_balance)
-        if self.daily_start_balance == 0 or today != self.last_reset_day:
-            self.daily_start_balance = balance
-            self.last_reset_day = today
+        if self.scan_lock.locked():
+            return "⏳ Hazırda başqa bir skan davam edir, bir az sonra yenidən yoxlayın."
 
-        if self.daily_start_balance > 0:
-            drawdown = (self.daily_start_balance - balance) / self.daily_start_balance
-            if drawdown >= Config.DAILY_MAX_LOSS_PCT:
-                self.is_paused = True
-                msg = f"🛑 <b>KILL-SWITCH AKTİV:</b> Gündəlik zərər {drawdown:.2%} həddinə çatdı. Bot dayandırıldı."
-                await self.send_telegram(msg)
-                return msg
+        async with self.scan_lock:
+            today = datetime.now(timezone.utc).day
+            balance = await asyncio.to_thread(self.client.get_usdt_balance)
+            if self.daily_start_balance == 0 or today != self.last_reset_day:
+                self.daily_start_balance = balance
+                self.last_reset_day = today
 
-        open_pos = await asyncio.to_thread(self.client.get_open_positions)
-        if len(open_pos) >= Config.MAX_OPEN_POSITIONS:
-            return f"Maksimum açıq mövqe limitinə ({Config.MAX_OPEN_POSITIONS}) çatılıb."
+            if self.daily_start_balance > 0:
+                drawdown = (self.daily_start_balance - balance) / self.daily_start_balance
+                if drawdown >= Config.DAILY_MAX_LOSS_PCT:
+                    self.is_paused = True
+                    msg = f"🛑 <b>KILL-SWITCH AKTİV:</b> Gündəlik zərər {drawdown:.2%} həddinə çatdı. Bot dayandırıldı."
+                    await self.send_telegram(msg)
+                    return msg
 
-        open_symbols = {p["symbol"] for p in open_pos}
+            open_pos = await asyncio.to_thread(self.client.get_open_positions)
+            if len(open_pos) >= Config.MAX_OPEN_POSITIONS:
+                return f"Maksimum açıq mövqe limitinə ({Config.MAX_OPEN_POSITIONS}) çatılıb."
 
-        btc_df = await asyncio.to_thread(self.client.get_klines, "BTCUSDT", Config.HTF_INTERVAL, 60)
-        btc_trend = "Neutral"
-        if len(btc_df) >= 50:
-            ema20 = btc_df["close"].ewm(span=20).mean().iloc[-1]
-            ema50 = btc_df["close"].ewm(span=50).mean().iloc[-1]
-            btc_trend = "Bullish" if ema20 > ema50 else "Bearish"
+            open_symbols = {p["symbol"] for p in open_pos}
 
-        tickers = await asyncio.to_thread(self.client.get_top_liquid_futures)
-        best_setup = None
+            btc_df = await asyncio.to_thread(self.client.get_klines, "BTCUSDT", Config.HTF_INTERVAL, 60)
+            btc_trend = "Neutral"
+            if len(btc_df) >= 50:
+                ema20 = btc_df["close"].ewm(span=20).mean().iloc[-1]
+                ema50 = btc_df["close"].ewm(span=50).mean().iloc[-1]
+                btc_trend = "Bullish" if ema20 > ema50 else "Bearish"
 
-        for t in tickers:
-            sym = t["symbol"]
-            if sym in open_symbols:
-                continue
+            tickers = await asyncio.to_thread(self.client.get_top_liquid_futures)
+            candidates = []
 
-            df_htf = await asyncio.to_thread(self.client.get_klines, sym, Config.HTF_INTERVAL, 80)
-            df_ltf = await asyncio.to_thread(self.client.get_klines, sym, Config.LTF_INTERVAL, 80)
-            await asyncio.sleep(0.15)
+            for t in tickers:
+                sym = t["symbol"]
+                if sym in open_symbols:
+                    continue
 
-            tech = self.tech_agent.analyze(df_htf, df_ltf)
-            if not tech["signal"] or tech["score"] < 35:
-                continue
+                df_htf = await asyncio.to_thread(self.client.get_klines, sym, Config.HTF_INTERVAL, 80)
+                df_ltf = await asyncio.to_thread(self.client.get_klines, sym, Config.LTF_INTERVAL, 80)
+                await asyncio.sleep(0.15)
 
-            deriv = self.deriv_agent.analyze(t, tech["signal"])
-            if deriv["score"] < 0:
-                continue
+                tech = self.tech_agent.analyze(df_htf, df_ltf)
+                if not tech["signal"]:
+                    continue
 
-            fund = await self.fund_agent.analyze(btc_trend, tech["signal"])
-            total_score = tech["score"] + deriv["score"] + fund["score"]
+                deriv = self.deriv_agent.analyze(t, tech["signal"])
+                fund = await self.fund_agent.analyze(btc_trend, tech["signal"])
+                total_score = tech["score"] + deriv["score"] + fund["score"]
 
-            if total_score >= Config.MIN_TOTAL_SCORE:
-                candidate = {
+                candidates.append({
                     "symbol": sym,
                     "signal": tech["signal"],
                     "entry": tech["entry"],
                     "sl": tech["sl"],
                     "score": total_score,
+                    "veto": deriv["score"] < 0,
                     "reasons": tech["reasons"] + deriv["reasons"] + fund["reasons"],
-                }
-                if not best_setup or candidate["score"] > best_setup["score"]:
-                    best_setup = candidate
+                })
 
-        if best_setup:
-            res = await asyncio.to_thread(self.risk_agent.execute_trade, best_setup)
-            if res["status"] == "executed":
-                msg = (
-                    f"🚀 <b>YENİ ƏMƏLİYYAT ({'DEMO' if Config.USE_DEMO else 'REAL'})</b>\n"
-                    f"Koin: <b>{best_setup['symbol']}</b> | İstiqamət: <b>{best_setup['signal']}</b>\n"
-                    f"Agent Balı: <b>{best_setup['score']}/100</b>\n"
-                    f"Miqdar: {res['qty']} | SL: {res['sl']} | TP: {res['tp']}\n"
-                    f"Səbəblər: {', '.join(best_setup['reasons'])}"
+            candidates.sort(key=lambda x: x["score"], reverse=True)
+            top3_lines = []
+            for i, c in enumerate(candidates[:3], 1):
+                status_tag = "⛔ VETO" if c["veto"] else f"{c['score']}/100"
+                top3_lines.append(
+                    f"{i}. <b>{c['symbol']}</b> ({c['signal']}) — <b>{status_tag}</b>\n   <i>{', '.join(c['reasons'])}</i>"
                 )
-                await self.send_telegram(msg)
-                return msg
-            return f"Namizəd ({best_setup['symbol']}) rədd edildi: {res['reason']}"
+            top3_text = "\n".join(top3_lines) if top3_lines else "BOS/Trend siqnalı verən koin tapılmadı."
 
-        return f"Skan tamamlandı ({len(tickers)} koin yoxlandı). Uyğun SMC fürsəti tapılmadı."
+            best_setup = next((c for c in candidates if not c["veto"] and c["score"] >= Config.MIN_TOTAL_SCORE), None)
+
+            if best_setup:
+                res = await asyncio.to_thread(self.risk_agent.execute_trade, best_setup)
+                if res["status"] == "executed":
+                    msg = (
+                        f"🚀 <b>YENİ ƏMƏLİYYAT ({'DEMO' if Config.USE_DEMO else 'REAL'})</b>\n"
+                        f"Koin: <b>{best_setup['symbol']}</b> | İstiqamət: <b>{best_setup['signal']}</b>\n"
+                        f"Agent Balı: <b>{best_setup['score']}/100</b>\n"
+                        f"Miqdar: {res['qty']} | SL: {res['sl']} | TP: {res['tp']}\n"
+                        f"Səbəblər: {', '.join(best_setup['reasons'])}\n\n"
+                        f"🏆 <b>Top 3 Namizəd:</b>\n{top3_text}"
+                    )
+                    await self.send_telegram(msg)
+                    return msg
+                return f"⚠️ Namizəd ({best_setup['symbol']}) rədd edildi: {res['reason']}\n\n🏆 <b>Top 3:</b>\n{top3_text}"
+
+            return (
+                f"🔍 <b>Skan tamamlandı</b> ({len(tickers)} koin | BTC: {btc_trend})\n"
+                f"75+ bal yığan fürsət tapılmadı.\n\n"
+                f"🏆 <b>Ən Yüksək Ballı Top 3:</b>\n{top3_text}"
+            )
 
     async def background_loop(self):
         await asyncio.to_thread(self.client.load_instruments)
         await self.send_telegram(
-            f"✅ <b>Bybit SMC Multi-Agent Bot işə düşdü!</b>\nRejim: {'DEMO' if Config.USE_DEMO else 'REAL'}"
+            f"✅ <b>Bybit SMC Multi-Agent Bot (v2) işə düşdü!</b>\nRejim: {'DEMO' if Config.USE_DEMO else 'REAL'}"
         )
         while True:
             if not self.is_paused:
@@ -384,9 +417,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     await update.message.reply_text(
-        "🤖 <b>Bybit SMC Multi-Agent Bot</b>\n"
+        "🤖 <b>Bybit SMC Multi-Agent Bot (v2)</b>\n"
         "/status - Balans və açıq mövqelər\n"
-        "/scan - İndi manuel skan başlat\n"
+        "/scan - İndi manuel skan başlat (Top 3 hesabatı ilə)\n"
         "/pause - Avtomatik skanı dayandır\n"
         "/resume - Avtomatik skanı davam etdir\n"
         "/close_all - Bütün açıq mövqeləri bağla",
@@ -410,7 +443,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
-    await update.message.reply_text("🔍 Skan başladıldı, zəhmət olmasa gözləyin...")
+    await update.message.reply_text("🔍 Skan başladıldı, Top 3 hesabat hazırlanır...")
     res = await orchestrator.run_scan_cycle()
     await update.message.reply_text(res, parse_mode="HTML")
 
@@ -433,7 +466,7 @@ async def cmd_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🚨 {count} açıq mövqe bazar qiyməti ilə bağlandı.")
 
 async def health_check(request):
-    return web.Response(text="Bybit SMC Bot is running 24/7")
+    return web.Response(text="Bybit SMC Bot v2 is running 24/7")
 
 async def main():
     web_app = web.Application()
