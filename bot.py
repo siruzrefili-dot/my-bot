@@ -129,6 +129,24 @@ class BybitClient:
             logger.error(f"Closed PnL xətası: {e}")
         return []
 
+    def set_breakeven_sl(self, symbol: str, new_sl: float) -> bool:
+        inst = self.instruments.get(symbol)
+        if not inst:
+            return False
+        sl_str = self.format_step(new_sl, inst["tickSize"])
+        try:
+            resp = self.session.set_trading_stop(
+                category="linear",
+                symbol=symbol,
+                stopLoss=sl_str,
+                slTriggerBy="MarkPrice",
+                positionIdx=0,
+            )
+            return resp.get("retCode") == 0
+        except Exception as e:
+            logger.error(f"Breakeven SL xətası ({symbol}): {e}")
+            return False
+
     def close_all_positions(self) -> int:
         positions = self.get_open_positions()
         closed = 0
@@ -159,27 +177,44 @@ class TechnicalSMCAgent:
 
         recent_high = df_ltf["high"].iloc[-20:-3].max()
         recent_low = df_ltf["low"].iloc[-20:-3].min()
+        prior_swing_low = df_ltf["low"].iloc[-25:-6].min()
+        prior_swing_high = df_ltf["high"].iloc[-25:-6].max()
         last_close = df_ltf["close"].iloc[-1]
 
         c1, c2, c3 = df_ltf.iloc[-3], df_ltf.iloc[-2], df_ltf.iloc[-1]
         bull_fvg = c3["low"] > c1["high"] and c2["close"] > c2["open"]
         bear_fvg = c3["high"] < c1["low"] and c2["close"] < c2["open"]
 
+        # Liquidity Sweep (son 5 şamda köhnə dib/zirvənin süpürülməsi)
+        bull_sweep = df_ltf["low"].iloc[-6:-1].min() < prior_swing_low and last_close > prior_swing_low
+        bear_sweep = df_ltf["high"].iloc[-6:-1].max() > prior_swing_high and last_close < prior_swing_high
+
+        # ATR və Şam boyu filtri (qiyməti qovmamaq üçün)
+        atr = (df_ltf["high"] - df_ltf["low"]).iloc[-15:-1].mean()
+        overextended = atr > 0 and abs(c3["close"] - c3["open"]) > (2.2 * atr)
+
         avg_vol = df_ltf["volume"].iloc[-21:-1].mean()
         rvol = c2["volume"] / avg_vol if avg_vol > 0 else 0
 
-        score, signal, entry, sl = 0, None, last_close, 0.0
+        score, signal, entry, sl, order_type = 0, None, last_close, 0.0, "Market"
         reasons = []
 
         if htf_bull and last_close > recent_high:
             signal = "Buy"
             score += 20
             reasons.append("4H Bullish + 15M BOS")
+            if bull_sweep:
+                score += 15
+                reasons.append("Liquidity Sweep")
             if bull_fvg:
                 score += 15
                 reasons.append("Bullish FVG")
+                if overextended:
+                    entry = (c1["high"] + c3["low"]) / 2
+                    order_type = "Limit"
+                    reasons.append("FVG 50% Limit")
             if rvol >= 1.8:
-                score += 15
+                score += 10
                 reasons.append(f"RVOL {rvol:.1f}x")
             sl = min(c1["low"], recent_low) * 0.998
 
@@ -187,15 +222,29 @@ class TechnicalSMCAgent:
             signal = "Sell"
             score += 20
             reasons.append("4H Bearish + 15M BOS")
+            if bear_sweep:
+                score += 15
+                reasons.append("Liquidity Sweep")
             if bear_fvg:
                 score += 15
                 reasons.append("Bearish FVG")
+                if overextended:
+                    entry = (c1["low"] + c3["high"]) / 2
+                    order_type = "Limit"
+                    reasons.append("FVG 50% Limit")
             if rvol >= 1.8:
-                score += 15
+                score += 10
                 reasons.append(f"RVOL {rvol:.1f}x")
             sl = max(c1["high"], recent_high) * 1.002
 
-        return {"score": score, "signal": signal, "entry": entry, "sl": sl, "reasons": reasons}
+        return {
+            "score": min(score, 55),
+            "signal": signal,
+            "entry": entry,
+            "sl": sl,
+            "order_type": order_type,
+            "reasons": reasons,
+        }
 class DerivativesAgent:
     def analyze(self, ticker: dict, signal: str) -> dict:
         funding = safe_float(ticker.get("fundingRate"))
@@ -236,7 +285,12 @@ class RiskManagerAgent:
         self.client = client
 
     def execute_trade(self, setup: dict) -> dict:
-        symbol, side, entry, sl = setup["symbol"], setup["signal"], setup["entry"], setup["sl"]
+        symbol = setup["symbol"]
+        side = setup["signal"]
+        entry = setup["entry"]
+        sl = setup["sl"]
+        order_type = setup.get("order_type", "Market")
+
         risk_unit = abs(entry - sl)
         if risk_unit <= 0 or entry <= 0:
             return {"status": "rejected", "reason": "SL və ya qiymət məsafəsi 0-dır"}
@@ -259,6 +313,7 @@ class RiskManagerAgent:
         if safe_float(qty_str) < inst["minOrderQty"]:
             return {"status": "rejected", "reason": "Miqdar minimumdan azdır"}
 
+        entry_str = self.client.format_step(entry, inst["tickSize"])
         sl_str = self.client.format_step(sl, inst["tickSize"])
         tp_str = self.client.format_step(tp, inst["tickSize"])
 
@@ -272,21 +327,34 @@ class RiskManagerAgent:
         except Exception:
             pass
 
+        params = {
+            "category": "linear",
+            "symbol": symbol,
+            "side": side,
+            "orderType": order_type,
+            "qty": qty_str,
+            "stopLoss": sl_str,
+            "takeProfit": tp_str,
+            "slTriggerBy": "MarkPrice",
+            "tpTriggerBy": "LastPrice",
+        }
+        if order_type == "Limit":
+            params["price"] = entry_str
+            params["timeInForce"] = "GTC"
+
         try:
-            order = self.client.session.place_order(
-                category="linear",
-                symbol=symbol,
-                side=side,
-                orderType="Market",
-                qty=qty_str,
-                stopLoss=sl_str,
-                takeProfit=tp_str,
-                slTriggerBy="MarkPrice",
-                tpTriggerBy="LastPrice",
-            )
+            order = self.client.session.place_order(**params)
             if order.get("retCode") != 0:
                 return {"status": "rejected", "reason": f"Bybit rədd etdi: {order.get('retMsg')}"}
-            return {"status": "executed", "order": order, "qty": qty_str, "sl": sl_str, "tp": tp_str}
+            return {
+                "status": "executed",
+                "order": order,
+                "order_type": order_type,
+                "entry": entry_str,
+                "qty": qty_str,
+                "sl": sl_str,
+                "tp": tp_str,
+            }
         except Exception as e:
             logger.error(f"Order xətası ({symbol}): {e}")
             return {"status": "rejected", "reason": f"Bybit API xətası: {e}"}
@@ -300,7 +368,7 @@ class TradingOrchestrator:
 
         self.is_paused = False
         self.scan_lock = asyncio.Lock()
-        self.tracked_positions: dict[str, str] = {}
+        self.tracked_positions: dict[str, dict] = {}
         self.daily_start_balance = 0.0
         self.last_reset_day = datetime.now(timezone.utc).day
         self.tg_app: Application | None = None
@@ -315,20 +383,28 @@ class TradingOrchestrator:
                 logger.error(f"Telegram göndərmə xətası: {e}")
 
     async def position_monitor_loop(self):
-        """Hər 60 saniyədən bir bağlanan mövqeləri (TP/SL) yoxlayır."""
+        """Hər 60 saniyədən bir +1R Breakeven və bağlanan TP/SL mövqelərini yoxlayır."""
         init_pos = await asyncio.to_thread(self.client.get_open_positions)
-        self.tracked_positions = {p["symbol"]: p["side"] for p in init_pos}
+        for p in init_pos:
+            self.tracked_positions[p["symbol"]] = {
+                "side": p["side"],
+                "entry": safe_float(p.get("avgPrice")),
+                "sl": safe_float(p.get("stopLoss")),
+                "be_done": False,
+            }
 
         while True:
             await asyncio.sleep(Config.MONITOR_INTERVAL_SECONDS)
             try:
                 current_pos = await asyncio.to_thread(self.client.get_open_positions)
-                current_map = {p["symbol"]: p["side"] for p in current_pos}
+                current_symbols = {p["symbol"] for p in current_pos}
 
-                closed_symbols = set(self.tracked_positions.keys()) - set(current_map.keys())
+                # 1. Bağlanan mövqelər (TP / SL bildirişi)
+                closed_symbols = set(self.tracked_positions.keys()) - current_symbols
                 if closed_symbols:
                     history = await asyncio.to_thread(self.client.get_closed_pnl, 10)
                     for sym in closed_symbols:
+                        self.tracked_positions.pop(sym, None)
                         match = next((h for h in history if h["symbol"] == sym), None)
                         if match:
                             pnl = safe_float(match.get("closedPnl"))
@@ -341,7 +417,43 @@ class TradingOrchestrator:
                             )
                             await self.send_telegram(msg)
 
-                self.tracked_positions = current_map
+                # 2. Açıq mövqelərdə +1R Breakeven yoxlaması
+                for p in current_pos:
+                    sym = p["symbol"]
+                    side = p["side"]
+                    entry = safe_float(p.get("avgPrice"))
+                    sl = safe_float(p.get("stopLoss"))
+                    mark = safe_float(p.get("markPrice"))
+
+                    if sym not in self.tracked_positions:
+                        self.tracked_positions[sym] = {
+                            "side": side, "entry": entry, "sl": sl, "be_done": False
+                        }
+
+                    info = self.tracked_positions[sym]
+                    if info["be_done"] or entry <= 0 or sl <= 0 or mark <= 0:
+                        continue
+
+                    if side == "Buy" and sl < entry:
+                        r_dist = entry - sl
+                        if mark >= entry + r_dist:
+                            be_price = entry * 1.001
+                            if await asyncio.to_thread(self.client.set_breakeven_sl, sym, be_price):
+                                info["be_done"] = True
+                                await self.send_telegram(
+                                    f"🛡️ <b>BREAKEVEN AKTİV ({sym})</b>\n"
+                                    f"Qiymət +1R qazanca çatdı. Stop-Loss girişə çəkildi."
+                                )
+                    elif side == "Sell" and sl > entry:
+                        r_dist = sl - entry
+                        if mark <= entry - r_dist:
+                            be_price = entry * 0.999
+                            if await asyncio.to_thread(self.client.set_breakeven_sl, sym, be_price):
+                                info["be_done"] = True
+                                await self.send_telegram(
+                                    f"🛡️ <b>BREAKEVEN AKTİV ({sym})</b>\n"
+                                    f"Qiymət +1R qazanca çatdı. Stop-Loss girişə çəkildi."
+                                )
             except Exception as e:
                 logger.error(f"Monitor xətası: {e}")
 
@@ -396,13 +508,14 @@ class TradingOrchestrator:
 
                 deriv = self.deriv_agent.analyze(t, tech["signal"])
                 fund = self.fund_agent.analyze(btc_trend, tech["signal"], fng)
-                total_score = tech["score"] + deriv["score"] + fund["score"]
+                total_score = min(tech["score"] + deriv["score"] + fund["score"], 100)
 
                 candidates.append({
                     "symbol": sym,
                     "signal": tech["signal"],
                     "entry": tech["entry"],
                     "sl": tech["sl"],
+                    "order_type": tech["order_type"],
                     "score": total_score,
                     "veto": deriv["score"] < 0,
                     "reasons": tech["reasons"] + deriv["reasons"] + fund["reasons"],
@@ -422,12 +535,12 @@ class TradingOrchestrator:
             if best_setup:
                 res = await asyncio.to_thread(self.risk_agent.execute_trade, best_setup)
                 if res["status"] == "executed":
-                    self.tracked_positions[best_setup["symbol"]] = best_setup["signal"]
                     msg = (
                         f"🚀 <b>YENİ ƏMƏLİYYAT ({'DEMO' if Config.USE_DEMO else 'REAL'})</b>\n"
-                        f"Koin: <b>{best_setup['symbol']}</b> | İstiqamət: <b>{best_setup['signal']}</b>\n"
+                        f"Koin: <b>{best_setup['symbol']}</b> | {best_setup['signal']} ({res['order_type']})\n"
                         f"Agent Balı: <b>{best_setup['score']}/100</b>\n"
-                        f"Miqdar: {res['qty']} | SL: {res['sl']} | TP: {res['tp']}\n"
+                        f"Giriş: {res['entry']} | Miqdar: {res['qty']}\n"
+                        f"SL: {res['sl']} | TP: {res['tp']}\n"
                         f"Səbəblər: {', '.join(best_setup['reasons'])}\n\n"
                         f"🏆 <b>Top 3 Namizəd:</b>\n{top3_text}"
                     )
@@ -447,8 +560,8 @@ class TradingOrchestrator:
         await asyncio.to_thread(self.client.load_instruments)
         asyncio.create_task(self.position_monitor_loop())
         await self.send_telegram(
-            f"✅ <b>Bybit SMC Multi-Agent Bot (v3) işə düşdü!</b>\n"
-            f"Rejim: {'DEMO' if Config.USE_DEMO else 'REAL'} | TP/SL Monitoru: Aktiv"
+            f"✅ <b>Bybit SMC Multi-Agent Bot (v4) işə düşdü!</b>\n"
+            f"Rejim: {'DEMO' if Config.USE_DEMO else 'REAL'} | Breakeven + TP/SL Monitoru: Aktiv"
         )
         while True:
             if not self.is_paused:
@@ -467,7 +580,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     await update.message.reply_text(
-        "🤖 <b>Bybit SMC Multi-Agent Bot (v3)</b>\n"
+        "🤖 <b>Bybit SMC Multi-Agent Bot (v4)</b>\n"
         "/status - Balans və açıq mövqelər\n"
         "/scan - İndi manuel skan başlat (Top 3 hesabatı)\n"
         "/history - Son 5 bağlanan əməliyyat (TP/SL)\n"
@@ -531,7 +644,7 @@ async def cmd_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🚨 {count} açıq mövqe bazar qiyməti ilə bağlandı.")
 
 async def health_check(request):
-    return web.Response(text="Bybit SMC Bot v3 is running 24/7")
+    return web.Response(text="Bybit SMC Bot v4 is running 24/7")
 
 async def main():
     web_app = web.Application()
