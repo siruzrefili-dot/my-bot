@@ -1,4 +1,5 @@
 import os
+import time
 import asyncio
 import logging
 from decimal import Decimal, ROUND_DOWN
@@ -42,6 +43,7 @@ class Config:
     TOP_COINS_LIMIT = 40
     SCAN_INTERVAL_SECONDS = 900
     MONITOR_INTERVAL_SECONDS = 60
+    LIMIT_ORDER_EXPIRY_SECONDS = 3600
     HTF_INTERVAL = "240"
     LTF_INTERVAL = "15"
 
@@ -120,6 +122,25 @@ class BybitClient:
             logger.error(f"Pozisiya oxuma xətası: {e}")
         return []
 
+    def get_open_orders(self) -> list[dict]:
+        try:
+            resp = self.session.get_open_orders(category="linear", settleCoin="USDT")
+            if resp.get("retCode") == 0:
+                return resp["result"]["list"]
+        except Exception as e:
+            logger.error(f"Açıq əmr oxuma xətası: {e}")
+        return []
+
+    def cancel_order(self, symbol: str, order_id: str) -> bool:
+        try:
+            resp = self.session.cancel_order(
+                category="linear", symbol=symbol, orderId=order_id
+            )
+            return resp.get("retCode") == 0
+        except Exception as e:
+            logger.error(f"Əmr ləğv xətası ({symbol}): {e}")
+            return False
+
     def get_closed_pnl(self, limit: int = 5) -> list[dict]:
         try:
             resp = self.session.get_closed_pnl(category="linear", limit=limit)
@@ -129,7 +150,7 @@ class BybitClient:
             logger.error(f"Closed PnL xətası: {e}")
         return []
 
-    def set_breakeven_sl(self, symbol: str, new_sl: float) -> bool:
+    def set_breakeven_sl(self, symbol: str, new_sl: float, position_idx: int = 0) -> bool:
         inst = self.instruments.get(symbol)
         if not inst:
             return False
@@ -140,16 +161,22 @@ class BybitClient:
                 symbol=symbol,
                 stopLoss=sl_str,
                 slTriggerBy="MarkPrice",
-                positionIdx=0,
+                positionIdx=int(position_idx),
             )
             return resp.get("retCode") == 0
         except Exception as e:
             logger.error(f"Breakeven SL xətası ({symbol}): {e}")
             return False
 
-    def close_all_positions(self) -> int:
+    def close_all_positions_and_orders(self) -> tuple[int, int]:
         positions = self.get_open_positions()
-        closed = 0
+        orders = self.get_open_orders()
+        closed_pos, canceled_ord = 0, 0
+
+        for o in orders:
+            if self.cancel_order(o["symbol"], o["orderId"]):
+                canceled_ord += 1
+
         for p in positions:
             side = "Sell" if p["side"] == "Buy" else "Buy"
             try:
@@ -161,10 +188,10 @@ class BybitClient:
                     qty=p["size"],
                     reduceOnly=True,
                 )
-                closed += 1
+                closed_pos += 1
             except Exception as e:
                 logger.error(f"{p['symbol']} bağlanma xətası: {e}")
-        return closed
+        return closed_pos, canceled_ord
 class TechnicalSMCAgent:
     def analyze(self, df_htf: pd.DataFrame, df_ltf: pd.DataFrame) -> dict:
         if len(df_htf) < 60 or len(df_ltf) < 60:
@@ -185,11 +212,9 @@ class TechnicalSMCAgent:
         bull_fvg = c3["low"] > c1["high"] and c2["close"] > c2["open"]
         bear_fvg = c3["high"] < c1["low"] and c2["close"] < c2["open"]
 
-        # Liquidity Sweep (son 5 şamda köhnə dib/zirvənin süpürülməsi)
         bull_sweep = df_ltf["low"].iloc[-6:-1].min() < prior_swing_low and last_close > prior_swing_low
         bear_sweep = df_ltf["high"].iloc[-6:-1].max() > prior_swing_high and last_close < prior_swing_high
 
-        # ATR və Şam boyu filtri (qiyməti qovmamaq üçün)
         atr = (df_ltf["high"] - df_ltf["low"]).iloc[-15:-1].mean()
         overextended = atr > 0 and abs(c3["close"] - c3["open"]) > (2.2 * atr)
 
@@ -203,39 +228,41 @@ class TechnicalSMCAgent:
             signal = "Buy"
             score += 20
             reasons.append("4H Bullish + 15M BOS")
+            sl = min(c1["low"], recent_low) * 0.998
             if bull_sweep:
                 score += 15
                 reasons.append("Liquidity Sweep")
             if bull_fvg:
                 score += 15
                 reasons.append("Bullish FVG")
-                if overextended:
-                    entry = (c1["high"] + c3["low"]) / 2
+                fvg_mid = (c1["high"] + c3["low"]) / 2
+                if overextended and sl < fvg_mid < last_close:
+                    entry = fvg_mid
                     order_type = "Limit"
                     reasons.append("FVG 50% Limit")
             if rvol >= 1.8:
                 score += 10
                 reasons.append(f"RVOL {rvol:.1f}x")
-            sl = min(c1["low"], recent_low) * 0.998
 
         elif htf_bear and last_close < recent_low:
             signal = "Sell"
             score += 20
             reasons.append("4H Bearish + 15M BOS")
+            sl = max(c1["high"], recent_high) * 1.002
             if bear_sweep:
                 score += 15
                 reasons.append("Liquidity Sweep")
             if bear_fvg:
                 score += 15
                 reasons.append("Bearish FVG")
-                if overextended:
-                    entry = (c1["low"] + c3["high"]) / 2
+                fvg_mid = (c1["low"] + c3["high"]) / 2
+                if overextended and last_close < fvg_mid < sl:
+                    entry = fvg_mid
                     order_type = "Limit"
                     reasons.append("FVG 50% Limit")
             if rvol >= 1.8:
                 score += 10
                 reasons.append(f"RVOL {rvol:.1f}x")
-            sl = max(c1["high"], recent_high) * 1.002
 
         return {
             "score": min(score, 55),
@@ -383,7 +410,7 @@ class TradingOrchestrator:
                 logger.error(f"Telegram göndərmə xətası: {e}")
 
     async def position_monitor_loop(self):
-        """Hər 60 saniyədən bir +1R Breakeven və bağlanan TP/SL mövqelərini yoxlayır."""
+        """Hər 60 saniyədən bir: TP/SL bildirişi, +1R Breakeven və 1 saatlıq Limit ləğvi."""
         init_pos = await asyncio.to_thread(self.client.get_open_positions)
         for p in init_pos:
             self.tracked_positions[p["symbol"]] = {
@@ -396,10 +423,22 @@ class TradingOrchestrator:
         while True:
             await asyncio.sleep(Config.MONITOR_INTERVAL_SECONDS)
             try:
+                # 1. Köhnəlmiş Limit əmrlərinin (1 saat+) ləğvi
+                open_orders = await asyncio.to_thread(self.client.get_open_orders)
+                now_ms = time.time() * 1000
+                for o in open_orders:
+                    created_ms = safe_float(o.get("createdTime"))
+                    if created_ms > 0 and (now_ms - created_ms) >= (Config.LIMIT_ORDER_EXPIRY_SECONDS * 1000):
+                        if await asyncio.to_thread(self.client.cancel_order, o["symbol"], o["orderId"]):
+                            await self.send_telegram(
+                                f"⏳ <b>LİMİT ƏMRİ LƏĞV EDİLDİ ({o['symbol']})</b>\n"
+                                f"1 saat ərzində FVG zonasına qayıtmadığı üçün əmr avtomatik silindi."
+                            )
+
+                # 2. Bağlanan mövqelər (TP / SL bildirişi)
                 current_pos = await asyncio.to_thread(self.client.get_open_positions)
                 current_symbols = {p["symbol"] for p in current_pos}
 
-                # 1. Bağlanan mövqelər (TP / SL bildirişi)
                 closed_symbols = set(self.tracked_positions.keys()) - current_symbols
                 if closed_symbols:
                     history = await asyncio.to_thread(self.client.get_closed_pnl, 10)
@@ -417,13 +456,14 @@ class TradingOrchestrator:
                             )
                             await self.send_telegram(msg)
 
-                # 2. Açıq mövqelərdə +1R Breakeven yoxlaması
+                # 3. Açıq mövqelərdə +1R Breakeven (One-Way & Hedge uyğun)
                 for p in current_pos:
                     sym = p["symbol"]
                     side = p["side"]
                     entry = safe_float(p.get("avgPrice"))
                     sl = safe_float(p.get("stopLoss"))
                     mark = safe_float(p.get("markPrice"))
+                    pos_idx = int(p.get("positionIdx", 0))
 
                     if sym not in self.tracked_positions:
                         self.tracked_positions[sym] = {
@@ -438,7 +478,7 @@ class TradingOrchestrator:
                         r_dist = entry - sl
                         if mark >= entry + r_dist:
                             be_price = entry * 1.001
-                            if await asyncio.to_thread(self.client.set_breakeven_sl, sym, be_price):
+                            if await asyncio.to_thread(self.client.set_breakeven_sl, sym, be_price, pos_idx):
                                 info["be_done"] = True
                                 await self.send_telegram(
                                     f"🛡️ <b>BREAKEVEN AKTİV ({sym})</b>\n"
@@ -448,7 +488,7 @@ class TradingOrchestrator:
                         r_dist = sl - entry
                         if mark <= entry - r_dist:
                             be_price = entry * 0.999
-                            if await asyncio.to_thread(self.client.set_breakeven_sl, sym, be_price):
+                            if await asyncio.to_thread(self.client.set_breakeven_sl, sym, be_price, pos_idx):
                                 info["be_done"] = True
                                 await self.send_telegram(
                                     f"🛡️ <b>BREAKEVEN AKTİV ({sym})</b>\n"
@@ -477,10 +517,12 @@ class TradingOrchestrator:
                     return msg
 
             open_pos = await asyncio.to_thread(self.client.get_open_positions)
-            if len(open_pos) >= Config.MAX_OPEN_POSITIONS:
-                return f"Maksimum açıq mövqe limitinə ({Config.MAX_OPEN_POSITIONS}) çatılıb."
+            open_orders = await asyncio.to_thread(self.client.get_open_orders)
+            total_active = len(open_pos) + len(open_orders)
+            if total_active >= Config.MAX_OPEN_POSITIONS:
+                return f"Maksimum aktiv əməliyyat limitinə ({total_active}/{Config.MAX_OPEN_POSITIONS}) çatılıb."
 
-            open_symbols = {p["symbol"] for p in open_pos}
+            active_symbols = {p["symbol"] for p in open_pos} | {o["symbol"] for o in open_orders}
 
             btc_df = await asyncio.to_thread(self.client.get_klines, "BTCUSDT", Config.HTF_INTERVAL, 60)
             btc_trend = "Neutral"
@@ -495,7 +537,7 @@ class TradingOrchestrator:
 
             for t in tickers:
                 sym = t["symbol"]
-                if sym in open_symbols:
+                if sym in active_symbols:
                     continue
 
                 df_htf = await asyncio.to_thread(self.client.get_klines, sym, Config.HTF_INTERVAL, 80)
@@ -560,8 +602,8 @@ class TradingOrchestrator:
         await asyncio.to_thread(self.client.load_instruments)
         asyncio.create_task(self.position_monitor_loop())
         await self.send_telegram(
-            f"✅ <b>Bybit SMC Multi-Agent Bot (v4) işə düşdü!</b>\n"
-            f"Rejim: {'DEMO' if Config.USE_DEMO else 'REAL'} | Breakeven + TP/SL Monitoru: Aktiv"
+            f"✅ <b>Bybit SMC Multi-Agent Bot (v4 Final) işə düşdü!</b>\n"
+            f"Rejim: {'DEMO' if Config.USE_DEMO else 'REAL'} | Breakeven + Limit + TP/SL: Aktiv"
         )
         while True:
             if not self.is_paused:
@@ -580,13 +622,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     await update.message.reply_text(
-        "🤖 <b>Bybit SMC Multi-Agent Bot (v4)</b>\n"
-        "/status - Balans və açıq mövqelər\n"
+        "🤖 <b>Bybit SMC Multi-Agent Bot (v4 Final)</b>\n"
+        "/status - Balans, açıq mövqelər və Limit əmrləri\n"
         "/scan - İndi manuel skan başlat (Top 3 hesabatı)\n"
         "/history - Son 5 bağlanan əməliyyat (TP/SL)\n"
         "/pause - Avtomatik skanı dayandır\n"
         "/resume - Avtomatik skanı davam etdir\n"
-        "/close_all - Bütün açıq mövqeləri bağla",
+        "/close_all - Bütün mövqeləri bağla və Limit əmrlərini ləğv et",
         parse_mode="HTML",
     )
 
@@ -595,12 +637,17 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     bal = await asyncio.to_thread(orchestrator.client.get_usdt_balance)
     pos = await asyncio.to_thread(orchestrator.client.get_open_positions)
+    orders = await asyncio.to_thread(orchestrator.client.get_open_orders)
     state = "⏸ Dayandırılıb" if orchestrator.is_paused else "🟢 Aktiv (7/24)"
+
     pos_text = "\n".join([f"- {p['symbol']} ({p['side']}): PnL {p.get('unrealisedPnl', '0')} USDT" for p in pos]) or "Yoxdur"
+    ord_text = "\n".join([f"- {o['symbol']} ({o['side']} Limit @ {o.get('price')})" for o in orders]) or "Yoxdur"
+
     await update.message.reply_text(
         f"📊 <b>Status:</b> {state}\n"
         f"💰 <b>Balans:</b> {bal:.2f} USDT\n"
-        f"📂 <b>Açıq Mövqelər ({len(pos)}):</b>\n{pos_text}",
+        f"📂 <b>Açıq Mövqelər ({len(pos)}):</b>\n{pos_text}\n"
+        f"⏳ <b>Gözləyən Limit Əmrləri ({len(orders)}):</b>\n{ord_text}",
         parse_mode="HTML",
     )
 
@@ -640,11 +687,13 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
-    count = await asyncio.to_thread(orchestrator.client.close_all_positions)
-    await update.message.reply_text(f"🚨 {count} açıq mövqe bazar qiyməti ilə bağlandı.")
+    c_pos, c_ord = await asyncio.to_thread(orchestrator.client.close_all_positions_and_orders)
+    await update.message.reply_text(
+        f"🚨 {c_pos} açıq mövqe bağlandı, {c_ord} gözləyən Limit əmri ləğv edildi."
+    )
 
 async def health_check(request):
-    return web.Response(text="Bybit SMC Bot v4 is running 24/7")
+    return web.Response(text="Bybit SMC Bot v4 Final is running 24/7")
 
 async def main():
     web_app = web.Application()
