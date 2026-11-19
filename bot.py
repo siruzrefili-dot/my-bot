@@ -22,7 +22,6 @@ logger = logging.getLogger("BybitSMCBot")
 
 
 def safe_float(val, default: float = 0.0) -> float:
-    """Bybit boş string ('') və ya None qaytardıqda xətanın qarşısını alır."""
     try:
         if val is None or val == "":
             return default
@@ -42,6 +41,7 @@ class Config:
     MIN_24H_VOLUME_USDT = 30_000_000
     TOP_COINS_LIMIT = 40
     SCAN_INTERVAL_SECONDS = 900
+    MONITOR_INTERVAL_SECONDS = 60
     HTF_INTERVAL = "240"
     LTF_INTERVAL = "15"
 
@@ -118,6 +118,15 @@ class BybitClient:
                 return [p for p in resp["result"]["list"] if safe_float(p.get("size")) > 0]
         except Exception as e:
             logger.error(f"Pozisiya oxuma xətası: {e}")
+        return []
+
+    def get_closed_pnl(self, limit: int = 5) -> list[dict]:
+        try:
+            resp = self.session.get_closed_pnl(category="linear", limit=limit)
+            if resp.get("retCode") == 0:
+                return resp["result"]["list"]
+        except Exception as e:
+            logger.error(f"Closed PnL xətası: {e}")
         return []
 
     def close_all_positions(self) -> int:
@@ -211,8 +220,7 @@ class FundamentalAgent:
         except Exception:
             return 50
 
-    async def analyze(self, btc_trend: str, signal: str) -> dict:
-        fng = await self.get_fng()
+    def analyze(self, btc_trend: str, signal: str, fng: int) -> dict:
         score = 0
         reasons = [f"F&G: {fng}"]
         if (btc_trend == "Bullish" and signal == "Buy") or (btc_trend == "Bearish" and signal == "Sell"):
@@ -240,8 +248,6 @@ class RiskManagerAgent:
 
         risk_usdt = balance * Config.RISK_PER_TRADE_PCT
         raw_qty = risk_usdt / risk_unit
-
-        # Marja Aşımı Qoruması (Max mövqe = Balans * Leverage * 90%)
         max_qty = (balance * Config.LEVERAGE * 0.90) / entry
         final_qty = min(raw_qty, max_qty)
 
@@ -266,18 +272,24 @@ class RiskManagerAgent:
         except Exception:
             pass
 
-        order = self.client.session.place_order(
-            category="linear",
-            symbol=symbol,
-            side=side,
-            orderType="Market",
-            qty=qty_str,
-            stopLoss=sl_str,
-            takeProfit=tp_str,
-            slTriggerBy="MarkPrice",
-            tpTriggerBy="LastPrice",
-        )
-        return {"status": "executed", "order": order, "qty": qty_str, "sl": sl_str, "tp": tp_str}
+        try:
+            order = self.client.session.place_order(
+                category="linear",
+                symbol=symbol,
+                side=side,
+                orderType="Market",
+                qty=qty_str,
+                stopLoss=sl_str,
+                takeProfit=tp_str,
+                slTriggerBy="MarkPrice",
+                tpTriggerBy="LastPrice",
+            )
+            if order.get("retCode") != 0:
+                return {"status": "rejected", "reason": f"Bybit rədd etdi: {order.get('retMsg')}"}
+            return {"status": "executed", "order": order, "qty": qty_str, "sl": sl_str, "tp": tp_str}
+        except Exception as e:
+            logger.error(f"Order xətası ({symbol}): {e}")
+            return {"status": "rejected", "reason": f"Bybit API xətası: {e}"}
 class TradingOrchestrator:
     def __init__(self):
         self.client = BybitClient()
@@ -288,6 +300,7 @@ class TradingOrchestrator:
 
         self.is_paused = False
         self.scan_lock = asyncio.Lock()
+        self.tracked_positions: dict[str, str] = {}
         self.daily_start_balance = 0.0
         self.last_reset_day = datetime.now(timezone.utc).day
         self.tg_app: Application | None = None
@@ -300,6 +313,37 @@ class TradingOrchestrator:
                 )
             except Exception as e:
                 logger.error(f"Telegram göndərmə xətası: {e}")
+
+    async def position_monitor_loop(self):
+        """Hər 60 saniyədən bir bağlanan mövqeləri (TP/SL) yoxlayır."""
+        init_pos = await asyncio.to_thread(self.client.get_open_positions)
+        self.tracked_positions = {p["symbol"]: p["side"] for p in init_pos}
+
+        while True:
+            await asyncio.sleep(Config.MONITOR_INTERVAL_SECONDS)
+            try:
+                current_pos = await asyncio.to_thread(self.client.get_open_positions)
+                current_map = {p["symbol"]: p["side"] for p in current_pos}
+
+                closed_symbols = set(self.tracked_positions.keys()) - set(current_map.keys())
+                if closed_symbols:
+                    history = await asyncio.to_thread(self.client.get_closed_pnl, 10)
+                    for sym in closed_symbols:
+                        match = next((h for h in history if h["symbol"] == sym), None)
+                        if match:
+                            pnl = safe_float(match.get("closedPnl"))
+                            tag = "✅ TP / QAZANC" if pnl > 0 else "🛑 SL / ZƏRƏR"
+                            msg = (
+                                f"<b>{tag} — MÖVQE BAĞLANDI</b>\n"
+                                f"Koin: <b>{sym}</b>\n"
+                                f"Giriş: {match.get('avgEntryPrice')} | Çıxış: {match.get('avgExitPrice')}\n"
+                                f"Xalis PnL: <b>{pnl:+.2f} USDT</b>"
+                            )
+                            await self.send_telegram(msg)
+
+                self.tracked_positions = current_map
+            except Exception as e:
+                logger.error(f"Monitor xətası: {e}")
 
     async def run_scan_cycle(self) -> str:
         if self.scan_lock.locked():
@@ -333,6 +377,7 @@ class TradingOrchestrator:
                 ema50 = btc_df["close"].ewm(span=50).mean().iloc[-1]
                 btc_trend = "Bullish" if ema20 > ema50 else "Bearish"
 
+            fng = await self.fund_agent.get_fng()
             tickers = await asyncio.to_thread(self.client.get_top_liquid_futures)
             candidates = []
 
@@ -350,7 +395,7 @@ class TradingOrchestrator:
                     continue
 
                 deriv = self.deriv_agent.analyze(t, tech["signal"])
-                fund = await self.fund_agent.analyze(btc_trend, tech["signal"])
+                fund = self.fund_agent.analyze(btc_trend, tech["signal"], fng)
                 total_score = tech["score"] + deriv["score"] + fund["score"]
 
                 candidates.append({
@@ -377,6 +422,7 @@ class TradingOrchestrator:
             if best_setup:
                 res = await asyncio.to_thread(self.risk_agent.execute_trade, best_setup)
                 if res["status"] == "executed":
+                    self.tracked_positions[best_setup["symbol"]] = best_setup["signal"]
                     msg = (
                         f"🚀 <b>YENİ ƏMƏLİYYAT ({'DEMO' if Config.USE_DEMO else 'REAL'})</b>\n"
                         f"Koin: <b>{best_setup['symbol']}</b> | İstiqamət: <b>{best_setup['signal']}</b>\n"
@@ -387,18 +433,22 @@ class TradingOrchestrator:
                     )
                     await self.send_telegram(msg)
                     return msg
-                return f"⚠️ Namizəd ({best_setup['symbol']}) rədd edildi: {res['reason']}\n\n🏆 <b>Top 3:</b>\n{top3_text}"
+                err_msg = f"⚠️ Namizəd ({best_setup['symbol']}) rədd edildi: {res['reason']}\n\n🏆 <b>Top 3:</b>\n{top3_text}"
+                await self.send_telegram(err_msg)
+                return err_msg
 
             return (
-                f"🔍 <b>Skan tamamlandı</b> ({len(tickers)} koin | BTC: {btc_trend})\n"
+                f"🔍 <b>Skan tamamlandı</b> ({len(tickers)} koin | BTC: {btc_trend} | F&G: {fng})\n"
                 f"75+ bal yığan fürsət tapılmadı.\n\n"
                 f"🏆 <b>Ən Yüksək Ballı Top 3:</b>\n{top3_text}"
             )
 
     async def background_loop(self):
         await asyncio.to_thread(self.client.load_instruments)
+        asyncio.create_task(self.position_monitor_loop())
         await self.send_telegram(
-            f"✅ <b>Bybit SMC Multi-Agent Bot (v2) işə düşdü!</b>\nRejim: {'DEMO' if Config.USE_DEMO else 'REAL'}"
+            f"✅ <b>Bybit SMC Multi-Agent Bot (v3) işə düşdü!</b>\n"
+            f"Rejim: {'DEMO' if Config.USE_DEMO else 'REAL'} | TP/SL Monitoru: Aktiv"
         )
         while True:
             if not self.is_paused:
@@ -417,9 +467,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     await update.message.reply_text(
-        "🤖 <b>Bybit SMC Multi-Agent Bot (v2)</b>\n"
+        "🤖 <b>Bybit SMC Multi-Agent Bot (v3)</b>\n"
         "/status - Balans və açıq mövqelər\n"
-        "/scan - İndi manuel skan başlat (Top 3 hesabatı ilə)\n"
+        "/scan - İndi manuel skan başlat (Top 3 hesabatı)\n"
+        "/history - Son 5 bağlanan əməliyyat (TP/SL)\n"
         "/pause - Avtomatik skanı dayandır\n"
         "/resume - Avtomatik skanı davam etdir\n"
         "/close_all - Bütün açıq mövqeləri bağla",
@@ -439,6 +490,20 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📂 <b>Açıq Mövqelər ({len(pos)}):</b>\n{pos_text}",
         parse_mode="HTML",
     )
+
+async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        return
+    history = await asyncio.to_thread(orchestrator.client.get_closed_pnl, 5)
+    if not history:
+        await update.message.reply_text("📜 Hələlik bağlanmış əməliyyat tarixçəsi yoxdur.")
+        return
+    lines = []
+    for h in history:
+        pnl = safe_float(h.get("closedPnl"))
+        icon = "✅" if pnl > 0 else "🛑"
+        lines.append(f"{icon} <b>{h['symbol']}</b>: <b>{pnl:+.2f} USDT</b> (Çıxış: {h.get('avgExitPrice')})")
+    await update.message.reply_text("📜 <b>Son 5 Bağlanan Əməliyyat:</b>\n" + "\n".join(lines), parse_mode="HTML")
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -466,7 +531,7 @@ async def cmd_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🚨 {count} açıq mövqe bazar qiyməti ilə bağlandı.")
 
 async def health_check(request):
-    return web.Response(text="Bybit SMC Bot v2 is running 24/7")
+    return web.Response(text="Bybit SMC Bot v3 is running 24/7")
 
 async def main():
     web_app = web.Application()
@@ -481,6 +546,7 @@ async def main():
     tg_app = Application.builder().token(Config.TELEGRAM_TOKEN).build()
     tg_app.add_handler(CommandHandler("start", cmd_start))
     tg_app.add_handler(CommandHandler("status", cmd_status))
+    tg_app.add_handler(CommandHandler("history", cmd_history))
     tg_app.add_handler(CommandHandler("scan", cmd_scan))
     tg_app.add_handler(CommandHandler("pause", cmd_pause))
     tg_app.add_handler(CommandHandler("resume", cmd_resume))
