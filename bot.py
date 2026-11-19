@@ -625,7 +625,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 <b>Bybit SMC Multi-Agent Bot (v4 Final)</b>\n"
         "/status - Balans, açıq mövqelər və Limit əmrləri\n"
         "/scan - İndi manuel skan başlat (Top 3 hesabatı)\n"
-        "/history - Son 5 bağlanan əməliyyat (TP/SL)\n"
+        "/history - Ümumi statistika (+ / -) və son 5 əməliyyat\n"
         "/pause - Avtomatik skanı dayandır\n"
         "/resume - Avtomatik skanı davam etdir\n"
         "/close_all - Bütün mövqeləri bağla və Limit əmrlərini ləğv et",
@@ -654,16 +654,30 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
-    history = await asyncio.to_thread(orchestrator.client.get_closed_pnl, 5)
+    history = await asyncio.to_thread(orchestrator.client.get_closed_pnl, 100)
     if not history:
         await update.message.reply_text("📜 Hələlik bağlanmış əməliyyat tarixçəsi yoxdur.")
         return
+
+    wins = sum(1 for h in history if safe_float(h.get("closedPnl")) > 0)
+    losses = sum(1 for h in history if safe_float(h.get("closedPnl")) < 0)
+    total_pnl = sum(safe_float(h.get("closedPnl")) for h in history)
+    win_rate = (wins / len(history)) * 100
+
     lines = []
-    for h in history:
+    for h in history[:5]:
         pnl = safe_float(h.get("closedPnl"))
         icon = "✅" if pnl > 0 else "🛑"
         lines.append(f"{icon} <b>{h['symbol']}</b>: <b>{pnl:+.2f} USDT</b> (Çıxış: {h.get('avgExitPrice')})")
-    await update.message.reply_text("📜 <b>Son 5 Bağlanan Əməliyyat:</b>\n" + "\n".join(lines), parse_mode="HTML")
+
+    msg = (
+        f"📊 <b>Ümumi Statistika (Son {len(history)} əməliyyat):</b>\n"
+        f"✅ Qazanc: <b>{wins}+</b> | 🛑 Zərər: <b>{losses}-</b>\n"
+        f"🎯 Win Rate: <b>{win_rate:.1f}%</b>\n"
+        f"💰 Ümumi PnL: <b>{total_pnl:+.2f} USDT</b>\n\n"
+        f"📜 <b>Son 5 Bağlanan Əməliyyat:</b>\n" + "\n".join(lines)
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
