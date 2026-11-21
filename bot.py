@@ -1,5 +1,6 @@
 import os
 import time
+import html
 import asyncio
 import logging
 from decimal import Decimal, ROUND_DOWN
@@ -35,11 +36,14 @@ class Config:
     BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "")
     BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
     USE_DEMO = os.getenv("USE_DEMO", "true").lower() == "true"
+    DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+    LIVE_CONFIRM = os.getenv("LIVE_CONFIRM", "")
 
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
     TELEGRAM_CHAT_ID = str(os.getenv("TELEGRAM_CHAT_ID", ""))
 
     MIN_24H_VOLUME_USDT = 30_000_000
+    MAX_SPREAD_PCT = 0.0015
     TOP_COINS_LIMIT = 40
     SCAN_INTERVAL_SECONDS = 900
     MONITOR_INTERVAL_SECONDS = 60
@@ -48,11 +52,21 @@ class Config:
     LTF_INTERVAL = "15"
 
     RISK_PER_TRADE_PCT = 0.01
+    MAX_TOTAL_RISK_PCT = 0.03
     MAX_OPEN_POSITIONS = 3
     DAILY_MAX_LOSS_PCT = 0.04
+    MAX_CONSECUTIVE_LOSSES = 3
+    MIN_SL_PCT = 0.006
+    ATR_SL_MULT = 1.5
+    ATR_TP_MULT = 3.75
     MIN_RR_RATIO = 2.5
     MIN_TOTAL_SCORE = 75
     LEVERAGE = 5
+
+    @classmethod
+    def validate_live_mode(cls):
+        if not cls.USE_DEMO and not cls.DRY_RUN and cls.LIVE_CONFIRM != "YES":
+            raise RuntimeError("REAL REJİM BLOKLANDI: Render-də LIVE_CONFIRM=YES təyin edilməyib!")
 class BybitClient:
     def __init__(self):
         self.session = HTTP(
@@ -62,36 +76,76 @@ class BybitClient:
         )
         self.instruments = {}
 
+    def api_call_with_retry(self, func, *args, retries: int = 3, **kwargs):
+        for attempt in range(retries):
+            try:
+                resp = func(*args, **kwargs)
+                if isinstance(resp, dict) and resp.get("retCode") == 10006:
+                    time.sleep(2 ** attempt)
+                    continue
+                return resp
+            except Exception as e:
+                if attempt == retries - 1:
+                    raise e
+                time.sleep(2 ** attempt)
+        return {}
+
     def load_instruments(self):
-        resp = self.session.get_instruments_info(category="linear")
-        if resp.get("retCode") == 0:
+        cursor = ""
+        while True:
+            params = {"category": "linear", "limit": 1000}
+            if cursor:
+                params["cursor"] = cursor
+            resp = self.api_call_with_retry(self.session.get_instruments_info, **params)
+            if resp.get("retCode") != 0:
+                break
             for item in resp["result"]["list"]:
+                if item.get("status") != "Trading":
+                    continue
                 self.instruments[item["symbol"]] = {
                     "qtyStep": item["lotSizeFilter"]["qtyStep"],
                     "minOrderQty": safe_float(item["lotSizeFilter"]["minOrderQty"]),
+                    "minNotional": safe_float(item["lotSizeFilter"].get("minNotionalValue"), 5.0),
                     "tickSize": item["priceFilter"]["tickSize"],
+                    "maxLeverage": int(safe_float(item.get("leverageFilter", {}).get("maxLeverage"), 5)),
                 }
-        logger.info(f"{len(self.instruments)} fyuçers instrumenti yükləndi.")
+            cursor = resp["result"].get("nextPageCursor", "")
+            if not cursor:
+                break
+        logger.info(f"{len(self.instruments)} aktiv (Trading) fyuçers instrumenti yükləndi.")
 
     @staticmethod
     def format_step(value: float, step: str) -> str:
         return str(Decimal(str(value)).quantize(Decimal(step), rounding=ROUND_DOWN))
 
+    def get_all_tickers_map(self) -> dict[str, dict]:
+        resp = self.api_call_with_retry(self.session.get_tickers, category="linear")
+        if resp.get("retCode") != 0:
+            return {}
+        return {t["symbol"]: t for t in resp["result"]["list"]}
+
     def get_top_liquid_futures(self) -> list[dict]:
-        resp = self.session.get_tickers(category="linear")
+        resp = self.api_call_with_retry(self.session.get_tickers, category="linear")
         if resp.get("retCode") != 0:
             return []
-        tickers = [
-            t for t in resp["result"]["list"]
-            if t["symbol"].endswith("USDT")
-            and safe_float(t.get("turnover24h")) >= Config.MIN_24H_VOLUME_USDT
-        ]
+        tickers = []
+        for t in resp["result"]["list"]:
+            sym = t["symbol"]
+            if not sym.endswith("USDT") or sym not in self.instruments:
+                continue
+            if safe_float(t.get("turnover24h")) < Config.MIN_24H_VOLUME_USDT:
+                continue
+            bid = safe_float(t.get("bid1Price"))
+            ask = safe_float(t.get("ask1Price"))
+            if bid > 0 and ask > 0 and ((ask - bid) / bid) > Config.MAX_SPREAD_PCT:
+                continue
+            tickers.append(t)
         tickers.sort(key=lambda x: safe_float(x.get("turnover24h")), reverse=True)
         return tickers[: Config.TOP_COINS_LIMIT]
 
     def get_klines(self, symbol: str, interval: str, limit: int = 100) -> pd.DataFrame:
-        resp = self.session.get_kline(
-            category="linear", symbol=symbol, interval=interval, limit=limit
+        resp = self.api_call_with_retry(
+            self.session.get_kline, category="linear", symbol=symbol, interval=interval, limit=limit
         )
         if resp.get("retCode") != 0 or not resp["result"]["list"]:
             return pd.DataFrame()
@@ -106,7 +160,9 @@ class BybitClient:
 
     def get_usdt_balance(self) -> float:
         try:
-            resp = self.session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+            resp = self.api_call_with_retry(
+                self.session.get_wallet_balance, accountType="UNIFIED", coin="USDT"
+            )
             if resp.get("retCode") == 0:
                 return safe_float(resp["result"]["list"][0].get("totalEquity"))
         except Exception as e:
@@ -115,7 +171,9 @@ class BybitClient:
 
     def get_open_positions(self) -> list[dict]:
         try:
-            resp = self.session.get_positions(category="linear", settleCoin="USDT")
+            resp = self.api_call_with_retry(
+                self.session.get_positions, category="linear", settleCoin="USDT"
+            )
             if resp.get("retCode") == 0:
                 return [p for p in resp["result"]["list"] if safe_float(p.get("size")) > 0]
         except Exception as e:
@@ -124,17 +182,22 @@ class BybitClient:
 
     def get_open_orders(self) -> list[dict]:
         try:
-            resp = self.session.get_open_orders(category="linear", settleCoin="USDT")
+            resp = self.api_call_with_retry(
+                self.session.get_open_orders, category="linear", settleCoin="USDT"
+            )
             if resp.get("retCode") == 0:
-                return resp["result"]["list"]
+                return [
+                    o for o in resp["result"]["list"]
+                    if o.get("orderType") == "Limit" and not o.get("reduceOnly")
+                ]
         except Exception as e:
             logger.error(f"Açıq əmr oxuma xətası: {e}")
         return []
 
     def cancel_order(self, symbol: str, order_id: str) -> bool:
         try:
-            resp = self.session.cancel_order(
-                category="linear", symbol=symbol, orderId=order_id
+            resp = self.api_call_with_retry(
+                self.session.cancel_order, category="linear", symbol=symbol, orderId=order_id
             )
             return resp.get("retCode") == 0
         except Exception as e:
@@ -143,29 +206,33 @@ class BybitClient:
 
     def get_closed_pnl(self, limit: int = 5) -> list[dict]:
         try:
-            resp = self.session.get_closed_pnl(category="linear", limit=limit)
+            resp = self.api_call_with_retry(
+                self.session.get_closed_pnl, category="linear", limit=limit
+            )
             if resp.get("retCode") == 0:
                 return resp["result"]["list"]
         except Exception as e:
             logger.error(f"Closed PnL xətası: {e}")
         return []
 
-    def set_breakeven_sl(self, symbol: str, new_sl: float, position_idx: int = 0) -> bool:
-        inst = self.instruments.get(symbol)
-        if not inst:
-            return False
-        sl_str = self.format_step(new_sl, inst["tickSize"])
+    def set_trading_stop(self, symbol: str, sl: str = None, tp: str = None, position_idx: int = 0) -> bool:
+        params = {
+            "category": "linear",
+            "symbol": symbol,
+            "tpslMode": "Full",
+            "slTriggerBy": "MarkPrice",
+            "tpTriggerBy": "LastPrice",
+            "positionIdx": int(position_idx),
+        }
+        if sl:
+            params["stopLoss"] = sl
+        if tp:
+            params["takeProfit"] = tp
         try:
-            resp = self.session.set_trading_stop(
-                category="linear",
-                symbol=symbol,
-                stopLoss=sl_str,
-                slTriggerBy="MarkPrice",
-                positionIdx=int(position_idx),
-            )
+            resp = self.api_call_with_retry(self.session.set_trading_stop, **params)
             return resp.get("retCode") == 0
         except Exception as e:
-            logger.error(f"Breakeven SL xətası ({symbol}): {e}")
+            logger.error(f"set_trading_stop xətası ({symbol}): {e}")
             return False
 
     def close_all_positions_and_orders(self) -> tuple[int, int]:
@@ -180,21 +247,48 @@ class BybitClient:
         for p in positions:
             side = "Sell" if p["side"] == "Buy" else "Buy"
             try:
-                self.session.place_order(
+                self.api_call_with_retry(
+                    self.session.place_order,
                     category="linear",
                     symbol=p["symbol"],
                     side=side,
                     orderType="Market",
                     qty=p["size"],
                     reduceOnly=True,
+                    positionIdx=int(p.get("positionIdx", 0)),
                 )
                 closed_pos += 1
             except Exception as e:
                 logger.error(f"{p['symbol']} bağlanma xətası: {e}")
         return closed_pos, canceled_ord
 class TechnicalSMCAgent:
+    @staticmethod
+    def calc_adx(df: pd.DataFrame, period: int = 14) -> float:
+        high, low, close = df["high"], df["low"], df["close"]
+        plus_dm = high.diff().clip(lower=0)
+        minus_dm = (-low.diff()).clip(lower=0)
+        plus_dm = plus_dm.where(plus_dm > minus_dm, 0.0)
+        minus_dm = minus_dm.where(minus_dm > plus_dm, 0.0)
+
+        tr = pd.concat([
+            high - low,
+            (high - close.shift()).abs(),
+            (low - close.shift()).abs(),
+        ], axis=1).max(axis=1)
+
+        atr = tr.ewm(alpha=1 / period, adjust=False).mean()
+        plus_di = 100 * (plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr.replace(0, 1e-9))
+        minus_di = 100 * (minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr.replace(0, 1e-9))
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1e-9)
+        adx = dx.ewm(alpha=1 / period, adjust=False).mean().iloc[-1]
+        return float(adx) if pd.notna(adx) else 0.0
+
     def analyze(self, df_htf: pd.DataFrame, df_ltf: pd.DataFrame) -> dict:
         if len(df_htf) < 60 or len(df_ltf) < 60:
+            return {"score": 0, "signal": None}
+
+        adx = self.calc_adx(df_ltf, 14)
+        if adx < 20:
             return {"score": 0, "signal": None}
 
         df_htf["ema20"] = df_htf["close"].ewm(span=20).mean()
@@ -216,30 +310,33 @@ class TechnicalSMCAgent:
         bear_sweep = df_ltf["high"].iloc[-6:-1].max() > prior_swing_high and last_close < prior_swing_high
 
         atr = (df_ltf["high"] - df_ltf["low"]).iloc[-15:-1].mean()
-        overextended = atr > 0 and abs(c3["close"] - c3["open"]) > (2.2 * atr)
+        if atr <= 0:
+            return {"score": 0, "signal": None}
 
+        overextended = abs(c3["close"] - c3["open"]) > (2.2 * atr)
         avg_vol = df_ltf["volume"].iloc[-21:-1].mean()
         rvol = c2["volume"] / avg_vol if avg_vol > 0 else 0
 
         score, signal, entry, sl, order_type = 0, None, last_close, 0.0, "Market"
-        reasons = []
+        reasons = [f"ADX {adx:.0f}"]
 
         if htf_bull and last_close > recent_high:
             signal = "Buy"
             score += 20
-            reasons.append("4H Bullish + 15M BOS")
-            sl = min(c1["low"], recent_low) * 0.998
+            reasons.append("4H Bull + 15M BOS")
+            struct_sl = min(c1["low"], recent_low) * 0.998
             if bull_sweep:
                 score += 15
                 reasons.append("Liquidity Sweep")
             if bull_fvg:
                 score += 15
-                reasons.append("Bullish FVG")
+                reasons.append("Bull FVG")
                 fvg_mid = (c1["high"] + c3["low"]) / 2
-                if overextended and sl < fvg_mid < last_close:
+                if overextended and struct_sl < fvg_mid < last_close:
                     entry = fvg_mid
                     order_type = "Limit"
                     reasons.append("FVG 50% Limit")
+            sl = min(struct_sl, entry - (atr * Config.ATR_SL_MULT))
             if rvol >= 1.8:
                 score += 10
                 reasons.append(f"RVOL {rvol:.1f}x")
@@ -247,19 +344,20 @@ class TechnicalSMCAgent:
         elif htf_bear and last_close < recent_low:
             signal = "Sell"
             score += 20
-            reasons.append("4H Bearish + 15M BOS")
-            sl = max(c1["high"], recent_high) * 1.002
+            reasons.append("4H Bear + 15M BOS")
+            struct_sl = max(c1["high"], recent_high) * 1.002
             if bear_sweep:
                 score += 15
                 reasons.append("Liquidity Sweep")
             if bear_fvg:
                 score += 15
-                reasons.append("Bearish FVG")
+                reasons.append("Bear FVG")
                 fvg_mid = (c1["low"] + c3["high"]) / 2
-                if overextended and last_close < fvg_mid < sl:
+                if overextended and last_close < fvg_mid < struct_sl:
                     entry = fvg_mid
                     order_type = "Limit"
                     reasons.append("FVG 50% Limit")
+            sl = max(struct_sl, entry + (atr * Config.ATR_SL_MULT))
             if rvol >= 1.8:
                 score += 10
                 reasons.append(f"RVOL {rvol:.1f}x")
@@ -269,6 +367,7 @@ class TechnicalSMCAgent:
             "signal": signal,
             "entry": entry,
             "sl": sl,
+            "atr": atr,
             "order_type": order_type,
             "reasons": reasons,
         }
@@ -316,40 +415,66 @@ class RiskManagerAgent:
         side = setup["signal"]
         entry = setup["entry"]
         sl = setup["sl"]
+        atr = setup.get("atr", 0.0)
         order_type = setup.get("order_type", "Market")
 
         risk_unit = abs(entry - sl)
         if risk_unit <= 0 or entry <= 0:
             return {"status": "rejected", "reason": "SL və ya qiymət məsafəsi 0-dır"}
 
-        tp = entry + (risk_unit * Config.MIN_RR_RATIO) if side == "Buy" else entry - (risk_unit * Config.MIN_RR_RATIO)
+        sl_pct = risk_unit / entry
+        if sl_pct < Config.MIN_SL_PCT:
+            return {"status": "rejected", "reason": f"SL çox yaxındır ({sl_pct:.2%} < {Config.MIN_SL_PCT:.2%})"}
+
+        tp_dist = max(risk_unit * Config.MIN_RR_RATIO, atr * Config.ATR_TP_MULT)
+        tp = entry + tp_dist if side == "Buy" else entry - tp_dist
+
         balance = self.client.get_usdt_balance()
         if balance <= 0:
             return {"status": "rejected", "reason": "Balans 0-dır"}
-
-        risk_usdt = balance * Config.RISK_PER_TRADE_PCT
-        raw_qty = risk_usdt / risk_unit
-        max_qty = (balance * Config.LEVERAGE * 0.90) / entry
-        final_qty = min(raw_qty, max_qty)
 
         inst = self.client.instruments.get(symbol)
         if not inst:
             return {"status": "rejected", "reason": "Instrument tapılmadı"}
 
+        safe_lev = min(Config.LEVERAGE, inst["maxLeverage"])
+        risk_usdt = balance * Config.RISK_PER_TRADE_PCT
+        effective_risk = risk_unit + (entry * 0.0012)  # Komissiya + slippage payı
+        raw_qty = risk_usdt / effective_risk
+        max_qty = (balance * safe_lev * 0.90) / entry
+        final_qty = min(raw_qty, max_qty)
+
         qty_str = self.client.format_step(final_qty, inst["qtyStep"])
-        if safe_float(qty_str) < inst["minOrderQty"]:
-            return {"status": "rejected", "reason": "Miqdar minimumdan azdır"}
+        qty_f = safe_float(qty_str)
+        if qty_f < inst["minOrderQty"] or (qty_f * entry) < inst["minNotional"]:
+            return {"status": "rejected", "reason": "Miqdar və ya dəyər birja minimumundan azdır"}
 
         entry_str = self.client.format_step(entry, inst["tickSize"])
         sl_str = self.client.format_step(sl, inst["tickSize"])
         tp_str = self.client.format_step(tp, inst["tickSize"])
 
+        if Config.DRY_RUN:
+            return {
+                "status": "executed",
+                "order_type": f"DRY_RUN ({order_type})",
+                "entry": entry_str,
+                "qty": qty_str,
+                "sl": sl_str,
+                "tp": tp_str,
+            }
+
+        # Isolated Margin + Təhlükəsiz Leverage
+        try:
+            self.client.session.switch_margin_mode(
+                category="linear", symbol=symbol, tradeMode=1,
+                buyLeverage=str(safe_lev), sellLeverage=str(safe_lev),
+            )
+        except Exception:
+            pass
         try:
             self.client.session.set_leverage(
-                category="linear",
-                symbol=symbol,
-                buyLeverage=str(Config.LEVERAGE),
-                sellLeverage=str(Config.LEVERAGE),
+                category="linear", symbol=symbol,
+                buyLeverage=str(safe_lev), sellLeverage=str(safe_lev),
             )
         except Exception:
             pass
@@ -362,6 +487,7 @@ class RiskManagerAgent:
             "qty": qty_str,
             "stopLoss": sl_str,
             "takeProfit": tp_str,
+            "tpslMode": "Full",
             "slTriggerBy": "MarkPrice",
             "tpTriggerBy": "LastPrice",
         }
@@ -370,9 +496,23 @@ class RiskManagerAgent:
             params["timeInForce"] = "GTC"
 
         try:
-            order = self.client.session.place_order(**params)
+            order = self.client.api_call_with_retry(self.client.session.place_order, **params)
             if order.get("retCode") != 0:
-                return {"status": "rejected", "reason": f"Bybit rədd etdi: {order.get('retMsg')}"}
+                msg = str(order.get("retMsg", ""))
+                return {
+                    "status": "rejected",
+                    "reason": f"Bybit rədd etdi: {msg}",
+                    "skip_symbol": "110126" in msg or order.get("retCode") == 110126,
+                }
+
+            # Zəmanət: Market əmri açılan kimi TP/SL-i mövqeyə təkrar təsdiqlə
+            if order_type == "Market":
+                time.sleep(1)
+                pos_list = self.client.get_open_positions()
+                pos = next((p for p in pos_list if p["symbol"] == symbol), None)
+                pos_idx = int(pos.get("positionIdx", 0)) if pos else 0
+                self.client.set_trading_stop(symbol, sl=sl_str, tp=tp_str, position_idx=pos_idx)
+
             return {
                 "status": "executed",
                 "order": order,
@@ -383,8 +523,13 @@ class RiskManagerAgent:
                 "tp": tp_str,
             }
         except Exception as e:
-            logger.error(f"Order xətası ({symbol}): {e}")
-            return {"status": "rejected", "reason": f"Bybit API xətası: {e}"}
+            err_str = str(e)
+            logger.error(f"Order xətası ({symbol}): {err_str}")
+            return {
+                "status": "rejected",
+                "reason": f"Bybit API xətası: {err_str}",
+                "skip_symbol": "110126" in err_str,
+            }
 class TradingOrchestrator:
     def __init__(self):
         self.client = BybitClient()
@@ -396,6 +541,8 @@ class TradingOrchestrator:
         self.is_paused = False
         self.scan_lock = asyncio.Lock()
         self.tracked_positions: dict[str, dict] = {}
+        self.blacklisted_symbols: set[str] = set()
+        self.last_loss_pause_id: str = ""
         self.daily_start_balance = 0.0
         self.last_reset_day = datetime.now(timezone.utc).day
         self.tg_app: Application | None = None
@@ -410,7 +557,7 @@ class TradingOrchestrator:
                 logger.error(f"Telegram göndərmə xətası: {e}")
 
     async def position_monitor_loop(self):
-        """Hər 60 saniyədən bir: TP/SL bildirişi, +1R Breakeven və 1 saatlıq Limit ləğvi."""
+        """Hər 60 saniyədən bir: Limit ləğvi (vaxt/SL), TP/SL bildirişi və +1R Breakeven."""
         init_pos = await asyncio.to_thread(self.client.get_open_positions)
         for p in init_pos:
             self.tracked_positions[p["symbol"]] = {
@@ -423,17 +570,31 @@ class TradingOrchestrator:
         while True:
             await asyncio.sleep(Config.MONITOR_INTERVAL_SECONDS)
             try:
-                # 1. Köhnəlmiş Limit əmrlərinin (1 saat+) ləğvi
+                # 1. Limit əmrlərinin vaxt (1 saat+) və ya SL etibarsızlığına görə ləğvi
                 open_orders = await asyncio.to_thread(self.client.get_open_orders)
-                now_ms = time.time() * 1000
-                for o in open_orders:
-                    created_ms = safe_float(o.get("createdTime"))
-                    if created_ms > 0 and (now_ms - created_ms) >= (Config.LIMIT_ORDER_EXPIRY_SECONDS * 1000):
-                        if await asyncio.to_thread(self.client.cancel_order, o["symbol"], o["orderId"]):
-                            await self.send_telegram(
-                                f"⏳ <b>LİMİT ƏMRİ LƏĞV EDİLDİ ({o['symbol']})</b>\n"
-                                f"1 saat ərzində FVG zonasına qayıtmadığı üçün əmr avtomatik silindi."
+                if open_orders:
+                    ticker_map = await asyncio.to_thread(self.client.get_all_tickers_map)
+                    now_ms = time.time() * 1000
+                    for o in open_orders:
+                        sym = o["symbol"]
+                        created_ms = safe_float(o.get("createdTime"))
+                        expired = created_ms > 0 and (now_ms - created_ms) >= (Config.LIMIT_ORDER_EXPIRY_SECONDS * 1000)
+
+                        sl_p = safe_float(o.get("stopLoss"))
+                        last_p = safe_float(ticker_map.get(sym, {}).get("lastPrice"))
+                        invalidated = (
+                            sl_p > 0 and last_p > 0 and (
+                                (o["side"] == "Buy" and last_p <= sl_p) or
+                                (o["side"] == "Sell" and last_p >= sl_p)
                             )
+                        )
+                        if expired or invalidated:
+                            reason = "qiymət SL-i keçdiyi" if invalidated else "1 saat ərzində dolmadığı"
+                            if await asyncio.to_thread(self.client.cancel_order, sym, o["orderId"]):
+                                await self.send_telegram(
+                                    f"⏳ <b>LİMİT ƏMRİ LƏĞV EDİLDİ ({sym})</b>\n"
+                                    f"Setup {reason} üçün əmr avtomatik silindi."
+                                )
 
                 # 2. Bağlanan mövqelər (TP / SL bildirişi)
                 current_pos = await asyncio.to_thread(self.client.get_open_positions)
@@ -448,13 +609,12 @@ class TradingOrchestrator:
                         if match:
                             pnl = safe_float(match.get("closedPnl"))
                             tag = "✅ TP / QAZANC" if pnl > 0 else "🛑 SL / ZƏRƏR"
-                            msg = (
+                            await self.send_telegram(
                                 f"<b>{tag} — MÖVQE BAĞLANDI</b>\n"
                                 f"Koin: <b>{sym}</b>\n"
                                 f"Giriş: {match.get('avgEntryPrice')} | Çıxış: {match.get('avgExitPrice')}\n"
                                 f"Xalis PnL: <b>{pnl:+.2f} USDT</b>"
                             )
-                            await self.send_telegram(msg)
 
                 # 3. Açıq mövqelərdə +1R Breakeven (One-Way & Hedge uyğun)
                 for p in current_pos:
@@ -474,26 +634,20 @@ class TradingOrchestrator:
                     if info["be_done"] or entry <= 0 or sl <= 0 or mark <= 0:
                         continue
 
-                    if side == "Buy" and sl < entry:
-                        r_dist = entry - sl
-                        if mark >= entry + r_dist:
-                            be_price = entry * 1.001
-                            if await asyncio.to_thread(self.client.set_breakeven_sl, sym, be_price, pos_idx):
-                                info["be_done"] = True
-                                await self.send_telegram(
-                                    f"🛡️ <b>BREAKEVEN AKTİV ({sym})</b>\n"
-                                    f"Qiymət +1R qazanca çatdı. Stop-Loss girişə çəkildi."
-                                )
-                    elif side == "Sell" and sl > entry:
-                        r_dist = sl - entry
-                        if mark <= entry - r_dist:
-                            be_price = entry * 0.999
-                            if await asyncio.to_thread(self.client.set_breakeven_sl, sym, be_price, pos_idx):
-                                info["be_done"] = True
-                                await self.send_telegram(
-                                    f"🛡️ <b>BREAKEVEN AKTİV ({sym})</b>\n"
-                                    f"Qiymət +1R qazanca çatdı. Stop-Loss girişə çəkildi."
-                                )
+                    inst = self.client.instruments.get(sym)
+                    if not inst:
+                        continue
+
+                    if side == "Buy" and sl < entry and mark >= entry + (entry - sl):
+                        be_str = self.client.format_step(entry * 1.001, inst["tickSize"])
+                        if await asyncio.to_thread(self.client.set_trading_stop, sym, sl=be_str, position_idx=pos_idx):
+                            info["be_done"] = True
+                            await self.send_telegram(f"🛡️ <b>BREAKEVEN AKTİV ({sym})</b>\nSL girişə çəkildi ({be_str}).")
+                    elif side == "Sell" and sl > entry and mark <= entry - (sl - entry):
+                        be_str = self.client.format_step(entry * 0.999, inst["tickSize"])
+                        if await asyncio.to_thread(self.client.set_trading_stop, sym, sl=be_str, position_idx=pos_idx):
+                            info["be_done"] = True
+                            await self.send_telegram(f"🛡️ <b>BREAKEVEN AKTİV ({sym})</b>\nSL girişə çəkildi ({be_str}).")
             except Exception as e:
                 logger.error(f"Monitor xətası: {e}")
 
@@ -508,11 +662,23 @@ class TradingOrchestrator:
                 self.daily_start_balance = balance
                 self.last_reset_day = today
 
+            # Gündəlik 4% Kill-Switch
             if self.daily_start_balance > 0:
                 drawdown = (self.daily_start_balance - balance) / self.daily_start_balance
                 if drawdown >= Config.DAILY_MAX_LOSS_PCT:
                     self.is_paused = True
-                    msg = f"🛑 <b>KILL-SWITCH AKTİV:</b> Gündəlik zərər {drawdown:.2%} həddinə çatdı. Bot dayandırıldı."
+                    msg = f"🛑 <b>KILL-SWITCH:</b> Gündəlik zərər {drawdown:.2%} həddinə çatdı. Bot dayandırıldı."
+                    await self.send_telegram(msg)
+                    return msg
+
+            # 3 Ardıcıl Zərər Qoruması
+            recent_pnl = await asyncio.to_thread(self.client.get_closed_pnl, Config.MAX_CONSECUTIVE_LOSSES)
+            if len(recent_pnl) == Config.MAX_CONSECUTIVE_LOSSES:
+                latest_id = str(recent_pnl[0].get("orderId", ""))
+                if latest_id != self.last_loss_pause_id and all(safe_float(x.get("closedPnl")) < 0 for x in recent_pnl):
+                    self.last_loss_pause_id = latest_id
+                    self.is_paused = True
+                    msg = f"🛑 <b>ARDICIL ZƏRƏR DAYANMASI:</b> Son {Config.MAX_CONSECUTIVE_LOSSES} əməliyyat SL oldu. Bot dayandırıldı (/resume ilə açın)."
                     await self.send_telegram(msg)
                     return msg
 
@@ -522,7 +688,16 @@ class TradingOrchestrator:
             if total_active >= Config.MAX_OPEN_POSITIONS:
                 return f"Maksimum aktiv əməliyyat limitinə ({total_active}/{Config.MAX_OPEN_POSITIONS}) çatılıb."
 
-            active_symbols = {p["symbol"] for p in open_pos} | {o["symbol"] for o in open_orders}
+            # Ümumi açıq risk limiti (<= 3%)
+            if balance > 0:
+                open_risk = sum(
+                    abs(safe_float(p.get("avgPrice")) - safe_float(p.get("stopLoss"))) * safe_float(p.get("size"))
+                    for p in open_pos if safe_float(p.get("stopLoss")) > 0
+                )
+                if (open_risk / balance) >= Config.MAX_TOTAL_RISK_PCT:
+                    return f"Ümumi açıq risk limitinə ({open_risk / balance:.2%}) çatılıb."
+
+            active_symbols = {p["symbol"] for p in open_pos} | {o["symbol"] for o in open_orders} | self.blacklisted_symbols
 
             btc_df = await asyncio.to_thread(self.client.get_klines, "BTCUSDT", Config.HTF_INTERVAL, 60)
             btc_trend = "Neutral"
@@ -539,29 +714,32 @@ class TradingOrchestrator:
                 sym = t["symbol"]
                 if sym in active_symbols:
                     continue
+                try:
+                    df_htf = await asyncio.to_thread(self.client.get_klines, sym, Config.HTF_INTERVAL, 80)
+                    df_ltf = await asyncio.to_thread(self.client.get_klines, sym, Config.LTF_INTERVAL, 80)
+                    await asyncio.sleep(0.15)
 
-                df_htf = await asyncio.to_thread(self.client.get_klines, sym, Config.HTF_INTERVAL, 80)
-                df_ltf = await asyncio.to_thread(self.client.get_klines, sym, Config.LTF_INTERVAL, 80)
-                await asyncio.sleep(0.15)
+                    tech = self.tech_agent.analyze(df_htf, df_ltf)
+                    if not tech["signal"]:
+                        continue
 
-                tech = self.tech_agent.analyze(df_htf, df_ltf)
-                if not tech["signal"]:
-                    continue
+                    deriv = self.deriv_agent.analyze(t, tech["signal"])
+                    fund = self.fund_agent.analyze(btc_trend, tech["signal"], fng)
+                    total_score = min(tech["score"] + deriv["score"] + fund["score"], 100)
 
-                deriv = self.deriv_agent.analyze(t, tech["signal"])
-                fund = self.fund_agent.analyze(btc_trend, tech["signal"], fng)
-                total_score = min(tech["score"] + deriv["score"] + fund["score"], 100)
-
-                candidates.append({
-                    "symbol": sym,
-                    "signal": tech["signal"],
-                    "entry": tech["entry"],
-                    "sl": tech["sl"],
-                    "order_type": tech["order_type"],
-                    "score": total_score,
-                    "veto": deriv["score"] < 0,
-                    "reasons": tech["reasons"] + deriv["reasons"] + fund["reasons"],
-                })
+                    candidates.append({
+                        "symbol": sym,
+                        "signal": tech["signal"],
+                        "entry": tech["entry"],
+                        "sl": tech["sl"],
+                        "atr": tech["atr"],
+                        "order_type": tech["order_type"],
+                        "score": total_score,
+                        "veto": deriv["score"] < 0,
+                        "reasons": tech["reasons"] + deriv["reasons"] + fund["reasons"],
+                    })
+                except Exception as e:
+                    logger.warning(f"{sym} analiz xətası: {e}")
 
             candidates.sort(key=lambda x: x["score"], reverse=True)
             top3_lines = []
@@ -570,15 +748,16 @@ class TradingOrchestrator:
                 top3_lines.append(
                     f"{i}. <b>{c['symbol']}</b> ({c['signal']}) — <b>{status_tag}</b>\n   <i>{', '.join(c['reasons'])}</i>"
                 )
-            top3_text = "\n".join(top3_lines) if top3_lines else "BOS/Trend siqnalı verən koin tapılmadı."
+            top3_text = "\n".join(top3_lines) if top3_lines else "Trend/ADX şərtinə uyğun koin tapılmadı."
 
             best_setup = next((c for c in candidates if not c["veto"] and c["score"] >= Config.MIN_TOTAL_SCORE), None)
 
             if best_setup:
                 res = await asyncio.to_thread(self.risk_agent.execute_trade, best_setup)
                 if res["status"] == "executed":
+                    mode_tag = "DRY_RUN" if Config.DRY_RUN else ("DEMO" if Config.USE_DEMO else "REAL")
                     msg = (
-                        f"🚀 <b>YENİ ƏMƏLİYYAT ({'DEMO' if Config.USE_DEMO else 'REAL'})</b>\n"
+                        f"🚀 <b>YENİ ƏMƏLİYYAT ({mode_tag})</b>\n"
                         f"Koin: <b>{best_setup['symbol']}</b> | {best_setup['signal']} ({res['order_type']})\n"
                         f"Agent Balı: <b>{best_setup['score']}/100</b>\n"
                         f"Giriş: {res['entry']} | Miqdar: {res['qty']}\n"
@@ -588,7 +767,11 @@ class TradingOrchestrator:
                     )
                     await self.send_telegram(msg)
                     return msg
-                err_msg = f"⚠️ Namizəd ({best_setup['symbol']}) rədd edildi: {res['reason']}\n\n🏆 <b>Top 3:</b>\n{top3_text}"
+
+                if res.get("skip_symbol"):
+                    self.blacklisted_symbols.add(best_setup["symbol"])
+                safe_reason = html.escape(str(res.get("reason", "")))
+                err_msg = f"⚠️ Namizəd ({best_setup['symbol']}) rədd edildi: {safe_reason}\n\n🏆 <b>Top 3:</b>\n{top3_text}"
                 await self.send_telegram(err_msg)
                 return err_msg
 
@@ -601,9 +784,10 @@ class TradingOrchestrator:
     async def background_loop(self):
         await asyncio.to_thread(self.client.load_instruments)
         asyncio.create_task(self.position_monitor_loop())
+        mode = "DRY_RUN" if Config.DRY_RUN else ("DEMO" if Config.USE_DEMO else "REAL")
         await self.send_telegram(
-            f"✅ <b>Bybit SMC Multi-Agent Bot (v4 Final) işə düşdü!</b>\n"
-            f"Rejim: {'DEMO' if Config.USE_DEMO else 'REAL'} | Breakeven + Limit + TP/SL: Aktiv"
+            f"✅ <b>Bybit SMC Multi-Agent Bot (v5 Pro) işə düşdü!</b>\n"
+            f"Rejim: {mode} | ATR + Isolated + TP/SL Zəmanəti: Aktiv"
         )
         while True:
             if not self.is_paused:
@@ -622,7 +806,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     await update.message.reply_text(
-        "🤖 <b>Bybit SMC Multi-Agent Bot (v4 Final)</b>\n"
+        "🤖 <b>Bybit SMC Multi-Agent Bot (v5 Pro)</b>\n"
         "/status - Balans, açıq mövqelər və Limit əmrləri\n"
         "/scan - İndi manuel skan başlat (Top 3 hesabatı)\n"
         "/history - Ümumi statistika (+ / -) və son 5 əməliyyat\n"
@@ -640,7 +824,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     orders = await asyncio.to_thread(orchestrator.client.get_open_orders)
     state = "⏸ Dayandırılıb" if orchestrator.is_paused else "🟢 Aktiv (7/24)"
 
-    pos_text = "\n".join([f"- {p['symbol']} ({p['side']}): PnL {p.get('unrealisedPnl', '0')} USDT" for p in pos]) or "Yoxdur"
+    pos_text = "\n".join([
+        f"- {p['symbol']} ({p['side']}): PnL {p.get('unrealisedPnl', '0')} USDT | SL: {p.get('stopLoss') or 'Yox'} | TP: {p.get('takeProfit') or 'Yox'}"
+        for p in pos
+    ]) or "Yoxdur"
     ord_text = "\n".join([f"- {o['symbol']} ({o['side']} Limit @ {o.get('price')})" for o in orders]) or "Yoxdur"
 
     await update.message.reply_text(
@@ -707,9 +894,11 @@ async def cmd_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def health_check(request):
-    return web.Response(text="Bybit SMC Bot v4 Final is running 24/7")
+    return web.Response(text="Bybit SMC Bot v5 Pro is running 24/7")
 
 async def main():
+    Config.validate_live_mode()
+
     web_app = web.Application()
     web_app.router.add_get("/", health_check)
     runner = web.AppRunner(web_app)
