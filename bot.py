@@ -47,18 +47,19 @@ class Config:
     TOP_COINS_LIMIT = 40
     SCAN_INTERVAL_SECONDS = 900
     MONITOR_INTERVAL_SECONDS = 60
-    LIMIT_ORDER_EXPIRY_SECONDS = 3600
+    LIMIT_ORDER_EXPIRY_SECONDS = 14400
     HTF_INTERVAL = "240"
-    LTF_INTERVAL = "15"
+    LTF_INTERVAL = "60"
 
     RISK_PER_TRADE_PCT = 0.01
     MAX_TOTAL_RISK_PCT = 0.03
     MAX_OPEN_POSITIONS = 3
+    MAX_SAME_DIRECTION = 1
     DAILY_MAX_LOSS_PCT = 0.04
     MAX_CONSECUTIVE_LOSSES = 3
     MIN_SL_PCT = 0.006
-    ATR_SL_MULT = 1.5
-    ATR_TP_MULT = 3.75
+    ATR_SL_MULT = 2.0
+    ATR_TP_MULT = 5.0
     MIN_RR_RATIO = 2.5
     MIN_TOTAL_SCORE = 75
     LEVERAGE = 5
@@ -323,7 +324,7 @@ class TechnicalSMCAgent:
         if htf_bull and last_close > recent_high:
             signal = "Buy"
             score += 20
-            reasons.append("4H Bull + 15M BOS")
+            reasons.append("4H Bull + 1H BOS")
             struct_sl = min(c1["low"], recent_low) * 0.998
             if bull_sweep:
                 score += 15
@@ -344,7 +345,7 @@ class TechnicalSMCAgent:
         elif htf_bear and last_close < recent_low:
             signal = "Sell"
             score += 20
-            reasons.append("4H Bear + 15M BOS")
+            reasons.append("4H Bear + 1H BOS")
             struct_sl = max(c1["high"], recent_high) * 1.002
             if bear_sweep:
                 score += 15
@@ -463,7 +464,6 @@ class RiskManagerAgent:
                 "tp": tp_str,
             }
 
-        # Isolated Margin + Təhlükəsiz Leverage
         try:
             self.client.session.switch_margin_mode(
                 category="linear", symbol=symbol, tradeMode=1,
@@ -505,7 +505,6 @@ class RiskManagerAgent:
                     "skip_symbol": "110126" in msg or order.get("retCode") == 110126,
                 }
 
-            # Zəmanət: Market əmri açılan kimi TP/SL-i mövqeyə təkrar təsdiqlə
             if order_type == "Market":
                 time.sleep(1)
                 pos_list = self.client.get_open_positions()
@@ -557,7 +556,7 @@ class TradingOrchestrator:
                 logger.error(f"Telegram göndərmə xətası: {e}")
 
     async def position_monitor_loop(self):
-        """Hər 60 saniyədən bir: Limit ləğvi (vaxt/SL), TP/SL bildirişi və +1R Breakeven."""
+        """Hər 60 saniyədən bir: Limit ləğvi (4 saat/SL), TP/SL bildirişi və +1R Breakeven."""
         init_pos = await asyncio.to_thread(self.client.get_open_positions)
         for p in init_pos:
             self.tracked_positions[p["symbol"]] = {
@@ -570,7 +569,6 @@ class TradingOrchestrator:
         while True:
             await asyncio.sleep(Config.MONITOR_INTERVAL_SECONDS)
             try:
-                # 1. Limit əmrlərinin vaxt (1 saat+) və ya SL etibarsızlığına görə ləğvi
                 open_orders = await asyncio.to_thread(self.client.get_open_orders)
                 if open_orders:
                     ticker_map = await asyncio.to_thread(self.client.get_all_tickers_map)
@@ -589,14 +587,13 @@ class TradingOrchestrator:
                             )
                         )
                         if expired or invalidated:
-                            reason = "qiymət SL-i keçdiyi" if invalidated else "1 saat ərzində dolmadığı"
+                            reason = "qiymət SL-i keçdiyi" if invalidated else "4 saat ərzində dolmadığı"
                             if await asyncio.to_thread(self.client.cancel_order, sym, o["orderId"]):
                                 await self.send_telegram(
                                     f"⏳ <b>LİMİT ƏMRİ LƏĞV EDİLDİ ({sym})</b>\n"
                                     f"Setup {reason} üçün əmr avtomatik silindi."
                                 )
 
-                # 2. Bağlanan mövqelər (TP / SL bildirişi)
                 current_pos = await asyncio.to_thread(self.client.get_open_positions)
                 current_symbols = {p["symbol"] for p in current_pos}
 
@@ -616,7 +613,6 @@ class TradingOrchestrator:
                                 f"Xalis PnL: <b>{pnl:+.2f} USDT</b>"
                             )
 
-                # 3. Açıq mövqelərdə +1R Breakeven (One-Way & Hedge uyğun)
                 for p in current_pos:
                     sym = p["symbol"]
                     side = p["side"]
@@ -662,7 +658,6 @@ class TradingOrchestrator:
                 self.daily_start_balance = balance
                 self.last_reset_day = today
 
-            # Gündəlik 4% Kill-Switch
             if self.daily_start_balance > 0:
                 drawdown = (self.daily_start_balance - balance) / self.daily_start_balance
                 if drawdown >= Config.DAILY_MAX_LOSS_PCT:
@@ -671,7 +666,6 @@ class TradingOrchestrator:
                     await self.send_telegram(msg)
                     return msg
 
-            # 3 Ardıcıl Zərər Qoruması
             recent_pnl = await asyncio.to_thread(self.client.get_closed_pnl, Config.MAX_CONSECUTIVE_LOSSES)
             if len(recent_pnl) == Config.MAX_CONSECUTIVE_LOSSES:
                 latest_id = str(recent_pnl[0].get("orderId", ""))
@@ -688,7 +682,6 @@ class TradingOrchestrator:
             if total_active >= Config.MAX_OPEN_POSITIONS:
                 return f"Maksimum aktiv əməliyyat limitinə ({total_active}/{Config.MAX_OPEN_POSITIONS}) çatılıb."
 
-            # Ümumi açıq risk limiti (<= 3%)
             if balance > 0:
                 open_risk = sum(
                     abs(safe_float(p.get("avgPrice")) - safe_float(p.get("stopLoss"))) * safe_float(p.get("size"))
@@ -696,6 +689,9 @@ class TradingOrchestrator:
                 )
                 if (open_risk / balance) >= Config.MAX_TOTAL_RISK_PCT:
                     return f"Ümumi açıq risk limitinə ({open_risk / balance:.2%}) çatılıb."
+
+            buy_count = sum(1 for p in open_pos if p.get("side") == "Buy") + sum(1 for o in open_orders if o.get("side") == "Buy")
+            sell_count = sum(1 for p in open_pos if p.get("side") == "Sell") + sum(1 for o in open_orders if o.get("side") == "Sell")
 
             active_symbols = {p["symbol"] for p in open_pos} | {o["symbol"] for o in open_orders} | self.blacklisted_symbols
 
@@ -750,7 +746,18 @@ class TradingOrchestrator:
                 )
             top3_text = "\n".join(top3_lines) if top3_lines else "Trend/ADX şərtinə uyğun koin tapılmadı."
 
-            best_setup = next((c for c in candidates if not c["veto"] and c["score"] >= Config.MIN_TOTAL_SCORE), None)
+            best_setup = next(
+                (
+                    c for c in candidates
+                    if not c["veto"]
+                    and c["score"] >= Config.MIN_TOTAL_SCORE
+                    and (
+                        (c["signal"] == "Buy" and buy_count < Config.MAX_SAME_DIRECTION)
+                        or (c["signal"] == "Sell" and sell_count < Config.MAX_SAME_DIRECTION)
+                    )
+                ),
+                None,
+            )
 
             if best_setup:
                 res = await asyncio.to_thread(self.risk_agent.execute_trade, best_setup)
@@ -777,7 +784,7 @@ class TradingOrchestrator:
 
             return (
                 f"🔍 <b>Skan tamamlandı</b> ({len(tickers)} koin | BTC: {btc_trend} | F&G: {fng})\n"
-                f"75+ bal yığan fürsət tapılmadı.\n\n"
+                f"Uyğun fürsət tapılmadı (və ya istiqamət limiti doludur).\n\n"
                 f"🏆 <b>Ən Yüksək Ballı Top 3:</b>\n{top3_text}"
             )
 
@@ -786,8 +793,8 @@ class TradingOrchestrator:
         asyncio.create_task(self.position_monitor_loop())
         mode = "DRY_RUN" if Config.DRY_RUN else ("DEMO" if Config.USE_DEMO else "REAL")
         await self.send_telegram(
-            f"✅ <b>Bybit SMC Multi-Agent Bot (v5 Pro) işə düşdü!</b>\n"
-            f"Rejim: {mode} | ATR + Isolated + TP/SL Zəmanəti: Aktiv"
+            f"✅ <b>Bybit SMC Multi-Agent Bot (v5.1 Pro) işə düşdü!</b>\n"
+            f"Rejim: {mode} | 1H + 2x ATR SL + Korrelyasiya Qoruması: Aktiv"
         )
         while True:
             if not self.is_paused:
@@ -806,7 +813,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     await update.message.reply_text(
-        "🤖 <b>Bybit SMC Multi-Agent Bot (v5 Pro)</b>\n"
+        "🤖 <b>Bybit SMC Multi-Agent Bot (v5.1 Pro)</b>\n"
         "/status - Balans, açıq mövqelər və Limit əmrləri\n"
         "/scan - İndi manuel skan başlat (Top 3 hesabatı)\n"
         "/history - Ümumi statistika (+ / -) və son 5 əməliyyat\n"
@@ -894,7 +901,7 @@ async def cmd_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def health_check(request):
-    return web.Response(text="Bybit SMC Bot v5 Pro is running 24/7")
+    return web.Response(text="Bybit SMC Bot v5.1 Pro is running 24/7")
 
 async def main():
     Config.validate_live_mode()
