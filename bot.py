@@ -56,11 +56,12 @@ class Config:
     MAX_OPEN_POSITIONS = 3
     MAX_SAME_DIRECTION = 1
     DAILY_MAX_LOSS_PCT = 0.04
-    MAX_CONSECUTIVE_LOSSES = 3
+    MAX_CONSECUTIVE_LOSSES = 5
     MIN_SL_PCT = 0.006
     ATR_SL_MULT = 2.0
-    ATR_TP_MULT = 5.0
-    MIN_RR_RATIO = 2.5
+    BE_TRIGGER_R = 1.5
+    TRAILING_ATR_MULT = 2.0
+    EMERGENCY_TP_RR = 10.0
     MIN_TOTAL_SCORE = 75
     LEVERAGE = 5
 
@@ -371,7 +372,7 @@ class TechnicalSMCAgent:
             "atr": atr,
             "order_type": order_type,
             "reasons": reasons,
-        }
+                    }
 class DerivativesAgent:
     def analyze(self, ticker: dict, signal: str) -> dict:
         funding = safe_float(ticker.get("fundingRate"))
@@ -416,7 +417,6 @@ class RiskManagerAgent:
         side = setup["signal"]
         entry = setup["entry"]
         sl = setup["sl"]
-        atr = setup.get("atr", 0.0)
         order_type = setup.get("order_type", "Market")
 
         risk_unit = abs(entry - sl)
@@ -427,8 +427,9 @@ class RiskManagerAgent:
         if sl_pct < Config.MIN_SL_PCT:
             return {"status": "rejected", "reason": f"SL çox yaxındır ({sl_pct:.2%} < {Config.MIN_SL_PCT:.2%})"}
 
-        tp_dist = max(risk_unit * Config.MIN_RR_RATIO, atr * Config.ATR_TP_MULT)
-        tp = entry + tp_dist if side == "Buy" else entry - tp_dist
+        # Trailing Stop trendi tam tutsun deyə uzaq 10R tavan TP qoyulur
+        tp_dist = risk_unit * Config.EMERGENCY_TP_RR
+        tp = entry + tp_dist if side == "Buy" else max(entry - tp_dist, entry * 0.05)
 
         balance = self.client.get_usdt_balance()
         if balance <= 0:
@@ -440,7 +441,7 @@ class RiskManagerAgent:
 
         safe_lev = min(Config.LEVERAGE, inst["maxLeverage"])
         risk_usdt = balance * Config.RISK_PER_TRADE_PCT
-        effective_risk = risk_unit + (entry * 0.0012)  # Komissiya + slippage payı
+        effective_risk = risk_unit + (entry * 0.0012)
         raw_qty = risk_usdt / effective_risk
         max_qty = (balance * safe_lev * 0.90) / entry
         final_qty = min(raw_qty, max_qty)
@@ -556,14 +557,19 @@ class TradingOrchestrator:
                 logger.error(f"Telegram göndərmə xətası: {e}")
 
     async def position_monitor_loop(self):
-        """Hər 60 saniyədən bir: Limit ləğvi (4 saat/SL), TP/SL bildirişi və +1R Breakeven."""
+        """Hər 60 saniyədən bir: Limit ləğvi, TP/SL bildirişi, +1.5R Breakeven və 2x ATR Trailing Stop."""
         init_pos = await asyncio.to_thread(self.client.get_open_positions)
         for p in init_pos:
+            entry = safe_float(p.get("avgPrice"))
+            sl = safe_float(p.get("stopLoss"))
+            side = p["side"]
+            already_be = (side == "Buy" and sl >= entry) or (side == "Sell" and sl <= entry and sl > 0)
             self.tracked_positions[p["symbol"]] = {
-                "side": p["side"],
-                "entry": safe_float(p.get("avgPrice")),
-                "sl": safe_float(p.get("stopLoss")),
-                "be_done": False,
+                "side": side,
+                "entry": entry,
+                "sl": sl,
+                "risk_unit": abs(entry - sl) if sl > 0 else 0.0,
+                "be_done": already_be,
             }
 
         while True:
@@ -605,7 +611,7 @@ class TradingOrchestrator:
                         match = next((h for h in history if h["symbol"] == sym), None)
                         if match:
                             pnl = safe_float(match.get("closedPnl"))
-                            tag = "✅ TP / QAZANC" if pnl > 0 else "🛑 SL / ZƏRƏR"
+                            tag = "✅ QAZANC (TRAILING/TP)" if pnl > 0 else "🛑 SL / ZƏRƏR"
                             await self.send_telegram(
                                 f"<b>{tag} — MÖVQE BAĞLANDI</b>\n"
                                 f"Koin: <b>{sym}</b>\n"
@@ -622,28 +628,65 @@ class TradingOrchestrator:
                     pos_idx = int(p.get("positionIdx", 0))
 
                     if sym not in self.tracked_positions:
+                        already_be = (side == "Buy" and sl >= entry) or (side == "Sell" and sl <= entry and sl > 0)
                         self.tracked_positions[sym] = {
-                            "side": side, "entry": entry, "sl": sl, "be_done": False
+                            "side": side,
+                            "entry": entry,
+                            "sl": sl,
+                            "risk_unit": abs(entry - sl) if sl > 0 else 0.0,
+                            "be_done": already_be,
                         }
 
                     info = self.tracked_positions[sym]
-                    if info["be_done"] or entry <= 0 or sl <= 0 or mark <= 0:
+                    if entry <= 0 or sl <= 0 or mark <= 0:
                         continue
 
                     inst = self.client.instruments.get(sym)
                     if not inst:
                         continue
 
-                    if side == "Buy" and sl < entry and mark >= entry + (entry - sl):
-                        be_str = self.client.format_step(entry * 1.001, inst["tickSize"])
-                        if await asyncio.to_thread(self.client.set_trading_stop, sym, sl=be_str, position_idx=pos_idx):
-                            info["be_done"] = True
-                            await self.send_telegram(f"🛡️ <b>BREAKEVEN AKTİV ({sym})</b>\nSL girişə çəkildi ({be_str}).")
-                    elif side == "Sell" and sl > entry and mark <= entry - (sl - entry):
-                        be_str = self.client.format_step(entry * 0.999, inst["tickSize"])
-                        if await asyncio.to_thread(self.client.set_trading_stop, sym, sl=be_str, position_idx=pos_idx):
-                            info["be_done"] = True
-                            await self.send_telegram(f"🛡️ <b>BREAKEVEN AKTİV ({sym})</b>\nSL girişə çəkildi ({be_str}).")
+                    # 1. +1.5R Breakeven aktivləşməsi
+                    if not info["be_done"] and info["risk_unit"] > 0:
+                        trigger_dist = info["risk_unit"] * Config.BE_TRIGGER_R
+                        if side == "Buy" and sl < entry and mark >= entry + trigger_dist:
+                            be_str = self.client.format_step(entry * 1.001, inst["tickSize"])
+                            if await asyncio.to_thread(self.client.set_trading_stop, sym, sl=be_str, position_idx=pos_idx):
+                                info["be_done"] = True
+                                info["sl"] = safe_float(be_str)
+                                await self.send_telegram(
+                                    f"🛡️ <b>BREAKEVEN + TRAILING AKTİV ({sym})</b>\n"
+                                    f"+1.5R çatdı, SL girişə çəkildi ({be_str}). Bundan sonra 2× ATR izləyəcək."
+                                )
+                        elif side == "Sell" and sl > entry and mark <= entry - trigger_dist:
+                            be_str = self.client.format_step(entry * 0.999, inst["tickSize"])
+                            if await asyncio.to_thread(self.client.set_trading_stop, sym, sl=be_str, position_idx=pos_idx):
+                                info["be_done"] = True
+                                info["sl"] = safe_float(be_str)
+                                await self.send_telegram(
+                                    f"🛡️ <b>BREAKEVEN + TRAILING AKTİV ({sym})</b>\n"
+                                    f"+1.5R çatdı, SL girişə çəkildi ({be_str}). Bundan sonra 2× ATR izləyəcək."
+                                )
+
+                    # 2. Breakeven-dən sonra 2x ATR Trailing Stop (SL-i qazanca doğru sürüşdür)
+                    elif info["be_done"]:
+                        df_ltf = await asyncio.to_thread(self.client.get_klines, sym, Config.LTF_INTERVAL, 20)
+                        if len(df_ltf) >= 15:
+                            atr = (df_ltf["high"] - df_ltf["low"]).iloc[-15:-1].mean()
+                            if atr > 0:
+                                if side == "Buy":
+                                    new_sl = mark - (atr * Config.TRAILING_ATR_MULT)
+                                    if new_sl > sl * 1.003:
+                                        sl_str = self.client.format_step(new_sl, inst["tickSize"])
+                                        if await asyncio.to_thread(self.client.set_trading_stop, sym, sl=sl_str, position_idx=pos_idx):
+                                            info["sl"] = safe_float(sl_str)
+                                            logger.info(f"Trailing SL yeniləndi ({sym} Buy): {sl_str}")
+                                elif side == "Sell":
+                                    new_sl = mark + (atr * Config.TRAILING_ATR_MULT)
+                                    if new_sl < sl * 0.997:
+                                        sl_str = self.client.format_step(new_sl, inst["tickSize"])
+                                        if await asyncio.to_thread(self.client.set_trading_stop, sym, sl=sl_str, position_idx=pos_idx):
+                                            info["sl"] = safe_float(sl_str)
+                                            logger.info(f"Trailing SL yeniləndi ({sym} Sell): {sl_str}")
             except Exception as e:
                 logger.error(f"Monitor xətası: {e}")
 
@@ -768,7 +811,7 @@ class TradingOrchestrator:
                         f"Koin: <b>{best_setup['symbol']}</b> | {best_setup['signal']} ({res['order_type']})\n"
                         f"Agent Balı: <b>{best_setup['score']}/100</b>\n"
                         f"Giriş: {res['entry']} | Miqdar: {res['qty']}\n"
-                        f"SL: {res['sl']} | TP: {res['tp']}\n"
+                        f"SL: {res['sl']} | Trailing: +1.5R sonra 2× ATR\n"
                         f"Səbəblər: {', '.join(best_setup['reasons'])}\n\n"
                         f"🏆 <b>Top 3 Namizəd:</b>\n{top3_text}"
                     )
@@ -793,8 +836,8 @@ class TradingOrchestrator:
         asyncio.create_task(self.position_monitor_loop())
         mode = "DRY_RUN" if Config.DRY_RUN else ("DEMO" if Config.USE_DEMO else "REAL")
         await self.send_telegram(
-            f"✅ <b>Bybit SMC Multi-Agent Bot (v5.1 Pro) işə düşdü!</b>\n"
-            f"Rejim: {mode} | 1H + 2x ATR SL + Korrelyasiya Qoruması: Aktiv"
+            f"✅ <b>Bybit SMC Multi-Agent Bot (v6 Pro — Trailing Stop) işə düşdü!</b>\n"
+            f"Rejim: {mode} | 1H + 2× ATR SL + 2× ATR Trailing Stop (+1.5R)"
         )
         while True:
             if not self.is_paused:
@@ -813,7 +856,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     await update.message.reply_text(
-        "🤖 <b>Bybit SMC Multi-Agent Bot (v5.1 Pro)</b>\n"
+        "🤖 <b>Bybit SMC Multi-Agent Bot (v6 Pro — Trailing Stop)</b>\n"
         "/status - Balans, açıq mövqelər və Limit əmrləri\n"
         "/scan - İndi manuel skan başlat (Top 3 hesabatı)\n"
         "/history - Ümumi statistika (+ / -) və son 5 əməliyyat\n"
@@ -901,7 +944,7 @@ async def cmd_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def health_check(request):
-    return web.Response(text="Bybit SMC Bot v5.1 Pro is running 24/7")
+    return web.Response(text="Bybit SMC Bot v6 Pro is running 24/7")
 
 async def main():
     Config.validate_live_mode()
